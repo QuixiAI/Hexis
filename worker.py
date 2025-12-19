@@ -16,6 +16,7 @@ This module contains two independent background loops:
 These are intentionally separate concerns with separate triggers.
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -24,27 +25,29 @@ import time
 from typing import Any
 
 import asyncpg
-from dotenv import load_dotenv
 import requests
-import argparse
+from dotenv import load_dotenv
 
 from prompt_resources import compose_personhood_prompt
 
 # Optional: Import LLM clients
 try:
     import openai
+
     HAS_OPENAI = True
 except ImportError:
     HAS_OPENAI = False
 
 try:
     import anthropic
+
     HAS_ANTHROPIC = True
 except ImportError:
     HAS_ANTHROPIC = False
 
 try:
     from openrouter import OpenRouter
+
     HAS_OPENROUTER = True
 except ImportError:
     HAS_OPENROUTER = False
@@ -54,31 +57,69 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger('heartbeat_worker')
+logger = logging.getLogger("heartbeat_worker")
 
 # Database configuration
 DB_CONFIG = {
-    'host': os.getenv('POSTGRES_HOST', 'localhost'),
-    'port': int(os.getenv('POSTGRES_PORT', 5432)),
-    'database': os.getenv('POSTGRES_DB', 'agi_db'),
-    'user': os.getenv('POSTGRES_USER', 'agi_user'),
-    'password': os.getenv('POSTGRES_PASSWORD', 'agi_password'),
+    "host": os.getenv("POSTGRES_HOST", "localhost"),
+    "port": int(os.getenv("POSTGRES_PORT", 5432)),
+    "database": os.getenv("POSTGRES_DB", "agi_db"),
+    "user": os.getenv("POSTGRES_USER", "agi_user"),
+    "password": os.getenv("POSTGRES_PASSWORD", "agi_password"),
 }
 
 # LLM configuration (defaults; may be overridden by DB config via `agi init`)
-DEFAULT_LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")  # openai|anthropic|openai_compatible|ollama
+DEFAULT_LLM_PROVIDER = os.getenv(
+    "LLM_PROVIDER", "openai"
+)  # openai|anthropic|openai_compatible|ollama
 DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
 
+
+def get_api_key_for_provider(provider: str) -> str | None:
+    """
+    Select the appropriate API key based on the LLM provider.
+
+    Args:
+        provider: The LLM provider name (e.g., "openai", "anthropic", "openrouter")
+
+    Returns:
+        The API key from the appropriate environment variable, or None if not found
+    """
+    provider_lower = (provider or "").strip().lower()
+
+    if provider_lower == "openai":
+        return os.getenv("OPENAI_API_KEY")
+    elif provider_lower == "anthropic":
+        return os.getenv("ANTHROPIC_API_KEY")
+    elif provider_lower == "openrouter":
+        return os.getenv("OPENROUTER_API_KEY")
+    elif provider_lower == "ollama":
+        # Ollama doesn't require an API key, but allows a placeholder
+        return os.getenv("OLLAMA_API_KEY") or "ollama"
+    elif provider_lower == "openai_compatible":
+        # For OpenAI-compatible endpoints, prefer OPENAI_API_KEY
+        return os.getenv("OPENAI_API_KEY")
+    else:
+        # Fallback to OpenAI for unknown providers
+        return os.getenv("OPENAI_API_KEY")
+
+
 # Worker configuration
-POLL_INTERVAL = float(os.getenv('WORKER_POLL_INTERVAL', 1.0))  # seconds
-MAX_RETRIES = int(os.getenv('WORKER_MAX_RETRIES', 3))
+POLL_INTERVAL = float(os.getenv("WORKER_POLL_INTERVAL", 1.0))  # seconds
+MAX_RETRIES = int(os.getenv("WORKER_MAX_RETRIES", 3))
 
 # RabbitMQ (optional outbox/inbox bridge; uses management HTTP API).
-RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
-RABBITMQ_MANAGEMENT_URL = os.getenv("RABBITMQ_MANAGEMENT_URL", "http://rabbitmq:15672").rstrip("/")
+RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+RABBITMQ_MANAGEMENT_URL = os.getenv(
+    "RABBITMQ_MANAGEMENT_URL", "http://rabbitmq:15672"
+).rstrip("/")
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "agi")
 RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "agi_password")
 RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/")
@@ -138,7 +179,7 @@ class HeartbeatWorker:
         self.llm_provider = DEFAULT_LLM_PROVIDER
         self.llm_model = DEFAULT_LLM_MODEL
         self.llm_base_url: str | None = os.getenv("OPENAI_BASE_URL") or None
-        self.llm_api_key: str | None = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        self.llm_api_key = get_api_key_for_provider(self.llm_provider)
 
         self.llm_client = None
         if init_llm:
@@ -163,10 +204,14 @@ class HeartbeatWorker:
         self.llm_client = None
         if self.llm_provider == "anthropic":
             if not HAS_ANTHROPIC:
-                logger.warning("Anthropic provider selected but anthropic package is not installed.")
+                logger.warning(
+                    "Anthropic provider selected but anthropic package is not installed."
+                )
                 return
             if not self.llm_api_key:
-                logger.warning("Anthropic provider selected but no API key is configured.")
+                logger.warning(
+                    "Anthropic provider selected but no API key is configured."
+                )
                 return
             try:
                 self.llm_client = anthropic.Anthropic(api_key=self.llm_api_key)
@@ -176,10 +221,14 @@ class HeartbeatWorker:
 
         if self.llm_provider == "openrouter":
             if not HAS_OPENROUTER:
-                logger.warning("OpenRouter provider selected but openrouter package is not installed.")
+                logger.warning(
+                    "OpenRouter provider selected but openrouter package is not installed."
+                )
                 return
             if not self.llm_api_key:
-                logger.warning("OpenRouter provider selected but no API key is configured.")
+                logger.warning(
+                    "OpenRouter provider selected but no API key is configured."
+                )
                 return
             try:
                 self.llm_client = OpenRouter(api_key=self.llm_api_key)
@@ -188,10 +237,14 @@ class HeartbeatWorker:
             return
 
         if not HAS_OPENAI:
-            logger.warning("OpenAI-compatible provider selected but openai package is not installed.")
+            logger.warning(
+                "OpenAI-compatible provider selected but openai package is not installed."
+            )
             return
         if not self.llm_api_key:
-            logger.warning("OpenAI-compatible provider selected but no API key is configured.")
+            logger.warning(
+                "OpenAI-compatible provider selected but no API key is configured."
+            )
             return
         try:
             kwargs = {"api_key": self.llm_api_key}
@@ -252,7 +305,9 @@ class HeartbeatWorker:
             async with self.pool.acquire() as conn:
                 cfg = await conn.fetchval("SELECT get_config('llm.heartbeat')")
         except Exception as e:
-            logger.warning(f"Failed to load llm.heartbeat from DB config (falling back to env): {e}")
+            logger.warning(
+                f"Failed to load llm.heartbeat from DB config (falling back to env): {e}"
+            )
             cfg = None
 
         if isinstance(cfg, str):
@@ -268,7 +323,7 @@ class HeartbeatWorker:
             api_key_env = str(cfg.get("api_key_env") or "").strip()
             api_key = os.getenv(api_key_env) if api_key_env else None
             if not api_key:
-                api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+                api_key = get_api_key_for_provider(provider)
 
             self.llm_provider = provider
             self.llm_model = model
@@ -280,7 +335,7 @@ class HeartbeatWorker:
         self.llm_provider = DEFAULT_LLM_PROVIDER
         self.llm_model = DEFAULT_LLM_MODEL
         self.llm_base_url = os.getenv("OPENAI_BASE_URL") or None
-        self.llm_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        self.llm_api_key = get_api_key_for_provider(self.llm_provider)
         self._init_llm_client()
 
     # -------------------------------------------------------------------------
@@ -292,7 +347,9 @@ class HeartbeatWorker:
             return "%2F"
         return requests.utils.quote(RABBITMQ_VHOST, safe="")
 
-    async def _rabbit_request(self, method: str, path: str, payload: dict | None = None) -> requests.Response:
+    async def _rabbit_request(
+        self, method: str, path: str, payload: dict | None = None
+    ) -> requests.Response:
         url = f"{RABBITMQ_MANAGEMENT_URL}{path}"
         auth = (RABBITMQ_USER, RABBITMQ_PASSWORD)
 
@@ -319,7 +376,9 @@ class HeartbeatWorker:
                     payload={"durable": True, "auto_delete": False, "arguments": {}},
                 )
                 if r.status_code not in (200, 201, 204):
-                    raise RuntimeError(f"rabbitmq queue declare {q!r} HTTP {r.status_code}: {r.text[:200]}")
+                    raise RuntimeError(
+                        f"rabbitmq queue declare {q!r} HTTP {r.status_code}: {r.text[:200]}"
+                    )
             logger.info("RabbitMQ bridge enabled (queues ensured).")
         except Exception as e:
             logger.warning(f"RabbitMQ bridge not ready; continuing without it: {e}")
@@ -365,7 +424,9 @@ class HeartbeatWorker:
                 )
                 ok = resp.status_code == 200 and bool(resp.json().get("routed"))
                 if not ok:
-                    raise RuntimeError(f"publish not routed: HTTP {resp.status_code} body={resp.text[:200]}")
+                    raise RuntimeError(
+                        f"publish not routed: HTTP {resp.status_code} body={resp.text[:200]}"
+                    )
 
                 async with self.pool.acquire() as conn:
                     await conn.execute(
@@ -419,7 +480,9 @@ class HeartbeatWorker:
                 },
             )
             if resp.status_code != 200:
-                raise RuntimeError(f"inbox get HTTP {resp.status_code}: {resp.text[:200]}")
+                raise RuntimeError(
+                    f"inbox get HTTP {resp.status_code}: {resp.text[:200]}"
+                )
             msgs = resp.json()
             if not isinstance(msgs, list):
                 return 0
@@ -459,18 +522,23 @@ class HeartbeatWorker:
     async def complete_call(self, call_id: str, output: dict):
         """Mark an external call as complete with its output."""
         async with self.pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 UPDATE external_calls
                 SET status = 'complete'::external_call_status, output = $1, completed_at = CURRENT_TIMESTAMP
                 WHERE id = $2
-            """, json.dumps(output), call_id)
+            """,
+                json.dumps(output),
+                call_id,
+            )
 
     async def fail_call(self, call_id: str, error: str, retry: bool = True):
         """Mark an external call as failed."""
         async with self.pool.acquire() as conn:
             if retry:
                 # Increment retry count and reset to pending
-                await conn.execute("""
+                await conn.execute(
+                    """
                     UPDATE external_calls
                     SET status = CASE
                             WHEN retry_count < $1 THEN 'pending'::external_call_status
@@ -480,13 +548,21 @@ class HeartbeatWorker:
                         retry_count = retry_count + 1,
                         started_at = NULL
                     WHERE id = $3
-                """, MAX_RETRIES, error, call_id)
+                """,
+                    MAX_RETRIES,
+                    error,
+                    call_id,
+                )
             else:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     UPDATE external_calls
                     SET status = 'failed'::external_call_status, error_message = $1, completed_at = CURRENT_TIMESTAMP
                     WHERE id = $2
-                """, error, call_id)
+                """,
+                    error,
+                    call_id,
+                )
 
     async def process_embed_call(self, call_input: dict) -> dict:
         """
@@ -495,7 +571,9 @@ class HeartbeatWorker:
         Keeping a second embedding path in the worker risks model/dimension drift, so `external_calls.call_type='embed'`
         is treated as unsupported.
         """
-        raise RuntimeError("external_calls type 'embed' is unsupported; use get_embedding() inside Postgres")
+        raise RuntimeError(
+            "external_calls type 'embed' is unsupported; use get_embedding() inside Postgres"
+        )
 
     async def process_think_call(self, call_input: dict) -> dict:
         """Process an LLM request stored as an external_calls row with call_type='think'."""
@@ -526,7 +604,12 @@ class HeartbeatWorker:
                     "goal_changes": [],
                 },
             )
-            return {"kind": "heartbeat_decision", "decision": decision, "heartbeat_id": heartbeat_id, "raw_response": raw}
+            return {
+                "kind": "heartbeat_decision",
+                "decision": decision,
+                "heartbeat_id": heartbeat_id,
+                "raw_response": raw,
+            }
         except Exception as e:
             logger.error(f"LLM heartbeat decision failed: {e}")
             return {
@@ -547,7 +630,7 @@ class HeartbeatWorker:
         system_prompt = (
             "You are helping an autonomous agent generate a small set of useful goals.\n"
             "Return STRICT JSON with shape:\n"
-            "{ \"goals\": [ {\"title\": str, \"description\": str|null, \"priority\": \"queued\"|\"backburner\"|\"active\"|null, \"source\": \"curiosity\"|\"user_request\"|\"identity\"|\"derived\"|\"external\"|null} ] }\n"
+            '{ "goals": [ {"title": str, "description": str|null, "priority": "queued"|"backburner"|"active"|null, "source": "curiosity"|"user_request"|"identity"|"derived"|"external"|null} ] }\n'
             "Keep it concise and non-duplicative."
         )
         user_prompt = (
@@ -558,12 +641,19 @@ class HeartbeatWorker:
             "Propose 1-5 goals that are actionable and consistent with the context."
         )
 
-        goals_doc, raw = self._call_llm_json(system_prompt, user_prompt, max_tokens=1200, fallback={"goals": []})
+        goals_doc, raw = self._call_llm_json(
+            system_prompt, user_prompt, max_tokens=1200, fallback={"goals": []}
+        )
         goals = goals_doc.get("goals") if isinstance(goals_doc, dict) else None
         if not isinstance(goals, list):
             goals = []
 
-        return {"kind": "brainstorm_goals", "heartbeat_id": heartbeat_id, "goals": goals, "raw_response": raw}
+        return {
+            "kind": "brainstorm_goals",
+            "heartbeat_id": heartbeat_id,
+            "goals": goals,
+            "raw_response": raw,
+        }
 
     async def _process_inquire_call(self, call_input: dict) -> dict:
         heartbeat_id = call_input.get("heartbeat_id")
@@ -575,7 +665,7 @@ class HeartbeatWorker:
         system_prompt = (
             "You are performing research/synthesis for an autonomous agent.\n"
             "Return STRICT JSON with shape:\n"
-            "{ \"summary\": str, \"confidence\": number, \"sources\": [str] }\n"
+            '{ "summary": str, "confidence": number, "sources": [str] }\n'
             "If you cannot access the web, still provide a best-effort answer and leave sources empty."
         )
         user_prompt = (
@@ -595,7 +685,14 @@ class HeartbeatWorker:
         )
         if not isinstance(doc, dict):
             doc = {"summary": str(doc), "confidence": 0.0, "sources": []}
-        return {"kind": "inquire", "heartbeat_id": heartbeat_id, "query": query, "depth": depth, "result": doc, "raw_response": raw}
+        return {
+            "kind": "inquire",
+            "heartbeat_id": heartbeat_id,
+            "query": query,
+            "depth": depth,
+            "result": doc,
+            "raw_response": raw,
+        }
 
     async def _process_reflect_call(self, call_input: dict) -> dict:
         heartbeat_id = call_input.get("heartbeat_id")
@@ -603,12 +700,12 @@ class HeartbeatWorker:
             "You are performing reflection for an autonomous agent.\n"
             "Return STRICT JSON with shape:\n"
             "{\n"
-            "  \"insights\": [{\"content\": str, \"confidence\": number, \"category\": str}],\n"
-            "  \"identity_updates\": [{\"aspect_type\": str, \"change\": str, \"reason\": str}],\n"
-            "  \"worldview_updates\": [{\"id\": str, \"new_confidence\": number, \"reason\": str}],\n"
-            "  \"discovered_relationships\": [{\"from_id\": str, \"to_id\": str, \"type\": str, \"confidence\": number}],\n"
-            "  \"contradictions_noted\": [{\"memory_a\": str, \"memory_b\": str, \"resolution\": str}],\n"
-            "  \"self_updates\": [{\"kind\": str, \"concept\": str, \"strength\": number, \"evidence_memory_id\": str|null}]\n"
+            '  "insights": [{"content": str, "confidence": number, "category": str}],\n'
+            '  "identity_updates": [{"aspect_type": str, "change": str, "reason": str}],\n'
+            '  "worldview_updates": [{"id": str, "new_confidence": number, "reason": str}],\n'
+            '  "discovered_relationships": [{"from_id": str, "to_id": str, "type": str, "confidence": number}],\n'
+            '  "contradictions_noted": [{"memory_a": str, "memory_b": str, "resolution": str}],\n'
+            '  "self_updates": [{"kind": str, "concept": str, "strength": number, "evidence_memory_id": str|null}]\n'
             "}\n"
             "Keep it concise; prefer high-confidence, high-leverage items."
         )
@@ -619,14 +716,25 @@ class HeartbeatWorker:
             + compose_personhood_prompt("reflect")
         )
         user_prompt = json.dumps(call_input)[:12000]
-        doc, raw = self._call_llm_json(system_prompt, user_prompt, max_tokens=1800, fallback={})
+        doc, raw = self._call_llm_json(
+            system_prompt, user_prompt, max_tokens=1800, fallback={}
+        )
         if not isinstance(doc, dict):
             doc = {}
-        return {"kind": "reflect", "heartbeat_id": heartbeat_id, "result": doc, "raw_response": raw}
+        return {
+            "kind": "reflect",
+            "heartbeat_id": heartbeat_id,
+            "result": doc,
+            "raw_response": raw,
+        }
 
-    def _call_llm_json(self, system_prompt: str, user_prompt: str, max_tokens: int, fallback: dict) -> tuple[dict, str]:
+    def _call_llm_json(
+        self, system_prompt: str, user_prompt: str, max_tokens: int, fallback: dict
+    ) -> tuple[dict, str]:
         if not self.llm_client:
-            raise RuntimeError("No LLM client available (install openai or anthropic and set API key).")
+            raise RuntimeError(
+                "No LLM client available (install openai or anthropic and set API key)."
+            )
 
         if self.llm_provider == "anthropic" and HAS_ANTHROPIC:
             response = self.llm_client.messages.create(
@@ -644,17 +752,17 @@ class HeartbeatWorker:
                     {"role": "user", "content": user_prompt},
                 ],
             )
-            if hasattr(response, 'choices') and len(response.choices) > 0:
+            if hasattr(response, "choices") and len(response.choices) > 0:
                 raw = response.choices[0].message.content
-            elif hasattr(response, 'message') and hasattr(response.message, 'content'):
+            elif hasattr(response, "message") and hasattr(response.message, "content"):
                 raw = response.message.content
             elif isinstance(response, dict):
-                 if 'choices' in response and len(response['choices']) > 0:
-                     raw = response['choices'][0]['message']['content']
-                 elif 'message' in response:
-                     raw = response['message']['content']
-                 else:
-                     raw = json.dumps(response)
+                if "choices" in response and len(response["choices"]) > 0:
+                    raw = response["choices"][0]["message"]["content"]
+                elif "message" in response:
+                    raw = response["message"]["content"]
+                else:
+                    raw = json.dumps(response)
             else:
                 raw = str(response)
         elif HAS_OPENAI:
@@ -683,18 +791,18 @@ class HeartbeatWorker:
     def _build_decision_prompt(self, context: dict) -> str:
         """Build the decision prompt from context."""
         agent = context.get("agent", {})
-        env = context.get('environment', {})
-        goals = context.get('goals', {})
-        memories = context.get('recent_memories', [])
-        identity = context.get('identity', [])
-        worldview = context.get('worldview', [])
+        env = context.get("environment", {})
+        goals = context.get("goals", {})
+        memories = context.get("recent_memories", [])
+        identity = context.get("identity", [])
+        worldview = context.get("worldview", [])
         self_model = context.get("self_model", [])
         narrative = context.get("narrative", {})
         urgent_drives = context.get("urgent_drives", [])
         emotional_state = context.get("emotional_state") or {}
-        energy = context.get('energy', {})
-        action_costs = context.get('action_costs', {})
-        hb_number = context.get('heartbeat_number', 0)
+        energy = context.get("energy", {})
+        action_costs = context.get("action_costs", {})
+        hb_number = context.get("heartbeat_number", 0)
 
         prompt = f"""## Heartbeat #{hb_number}
 
@@ -712,22 +820,22 @@ Budget:
 {json.dumps(agent.get("budget") or {})}
 
 ## Current Time
-{env.get('timestamp', 'Unknown')}
-Day of week: {env.get('day_of_week', '?')}, Hour: {env.get('hour_of_day', '?')}
+{env.get("timestamp", "Unknown")}
+Day of week: {env.get("day_of_week", "?")}, Hour: {env.get("hour_of_day", "?")}
 
 ## Environment
-- Time since last user interaction: {env.get('time_since_user_hours', 'Never')} hours
-- Pending events: {env.get('pending_events', 0)}
+- Time since last user interaction: {env.get("time_since_user_hours", "Never")} hours
+- Pending events: {env.get("pending_events", 0)}
 
 ## Your Goals
-Active ({goals.get('counts', {}).get('active', 0)}):
-{self._format_goals(goals.get('active', []))}
+Active ({goals.get("counts", {}).get("active", 0)}):
+{self._format_goals(goals.get("active", []))}
 
-Queued ({goals.get('counts', {}).get('queued', 0)}):
-{self._format_goals(goals.get('queued', []))}
+Queued ({goals.get("counts", {}).get("queued", 0)}):
+{self._format_goals(goals.get("queued", []))}
 
 Issues:
-{self._format_issues(goals.get('issues', []))}
+{self._format_issues(goals.get("issues", []))}
 
 ## Narrative
 {self._format_narrative(narrative)}
@@ -751,8 +859,8 @@ Issues:
 {self._format_drives(urgent_drives)}
 
 ## Energy
-Available: {energy.get('current', 0)}
-Max: {energy.get('max', 20)}
+Available: {energy.get("current", 0)}
+Max: {energy.get("max", 20)}
 
 ## Action Costs
 {self._format_costs(action_costs)}
@@ -779,10 +887,7 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
     def _format_memories(self, memories: list) -> str:
         if not memories:
             return "  (no recent memories)"
-        return "\n".join(
-            f"  - {m.get('content', '')[:100]}..."
-            for m in memories[:5]
-        )
+        return "\n".join(f"  - {m.get('content', '')[:100]}..." for m in memories[:5])
 
     def _format_identity(self, identity: list) -> str:
         if not identity:
@@ -834,7 +939,11 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
     def _format_narrative(self, narrative: Any) -> str:
         if not isinstance(narrative, dict):
             return "  (none)"
-        cur = narrative.get("current_chapter") if isinstance(narrative.get("current_chapter"), dict) else {}
+        cur = (
+            narrative.get("current_chapter")
+            if isinstance(narrative.get("current_chapter"), dict)
+            else {}
+        )
         name = cur.get("name") or "Foundations"
         return f"  - Current chapter: {name}"
 
@@ -848,7 +957,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             kind = item.get("kind") or "associated"
             concept = item.get("concept") or "?"
             strength = item.get("strength")
-            strength_txt = f" ({strength:.2f})" if isinstance(strength, (int, float)) else ""
+            strength_txt = (
+                f" ({strength:.2f})" if isinstance(strength, (int, float)) else ""
+            )
             lines.append(f"  - {kind}: {concept}{strength_txt}")
         return "\n".join(lines) if lines else "  (empty)"
 
@@ -878,7 +989,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 lines.append(f"  - {name}: {ratio:.2f}x threshold")
             else:
                 level = d.get("level")
-                lines.append(f"  - {name}: {level}" if level is not None else f"  - {name}")
+                lines.append(
+                    f"  - {name}: {level}" if level is not None else f"  - {name}"
+                )
         return "\n".join(lines) if lines else "  (none)"
 
     def _format_worldview(self, worldview: list) -> str:
@@ -902,21 +1015,26 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
 
     async def execute_heartbeat_actions(self, heartbeat_id: str, decision: dict):
         """Execute the actions decided by the LLM and complete the heartbeat."""
-        actions = decision.get('actions', [])
-        goal_changes = decision.get('goal_changes', [])
-        reasoning = decision.get('reasoning', '')
+        actions = decision.get("actions", [])
+        goal_changes = decision.get("goal_changes", [])
+        reasoning = decision.get("reasoning", "")
 
         actions_taken = []
 
         async with self.pool.acquire() as conn:
             for action_spec in actions:
-                action = action_spec.get('action', 'rest')
-                params = action_spec.get('params', {})
+                action = action_spec.get("action", "rest")
+                params = action_spec.get("params", {})
 
                 # Execute the action via the database function
-                result = await conn.fetchval("""
+                result = await conn.fetchval(
+                    """
                     SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)
-                """, heartbeat_id, action, json.dumps(params))
+                """,
+                    heartbeat_id,
+                    action,
+                    json.dumps(params),
+                )
 
                 result_dict = json.loads(result) if result else {}
                 # If this action queued an LLM call (e.g., brainstorm/inquire), process it immediately
@@ -928,42 +1046,62 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 external_result = None
                 if queued_call_id:
                     try:
-                        external_result = await self._process_external_call_by_id(conn, str(queued_call_id))
+                        external_result = await self._process_external_call_by_id(
+                            conn, str(queued_call_id)
+                        )
                     except Exception as e:
                         external_result = {"error": str(e)}
-                    if isinstance(result_dict, dict) and isinstance(result_dict.get("result"), dict):
+                    if isinstance(result_dict, dict) and isinstance(
+                        result_dict.get("result"), dict
+                    ):
                         result_dict["result"]["external_call_result"] = external_result
 
-                actions_taken.append({
-                    'action': action,
-                    'params': params,
-                    'result': result_dict
-                })
+                actions_taken.append(
+                    {"action": action, "params": params, "result": result_dict}
+                )
 
                 # Check if we ran out of energy
-                if not result_dict.get('success', True):
-                    logger.info(f"Action {action} failed: {result_dict.get('error', 'unknown')}")
+                if not result_dict.get("success", True):
+                    logger.info(
+                        f"Action {action} failed: {result_dict.get('error', 'unknown')}"
+                    )
                     break
 
             # Apply goal changes
             for change in goal_changes:
-                goal_id = change.get('goal_id')
-                change_type = change.get('change')
-                reason = change.get('reason', '')
+                goal_id = change.get("goal_id")
+                change_type = change.get("change")
+                reason = change.get("reason", "")
 
                 if goal_id and change_type:
-                    await conn.execute("""
+                    await conn.execute(
+                        """
                         SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)
-                    """, goal_id, change_type, reason)
+                    """,
+                        goal_id,
+                        change_type,
+                        reason,
+                    )
 
             # Complete the heartbeat
-            memory_id = await conn.fetchval("""
+            memory_id = await conn.fetchval(
+                """
                 SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb)
-            """, heartbeat_id, reasoning, json.dumps(actions_taken), json.dumps(goal_changes), json.dumps(decision.get("emotional_assessment")) if isinstance(decision.get("emotional_assessment"), dict) else None)
+            """,
+                heartbeat_id,
+                reasoning,
+                json.dumps(actions_taken),
+                json.dumps(goal_changes),
+                json.dumps(decision.get("emotional_assessment"))
+                if isinstance(decision.get("emotional_assessment"), dict)
+                else None,
+            )
 
             logger.info(f"Heartbeat {heartbeat_id} completed. Memory: {memory_id}")
 
-    async def _process_external_call_by_id(self, conn: asyncpg.Connection, call_id: str) -> dict:
+    async def _process_external_call_by_id(
+        self, conn: asyncpg.Connection, call_id: str
+    ) -> dict:
         """
         Opportunistically process a specific external call (best-effort).
         This is used to keep a single heartbeat cohesive when it queues follow-on LLM calls.
@@ -979,7 +1117,10 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         )
         if not row:
             # Another worker may have claimed it; just return a lightweight status.
-            cur = await conn.fetchrow("SELECT status, output, error_message FROM external_calls WHERE id = $1::uuid", call_id)
+            cur = await conn.fetchrow(
+                "SELECT status, output, error_message FROM external_calls WHERE id = $1::uuid",
+                call_id,
+            )
             return dict(cur) if cur else {"error": "call not found"}
 
         call_type = row["call_type"]
@@ -996,13 +1137,19 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             # Apply side-effects for non-heartbeat think kinds
             kind = result.get("kind")
             if kind == "brainstorm_goals" and heartbeat_id:
-                created = await self._apply_brainstormed_goals(conn, str(heartbeat_id), result.get("goals", []))
+                created = await self._apply_brainstormed_goals(
+                    conn, str(heartbeat_id), result.get("goals", [])
+                )
                 result["created_goal_ids"] = created
             if kind == "inquire" and heartbeat_id:
-                mem_id = await self._apply_inquiry_result(conn, str(heartbeat_id), result)
+                mem_id = await self._apply_inquiry_result(
+                    conn, str(heartbeat_id), result
+                )
                 result["memory_id"] = mem_id
             if kind == "reflect" and heartbeat_id:
-                await self._apply_reflection_result(conn, str(heartbeat_id), result.get("result"))
+                await self._apply_reflection_result(
+                    conn, str(heartbeat_id), result.get("result")
+                )
                 result["applied"] = True
         elif call_type == "embed":
             result = await self.process_embed_call(call_input)
@@ -1020,7 +1167,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         )
         return result
 
-    async def _apply_brainstormed_goals(self, conn: asyncpg.Connection, heartbeat_id: str, goals: list[dict]) -> list[str]:
+    async def _apply_brainstormed_goals(
+        self, conn: asyncpg.Connection, heartbeat_id: str, goals: list[dict]
+    ) -> list[str]:
         created_ids: list[str] = []
         if not goals:
             return created_ids
@@ -1049,7 +1198,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
 
         return created_ids
 
-    async def _apply_inquiry_result(self, conn: asyncpg.Connection, heartbeat_id: str, result: dict) -> str | None:
+    async def _apply_inquiry_result(
+        self, conn: asyncpg.Connection, heartbeat_id: str, result: dict
+    ) -> str | None:
         payload = result.get("result") if isinstance(result, dict) else None
         if not isinstance(payload, dict):
             return None
@@ -1096,7 +1247,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             logger.warning(f"Failed to persist inquiry result: {e}")
             return None
 
-    async def _apply_reflection_result(self, conn: asyncpg.Connection, heartbeat_id: str, payload: dict | None) -> None:
+    async def _apply_reflection_result(
+        self, conn: asyncpg.Connection, heartbeat_id: str, payload: dict | None
+    ) -> None:
         if not payload:
             return
         try:
@@ -1134,41 +1287,60 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     call = await self.claim_pending_call()
 
                     if call:
-                        call_id = str(call['id'])
-                        call_type = call['call_type']
-                        call_input = call['input']
+                        call_id = str(call["id"])
+                        call_type = call["call_type"]
+                        call_input = call["input"]
                         if isinstance(call_input, str):
                             try:
                                 call_input = json.loads(call_input)
                             except Exception:
                                 pass
-                        heartbeat_id = call.get('heartbeat_id')
+                        heartbeat_id = call.get("heartbeat_id")
 
                         logger.info(f"Processing {call_type} call: {call_id}")
 
                         try:
-                            if call_type == 'embed':
+                            if call_type == "embed":
                                 result = await self.process_embed_call(call_input)
-                            elif call_type == 'think':
+                            elif call_type == "think":
                                 result = await self.process_think_call(call_input)
 
                                 # Heartbeat decision calls drive execution; other think kinds are side tasks.
-                                if heartbeat_id and result.get("kind") == "heartbeat_decision" and "decision" in result:
-                                    await self.execute_heartbeat_actions(str(heartbeat_id), result["decision"])
-                                elif heartbeat_id and result.get("kind") == "brainstorm_goals":
+                                if (
+                                    heartbeat_id
+                                    and result.get("kind") == "heartbeat_decision"
+                                    and "decision" in result
+                                ):
+                                    await self.execute_heartbeat_actions(
+                                        str(heartbeat_id), result["decision"]
+                                    )
+                                elif (
+                                    heartbeat_id
+                                    and result.get("kind") == "brainstorm_goals"
+                                ):
                                     async with self.pool.acquire() as conn:
-                                        created = await self._apply_brainstormed_goals(conn, str(heartbeat_id), result.get("goals", []))
+                                        created = await self._apply_brainstormed_goals(
+                                            conn,
+                                            str(heartbeat_id),
+                                            result.get("goals", []),
+                                        )
                                     result["created_goal_ids"] = created
                                 elif heartbeat_id and result.get("kind") == "inquire":
                                     async with self.pool.acquire() as conn:
-                                        mem_id = await self._apply_inquiry_result(conn, str(heartbeat_id), result)
+                                        mem_id = await self._apply_inquiry_result(
+                                            conn, str(heartbeat_id), result
+                                        )
                                     result["memory_id"] = mem_id
                                 elif heartbeat_id and result.get("kind") == "reflect":
                                     async with self.pool.acquire() as conn:
-                                        await self._apply_reflection_result(conn, str(heartbeat_id), result.get("result"))
+                                        await self._apply_reflection_result(
+                                            conn,
+                                            str(heartbeat_id),
+                                            result.get("result"),
+                                        )
                                     result["applied"] = True
                             else:
-                                result = {'error': f'Unknown call type: {call_type}'}
+                                result = {"error": f"Unknown call type: {call_type}"}
 
                             await self.complete_call(call_id, result)
 
@@ -1218,7 +1390,9 @@ class MaintenanceWorker:
 
     async def run_maintenance_tick(self) -> dict[str, Any]:
         async with self.pool.acquire() as conn:
-            raw = await conn.fetchval("SELECT run_subconscious_maintenance('{}'::jsonb)")
+            raw = await conn.fetchval(
+                "SELECT run_subconscious_maintenance('{}'::jsonb)"
+            )
             if isinstance(raw, str):
                 return json.loads(raw)
             return dict(raw) if isinstance(raw, dict) else {"result": raw}
@@ -1300,7 +1474,9 @@ async def _amain(mode: str) -> None:
 
 def main() -> int:
     """Console-script entry point."""
-    p = argparse.ArgumentParser(prog="agi-worker", description="Run AGI background workers.")
+    p = argparse.ArgumentParser(
+        prog="agi-worker", description="Run AGI background workers."
+    )
     p.add_argument(
         "--mode",
         choices=["heartbeat", "maintenance", "both"],
