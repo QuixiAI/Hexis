@@ -21,20 +21,17 @@ from typing import Optional
 try:
     import requests
 except ImportError:
-    import subprocess
-
-    subprocess.check_call(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "requests",
-            "--break-system-packages",
-            "-q",
-        ]
+    print(
+        "Error: 'requests' package is required but not installed.\n"
+        "Please install dependencies using one of the following methods:\n"
+        "  - pip install -e .\n"
+        "  - pip install requests\n"
+        "  - uv pip install -e .\n\n"
+        "The 'requests' package is declared in pyproject.toml and should be "
+        "installed as part of the project dependencies.",
+        file=sys.stderr,
     )
-    import requests
+    sys.exit(1)
 
 try:
     from openrouter import OpenRouter
@@ -44,7 +41,6 @@ except ImportError:
     HAS_OPENROUTER = False
 
 from memory_tools import (
-    MEMORY_TOOLS,
     create_enricher,
     create_memory_formation,
     create_tool_handler,

@@ -25,28 +25,17 @@ from typing import ClassVar, Generator, Optional
 try:
     import requests
 except ImportError:
-    print("Warning: requests package not found, attempting to install...")
-    import subprocess
-
-    try:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "requests",
-                "--break-system-packages",
-                "-q",
-            ]
-        )
-        import requests
-
-        print("Successfully installed requests package")
-    except subprocess.CalledProcessError as e:
-        print(f"Error: Failed to install requests package: {e}")
-        print("Please install requests manually: pip install requests")
-        raise RuntimeError("Failed to install required 'requests' package") from e
+    print(
+        "Error: 'requests' package is required but not installed.\n"
+        "Please install dependencies using one of the following methods:\n"
+        "  - pip install -e .\n"
+        "  - pip install requests\n"
+        "  - uv pip install -e .\n\n"
+        "The 'requests' package is declared in pyproject.toml and should be "
+        "installed as part of the project dependencies.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 try:
     from openrouter import OpenRouter
@@ -243,30 +232,15 @@ class PDFReader(DocumentReader):
         try:
             import pdfplumber
         except ImportError:
-            print("Warning: pdfplumber package not found, attempting to install...")
-            import subprocess
-
-            try:
-                subprocess.check_call(
-                    [
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "install",
-                        "pdfplumber",
-                        "--break-system-packages",
-                        "-q",
-                    ]
-                )
-                import pdfplumber
-
-                print("Successfully installed pdfplumber package")
-            except subprocess.CalledProcessError as e:
-                print(f"Error: Failed to install pdfplumber package: {e}")
-                print("Please install pdfplumber manually: pip install pdfplumber")
-                raise RuntimeError(
-                    "Failed to install required 'pdfplumber' package"
-                ) from e
+            print(
+                "Error: 'pdfplumber' package is required for PDF processing but not installed.\n"
+                "Please install it using one of the following methods:\n"
+                "  - pip install pdfplumber\n"
+                "  - uv pip install pdfplumber\n\n"
+                "PDF processing will not be available until pdfplumber is installed.",
+                file=sys.stderr,
+            )
+            return ""
 
         text_parts = []
         with pdfplumber.open(file_path) as pdf:
