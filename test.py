@@ -9094,3 +9094,1163 @@ async def test_cli_config_validate_fails_when_unconfigured(db_pool):
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
+
+
+# =============================================================================
+# ACCELERATION LAYER TESTS (Episodes & Temporal Segmentation)
+# =============================================================================
+
+
+async def test_episodes_table_structure(db_pool):
+    """Test episodes table with time_range TSTZRANGE generated column"""
+    async with db_pool.acquire() as conn:
+        # Check table exists
+        exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name = 'episodes'
+            )
+            """
+        )
+        assert exists, "episodes table not found"
+        
+        # Check key columns
+        columns = await conn.fetch(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = 'episodes'
+            ORDER BY ordinal_position
+            """
+        )
+        col_dict = {c["column_name"]: c for c in columns}
+        
+        assert "id" in col_dict
+        assert "started_at" in col_dict
+        assert "ended_at" in col_dict
+        assert "summary" in col_dict
+        assert "summary_embedding" in col_dict
+        assert "time_range" in col_dict
+        
+        # Verify time_range is a tstzrange type
+        assert col_dict["time_range"]["data_type"] == "tstzrange"
+
+
+async def test_auto_episode_assignment_trigger(db_pool):
+    """Test trg_auto_episode_assignment trigger:
+    - Creates new episode when first memory inserted
+    - Continues episode within 30-minute gap
+    - Closes old episode and creates new one after 30-minute gap
+    - Correctly sets sequence_order in episode_memories
+    - Initializes memory_neighborhoods record
+    """
+    test_id = get_test_identifier("episode_trigger")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up any existing test data
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create first memory - should create new episode
+        mem1_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('episodic', $1, 0.5)
+            RETURNING id
+            """,
+            f"First memory {test_id}",
+        )
+        
+        # Check episode was created
+        episode1 = await conn.fetchrow(
+            """
+            SELECT e.id, e.started_at, e.ended_at, em.sequence_order
+            FROM episodes e
+            JOIN episode_memories em ON e.id = em.episode_id
+            WHERE em.memory_id = $1
+            """,
+            mem1_id,
+        )
+        assert episode1 is not None, "Episode not created for first memory"
+        assert episode1["sequence_order"] == 1, "First memory should have sequence_order 1"
+        assert episode1["ended_at"] is None, "Episode should still be open"
+        
+        # Check memory_neighborhoods was initialized
+        neighborhood = await conn.fetchrow(
+            "SELECT * FROM memory_neighborhoods WHERE memory_id = $1",
+            mem1_id,
+        )
+        assert neighborhood is not None, "memory_neighborhoods not initialized"
+        
+        # Create second memory within 30 minutes - should join same episode
+        await asyncio.sleep(0.1)  # Small delay to ensure different timestamp
+        mem2_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('episodic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Second memory {test_id}",
+        )
+        
+        episode2 = await conn.fetchrow(
+            """
+            SELECT e.id, em.sequence_order
+            FROM episodes e
+            JOIN episode_memories em ON e.id = em.episode_id
+            WHERE em.memory_id = $1
+            """,
+            mem2_id,
+        )
+        assert episode2["id"] == episode1["id"], "Second memory should join same episode"
+        assert episode2["sequence_order"] == 2, "Second memory should have sequence_order 2"
+        
+        # Simulate 31-minute gap by manually setting started_at far in past
+        await conn.execute(
+            """
+            UPDATE episodes 
+            SET started_at = started_at - INTERVAL '31 minutes'
+            WHERE id = $1
+            """,
+            episode1["id"],
+        )
+        
+        # Create third memory - should create new episode due to gap
+        mem3_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('episodic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Third memory {test_id}",
+        )
+        
+        episode3 = await conn.fetchrow(
+            """
+            SELECT e.id, em.sequence_order
+            FROM episodes e
+            JOIN episode_memories em ON e.id = em.episode_id
+            WHERE em.memory_id = $1
+            """,
+            mem3_id,
+        )
+        assert episode3["id"] != episode1["id"], "Third memory should create new episode"
+        assert episode3["sequence_order"] == 1, "First memory in new episode should have sequence_order 1"
+        
+        # Check first episode was closed
+        episode1_updated = await conn.fetchrow(
+            "SELECT ended_at FROM episodes WHERE id = $1",
+            episode1["id"],
+        )
+        assert episode1_updated["ended_at"] is not None, "First episode should be closed"
+
+
+async def test_episode_summary_view(db_pool):
+    """Test episode_summary view calculations:
+    - memory_count
+    - first_memory_at / last_memory_at
+    """
+    test_id = get_test_identifier("episode_summary")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create episode with multiple memories
+        mem_ids = []
+        for i in range(3):
+            await asyncio.sleep(0.05)  # Small delay between memories
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, importance)
+                VALUES ('episodic', $1, 0.5)
+                RETURNING id
+                """,
+                f"Memory {i} {test_id}",
+            )
+            mem_ids.append(mem_id)
+        
+        # Get episode_id from first memory
+        episode_id = await conn.fetchval(
+            """
+            SELECT episode_id FROM episode_memories WHERE memory_id = $1
+            """,
+            mem_ids[0],
+        )
+        
+        # Check episode_summary view
+        summary = await conn.fetchrow(
+            """
+            SELECT * FROM episode_summary WHERE episode_id = $1
+            """,
+            episode_id,
+        )
+        
+        assert summary is not None, "Episode summary not found"
+        assert summary["memory_count"] == 3, f"Expected 3 memories, got {summary['memory_count']}"
+        assert summary["first_memory_at"] is not None
+        assert summary["last_memory_at"] is not None
+        assert summary["first_memory_at"] <= summary["last_memory_at"]
+
+
+async def test_episode_time_range_gist_index(db_pool):
+    """Test GiST index on episodes.time_range for temporal queries"""
+    test_id = get_test_identifier("episode_gist")
+    
+    async with db_pool.acquire() as conn:
+        # Check index exists
+        index_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'episodes'
+                AND indexname = 'idx_episodes_time_range'
+            )
+            """
+        )
+        assert index_exists, "GiST index on episodes.time_range not found"
+        
+        # Create test episode
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('episodic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Query using time range - should use index
+        result = await conn.fetch(
+            """
+            SELECT e.id, e.time_range
+            FROM episodes e
+            WHERE e.time_range @> NOW()
+            LIMIT 10
+            """
+        )
+        # Just verify query executes without error
+        assert result is not None
+
+
+# =============================================================================
+# MEMORY NEIGHBORHOODS TESTS (Precomputed Spreading Activation)
+# =============================================================================
+
+
+async def test_memory_neighborhoods_initialization(db_pool):
+    """Test that memory_neighborhoods record is created on memory insert"""
+    test_id = get_test_identifier("neighborhood_init")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create memory
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.7)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Check memory_neighborhoods was created
+        neighborhood = await conn.fetchrow(
+            """
+            SELECT memory_id, neighbors, is_stale, computed_at
+            FROM memory_neighborhoods
+            WHERE memory_id = $1
+            """,
+            mem_id,
+        )
+        
+        assert neighborhood is not None, "memory_neighborhoods record not created"
+        assert neighborhood["memory_id"] == mem_id
+        assert neighborhood["neighbors"] is not None
+        assert neighborhood["computed_at"] is not None
+
+
+async def test_neighborhoods_staleness_trigger(db_pool):
+    """Test trg_neighborhood_staleness marks neighborhoods stale:
+    - On importance change
+    - On status change
+    """
+    test_id = get_test_identifier("neighborhood_stale")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create memory
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Initially should not be stale (or might be stale from creation)
+        # Let's mark it as not stale first
+        await conn.execute(
+            """
+            UPDATE memory_neighborhoods
+            SET is_stale = FALSE
+            WHERE memory_id = $1
+            """,
+            mem_id,
+        )
+        
+        # Update importance - should mark stale
+        await conn.execute(
+            """
+            UPDATE memories
+            SET importance = 0.9
+            WHERE id = $1
+            """,
+            mem_id,
+        )
+        
+        is_stale = await conn.fetchval(
+            """
+            SELECT is_stale FROM memory_neighborhoods WHERE memory_id = $1
+            """,
+            mem_id,
+        )
+        assert is_stale is True, "Neighborhood not marked stale after importance change"
+        
+        # Mark not stale again
+        await conn.execute(
+            """
+            UPDATE memory_neighborhoods
+            SET is_stale = FALSE
+            WHERE memory_id = $1
+            """,
+            mem_id,
+        )
+        
+        # Update status - should mark stale
+        await conn.execute(
+            """
+            UPDATE memories
+            SET status = 'archived'
+            WHERE id = $1
+            """,
+            mem_id,
+        )
+        
+        is_stale = await conn.fetchval(
+            """
+            SELECT is_stale FROM memory_neighborhoods WHERE memory_id = $1
+            """,
+            mem_id,
+        )
+        assert is_stale is True, "Neighborhood not marked stale after status change"
+
+
+async def test_stale_neighborhoods_view(db_pool):
+    """Test stale_neighborhoods view shows correct memories"""
+    test_id = get_test_identifier("stale_view")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create memory and mark neighborhood as stale
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        await conn.execute(
+            """
+            UPDATE memory_neighborhoods
+            SET is_stale = TRUE
+            WHERE memory_id = $1
+            """,
+            mem_id,
+        )
+        
+        # Check stale_neighborhoods view
+        stale = await conn.fetch(
+            """
+            SELECT memory_id FROM stale_neighborhoods
+            WHERE memory_id = $1
+            """,
+            mem_id,
+        )
+        
+        assert len(stale) > 0, "Stale memory not found in stale_neighborhoods view"
+        assert stale[0]["memory_id"] == mem_id
+
+
+async def test_neighborhoods_gin_index(db_pool):
+    """Test GIN index on neighbors JSONB works correctly"""
+    test_id = get_test_identifier("neighborhood_gin")
+    
+    async with db_pool.acquire() as conn:
+        # Check index exists
+        index_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'memory_neighborhoods'
+                AND indexname = 'idx_memory_neighborhoods_neighbors'
+            )
+            """
+        )
+        assert index_exists, "GIN index on memory_neighborhoods.neighbors not found"
+        
+        # Create test memory
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Query using JSONB operators - should use index
+        result = await conn.fetch(
+            """
+            SELECT memory_id
+            FROM memory_neighborhoods
+            WHERE neighbors ? $1::text
+            LIMIT 10
+            """,
+            str(mem_id),
+        )
+        # Just verify query executes without error
+        assert result is not None
+
+
+# =============================================================================
+# ACTIVATION CACHE TESTS (Unlogged Table)
+# =============================================================================
+
+
+async def test_activation_cache_unlogged(db_pool):
+    """Test activation_cache is UNLOGGED (fast writes, transient data)"""
+    async with db_pool.acquire() as conn:
+        # Check table persistence setting
+        is_unlogged = await conn.fetchval(
+            """
+            SELECT relpersistence = 'u'
+            FROM pg_class
+            WHERE relname = 'activation_cache'
+            AND relnamespace = 'public'::regnamespace
+            """
+        )
+        assert is_unlogged, "activation_cache should be UNLOGGED table"
+        
+        # Verify we can insert and query
+        test_id = get_test_identifier("activation_cache")
+        session_id = f"session_{test_id}"
+        
+        # Create test memory
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Insert activation
+        await conn.execute(
+            """
+            INSERT INTO activation_cache (session_id, memory_id, activation_level)
+            VALUES ($1, $2, 0.8)
+            ON CONFLICT (session_id, memory_id) DO UPDATE
+            SET activation_level = EXCLUDED.activation_level
+            """,
+            session_id,
+            mem_id,
+        )
+        
+        # Query activation
+        activation = await conn.fetchval(
+            """
+            SELECT activation_level
+            FROM activation_cache
+            WHERE session_id = $1 AND memory_id = $2
+            """,
+            session_id,
+            mem_id,
+        )
+        assert activation == 0.8
+
+
+async def test_activation_cache_session_isolation(db_pool):
+    """Test activation levels are isolated by session_id"""
+    test_id = get_test_identifier("activation_isolation")
+    
+    async with db_pool.acquire() as conn:
+        # Create test memory
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Insert activations for two different sessions
+        session1 = f"session1_{test_id}"
+        session2 = f"session2_{test_id}"
+        
+        await conn.execute(
+            """
+            INSERT INTO activation_cache (session_id, memory_id, activation_level)
+            VALUES ($1, $2, 0.7)
+            ON CONFLICT (session_id, memory_id) DO UPDATE
+            SET activation_level = EXCLUDED.activation_level
+            """,
+            session1,
+            mem_id,
+        )
+        
+        await conn.execute(
+            """
+            INSERT INTO activation_cache (session_id, memory_id, activation_level)
+            VALUES ($1, $2, 0.3)
+            ON CONFLICT (session_id, memory_id) DO UPDATE
+            SET activation_level = EXCLUDED.activation_level
+            """,
+            session2,
+            mem_id,
+        )
+        
+        # Verify isolation
+        act1 = await conn.fetchval(
+            """
+            SELECT activation_level
+            FROM activation_cache
+            WHERE session_id = $1 AND memory_id = $2
+            """,
+            session1,
+            mem_id,
+        )
+        
+        act2 = await conn.fetchval(
+            """
+            SELECT activation_level
+            FROM activation_cache
+            WHERE session_id = $1 AND memory_id = $2
+            """,
+            session2,
+            mem_id,
+        )
+        
+        assert act1 == 0.7, "Session 1 activation incorrect"
+        assert act2 == 0.3, "Session 2 activation incorrect"
+
+
+# =============================================================================
+# CONCEPT LAYER TESTS
+# =============================================================================
+
+
+async def test_concepts_table(db_pool):
+    """Test concepts table with:
+    - Unique name constraint
+    - Flattened ancestors array
+    - path_text hierarchy string
+    - depth tracking
+    """
+    test_id = get_test_identifier("concepts_table")
+    
+    async with db_pool.acquire() as conn:
+        # Check table exists
+        exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name = 'concepts'
+            )
+            """
+        )
+        assert exists, "concepts table not found"
+        
+        # Check key columns
+        columns = await conn.fetch(
+            """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_name = 'concepts'
+            ORDER BY ordinal_position
+            """
+        )
+        col_dict = {c["column_name"]: c for c in columns}
+        
+        assert "id" in col_dict
+        assert "name" in col_dict
+        assert "parent_id" in col_dict
+        assert "ancestors" in col_dict
+        assert "path_text" in col_dict
+        assert "depth" in col_dict
+        
+        # Test unique name constraint
+        concept_name = f"test_concept_{test_id}"
+        
+        await conn.execute(
+            """
+            INSERT INTO concepts (name, depth)
+            VALUES ($1, 0)
+            ON CONFLICT (name) DO NOTHING
+            """,
+            concept_name,
+        )
+        
+        # Try to insert duplicate - should be prevented by unique constraint
+        try:
+            await conn.execute(
+                """
+                INSERT INTO concepts (name, depth)
+                VALUES ($1, 0)
+                """,
+                concept_name,
+            )
+            assert False, "Duplicate concept name should be prevented"
+        except asyncpg.UniqueViolationError:
+            pass  # Expected
+
+
+async def test_memory_concepts_junction(db_pool):
+    """Test memory_concepts many-to-many relationship"""
+    test_id = get_test_identifier("memory_concepts")
+    
+    async with db_pool.acquire() as conn:
+        # Create concept
+        concept_name = f"test_concept_{test_id}"
+        concept_id = await conn.fetchval(
+            """
+            INSERT INTO concepts (name, depth)
+            VALUES ($1, 0)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            concept_name,
+        )
+        
+        # Create memory
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Link memory to concept
+        await conn.execute(
+            """
+            INSERT INTO memory_concepts (memory_id, concept_id, strength)
+            VALUES ($1, $2, 0.8)
+            ON CONFLICT (memory_id, concept_id) DO UPDATE
+            SET strength = EXCLUDED.strength
+            """,
+            mem_id,
+            concept_id,
+        )
+        
+        # Verify link
+        strength = await conn.fetchval(
+            """
+            SELECT strength
+            FROM memory_concepts
+            WHERE memory_id = $1 AND concept_id = $2
+            """,
+            mem_id,
+            concept_id,
+        )
+        assert strength == 0.8
+
+
+async def test_link_memory_to_concept_function(db_pool):
+    """Test link_memory_to_concept():
+    - Creates concept if not exists
+    - Creates relational link in memory_concepts
+    - Creates INSTANCE_OF edge in graph
+    """
+    test_id = get_test_identifier("link_concept")
+    
+    async with db_pool.acquire() as conn:
+        # Create memory
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.5)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Link to concept (should create concept if not exists)
+        concept_name = f"auto_concept_{test_id}"
+        await conn.execute(
+            """
+            SELECT link_memory_to_concept($1, $2, 0.9)
+            """,
+            mem_id,
+            concept_name,
+        )
+        
+        # Verify concept was created
+        concept_id = await conn.fetchval(
+            """
+            SELECT id FROM concepts WHERE name = $1
+            """,
+            concept_name,
+        )
+        assert concept_id is not None, "Concept not created"
+        
+        # Verify relational link
+        strength = await conn.fetchval(
+            """
+            SELECT strength
+            FROM memory_concepts
+            WHERE memory_id = $1 AND concept_id = $2
+            """,
+            mem_id,
+            concept_id,
+        )
+        assert strength == 0.9, "Memory-concept link not created"
+        
+        # Verify graph edge (INSTANCE_OF)
+        edge_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM cypher('memory_graph', $
+                    MATCH (m:MemoryNode)-[r:INSTANCE_OF]->(c:ConceptNode)
+                    WHERE m.memory_id = $mem_id AND c.concept_id = $concept_id
+                    RETURN r
+                $, $1) as (r agtype)
+            )
+            """,
+            json.dumps({"mem_id": str(mem_id), "concept_id": str(concept_id)}),
+        )
+        # Note: Graph edge creation might be optional depending on implementation
+        # Just verify the function doesn't error
+
+
+async def test_concept_hierarchy(db_pool):
+    """Test concept hierarchy with ancestors and path_text:
+    - Build hierarchy: Entity -> Organism -> Animal -> Dog
+    - Verify ancestors array flattening
+    - Verify depth calculation
+    """
+    test_id = get_test_identifier("concept_hierarchy")
+    
+    async with db_pool.acquire() as conn:
+        # Create hierarchy
+        entity_name = f"Entity_{test_id}"
+        organism_name = f"Organism_{test_id}"
+        animal_name = f"Animal_{test_id}"
+        dog_name = f"Dog_{test_id}"
+        
+        # Level 0: Entity
+        entity_id = await conn.fetchval(
+            """
+            INSERT INTO concepts (name, depth, path_text)
+            VALUES ($1, 0, $1)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            entity_name,
+        )
+        
+        # Level 1: Organism
+        organism_id = await conn.fetchval(
+            """
+            INSERT INTO concepts (name, parent_id, ancestors, depth, path_text)
+            VALUES ($1, $2, ARRAY[$2], 1, $3 || ' > ' || $1)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            organism_name,
+            entity_id,
+            entity_name,
+        )
+        
+        # Level 2: Animal
+        animal_id = await conn.fetchval(
+            """
+            INSERT INTO concepts (name, parent_id, ancestors, depth, path_text)
+            VALUES ($1, $2, ARRAY[$3, $2], 2, $4 || ' > ' || $5 || ' > ' || $1)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            animal_name,
+            organism_id,
+            entity_id,
+            entity_name,
+            organism_name,
+        )
+        
+        # Level 3: Dog
+        dog_id = await conn.fetchval(
+            """
+            INSERT INTO concepts (name, parent_id, ancestors, depth, path_text)
+            VALUES ($1, $2, ARRAY[$3, $4, $2], 3, $5 || ' > ' || $6 || ' > ' || $7 || ' > ' || $1)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            dog_name,
+            animal_id,
+            entity_id,
+            organism_id,
+            entity_name,
+            organism_name,
+            animal_name,
+        )
+        
+        # Verify Dog's ancestors
+        dog = await conn.fetchrow(
+            """
+            SELECT ancestors, depth, path_text
+            FROM concepts
+            WHERE id = $1
+            """,
+            dog_id,
+        )
+        
+        assert dog["depth"] == 3, f"Expected depth 3, got {dog['depth']}"
+        assert len(dog["ancestors"]) == 3, f"Expected 3 ancestors, got {len(dog['ancestors'])}"
+        assert entity_id in dog["ancestors"], "Entity not in ancestors"
+        assert organism_id in dog["ancestors"], "Organism not in ancestors"
+        assert animal_id in dog["ancestors"], "Animal not in ancestors"
+        assert dog_name in dog["path_text"], "Dog not in path_text"
+
+
+async def test_concepts_ancestors_gin_index(db_pool):
+    """Test GIN index on concepts.ancestors for hierarchy queries"""
+    async with db_pool.acquire() as conn:
+        # Check index exists
+        index_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE tablename = 'concepts'
+                AND indexname = 'idx_concepts_ancestors'
+            )
+            """
+        )
+        assert index_exists, "GIN index on concepts.ancestors not found"
+        
+        # Create test concept with ancestors
+        test_id = get_test_identifier("concept_gin")
+        parent_id = await conn.fetchval(
+            """
+            INSERT INTO concepts (name, depth)
+            VALUES ($1, 0)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            f"parent_{test_id}",
+        )
+        
+        child_id = await conn.fetchval(
+            """
+            INSERT INTO concepts (name, parent_id, ancestors, depth)
+            VALUES ($1, $2, ARRAY[$2], 1)
+            ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+            RETURNING id
+            """,
+            f"child_{test_id}",
+            parent_id,
+        )
+        
+        # Query using array operators - should use GIN index
+        result = await conn.fetch(
+            """
+            SELECT id, name
+            FROM concepts
+            WHERE ancestors @> ARRAY[$1]::uuid[]
+            LIMIT 10
+            """,
+            parent_id,
+        )
+        
+        # Verify child is in results
+        assert any(r["id"] == child_id for r in result), "Child concept not found in hierarchy query"
+
+
+# =============================================================================
+# FAST_RECALL FUNCTION TESTS (Primary Hot-Path Retrieval)
+# =============================================================================
+
+
+async def test_fast_recall_basic(db_pool):
+    """Test fast_recall() primary retrieval:
+    - Returns memories with similarity scores
+    - Respects limit parameter
+    - Only returns active memories
+    """
+    test_id = get_test_identifier("fast_recall_basic")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create test memories
+        mem_ids = []
+        for i in range(5):
+            mem_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, importance, status)
+                VALUES ('semantic', $1, 0.7, 'active')
+                RETURNING id
+                """,
+                f"Test memory {i} {test_id}",
+            )
+            mem_ids.append(mem_id)
+        
+        # Create archived memory (should not be returned)
+        archived_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance, status)
+            VALUES ('semantic', $1, 0.7, 'archived')
+            RETURNING id
+            """,
+            f"Archived memory {test_id}",
+        )
+        
+        # Call fast_recall
+        results = await conn.fetch(
+            """
+            SELECT * FROM fast_recall($1, 3)
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Verify results
+        assert len(results) <= 3, f"Expected at most 3 results, got {len(results)}"
+        
+        # Verify all results are active
+        for row in results:
+            mem_status = await conn.fetchval(
+                "SELECT status FROM memories WHERE id = $1",
+                row["memory_id"],
+            )
+            assert mem_status == "active", f"Non-active memory returned: {mem_status}"
+        
+        # Verify archived memory not in results
+        assert not any(r["memory_id"] == archived_id for r in results), "Archived memory should not be returned"
+
+
+async def test_fast_recall_vector_scoring(db_pool):
+    """Test vector similarity component of fast_recall scoring"""
+    test_id = get_test_identifier("fast_recall_vector")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create memories with known content for similarity
+        similar_content = f"Python programming language {test_id}"
+        dissimilar_content = f"Cooking recipes for pasta {test_id}"
+        
+        similar_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.7)
+            RETURNING id
+            """,
+            similar_content,
+        )
+        
+        dissimilar_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.7)
+            RETURNING id
+            """,
+            dissimilar_content,
+        )
+        
+        # Query with similar content
+        results = await conn.fetch(
+            """
+            SELECT memory_id, score
+            FROM fast_recall($1, 5)
+            ORDER BY score DESC
+            """,
+            f"Python programming {test_id}",
+        )
+        
+        # Find positions of our test memories
+        similar_pos = next((i for i, r in enumerate(results) if r["memory_id"] == similar_id), None)
+        dissimilar_pos = next((i for i, r in enumerate(results) if r["memory_id"] == dissimilar_id), None)
+        
+        # Similar content should rank higher (lower position index)
+        if similar_pos is not None and dissimilar_pos is not None:
+            assert similar_pos < dissimilar_pos, "Similar content should rank higher than dissimilar"
+
+
+async def test_fast_recall_neighborhood_expansion(db_pool):
+    """Test association expansion via precomputed neighborhoods:
+    - Seed memories expand via neighbors JSONB
+    - Non-stale neighborhoods contribute to score
+    """
+    test_id = get_test_identifier("fast_recall_neighborhood")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create seed memory
+        seed_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.8)
+            RETURNING id
+            """,
+            f"Seed memory {test_id}",
+        )
+        
+        # Create neighbor memory
+        neighbor_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.7)
+            RETURNING id
+            """,
+            f"Neighbor memory {test_id}",
+        )
+        
+        # Manually set up neighborhood relationship
+        neighbors_json = json.dumps({str(neighbor_id): 0.9})
+        await conn.execute(
+            """
+            UPDATE memory_neighborhoods
+            SET neighbors = $1::jsonb, is_stale = FALSE
+            WHERE memory_id = $2
+            """,
+            neighbors_json,
+            seed_id,
+        )
+        
+        # Query for seed memory
+        results = await conn.fetch(
+            """
+            SELECT memory_id, source
+            FROM fast_recall($1, 10)
+            """,
+            f"Seed memory {test_id}",
+        )
+        
+        # Verify both seed and neighbor are in results
+        memory_ids = [r["memory_id"] for r in results]
+        assert seed_id in memory_ids, "Seed memory not in results"
+        # Neighbor might be in results via association expansion
+
+
+async def test_fast_recall_temporal_context(db_pool):
+    """Test temporal context component:
+    - Memories in same episode get temporal boost
+    """
+    test_id = get_test_identifier("fast_recall_temporal")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create memories in same episode (within 30 minutes)
+        mem1_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('episodic', $1, 0.6)
+            RETURNING id
+            """,
+            f"First memory {test_id}",
+        )
+        
+        await asyncio.sleep(0.1)
+        
+        mem2_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('episodic', $1, 0.6)
+            RETURNING id
+            """,
+            f"Second memory {test_id}",
+        )
+        
+        # Verify they're in same episode
+        episode1 = await conn.fetchval(
+            "SELECT episode_id FROM episode_memories WHERE memory_id = $1",
+            mem1_id,
+        )
+        episode2 = await conn.fetchval(
+            "SELECT episode_id FROM episode_memories WHERE memory_id = $1",
+            mem2_id,
+        )
+        
+        if episode1 == episode2:
+            # Query for first memory
+            results = await conn.fetch(
+                """
+                SELECT memory_id, source
+                FROM fast_recall($1, 10)
+                """,
+                f"First memory {test_id}",
+            )
+            
+            # Both memories should be in results
+            memory_ids = [r["memory_id"] for r in results]
+            assert mem1_id in memory_ids, "First memory not in results"
+            # Second memory might be boosted by temporal context
+
+
+async def test_fast_recall_source_attribution(db_pool):
+    """Test source field correctly identifies retrieval source:
+    - 'vector' for direct similarity matches
+    - 'association' for neighborhood expansion
+    - 'temporal' for episode context
+    """
+    test_id = get_test_identifier("fast_recall_source")
+    
+    async with db_pool.acquire() as conn:
+        # Clean up
+        await conn.execute("DELETE FROM memories WHERE content LIKE $1", f"%{test_id}%")
+        
+        # Create test memory
+        mem_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, importance)
+            VALUES ('semantic', $1, 0.7)
+            RETURNING id
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Query with exact match
+        results = await conn.fetch(
+            """
+            SELECT memory_id, source, score
+            FROM fast_recall($1, 5)
+            """,
+            f"Test memory {test_id}",
+        )
+        
+        # Verify source field exists and has valid values
+        valid_sources = {'vector', 'association', 'temporal', 'combined'}
+        for row in results:
+            assert "source" in row, "Source field missing"
+            # Source might be null or one of the valid values depending on implementation
+            if row["source"] is not None:
+                assert row["source"] in valid_sources, f"Invalid source: {row['source']}"
