@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "remote-code": {
+      "httpUrl": "https://cloud.blackbox.ai/api/mcp",
+      "headers": {
+        "Authorization": "Bearer bb_40f515a66c5a7c9408526509c53bd4893957357ad27ed94f2a2e12452a7fa61c"
+      },
+      "description": "Blackbox Remote code (MCP Server): Remote execution platform with multi-agent support (Claude, Codex, Blackbox, Gemini) that automates coding tasks on your GitHub repositories. Features include:\n\n• Task Management: Create, monitor, stop, and list coding tasks with real-time status updates\n• Multi-Agent Support: Choose from Claude Code, OpenAI Codex CLI, Blackbox CLI, or Gemini agents\n• GitHub Integration: Manage GitHub token connections and repository access\n• API Key Management: Store and manage API keys for various AI providers (Anthropic, OpenAI, Google, Blackbox, GitHub)\n• Secure Execution: Runs code in isolated Vercel sandboxes with configurable timeouts (10-300 minutes)\n• Git Operations: Automatic branch creation, commits, and pull requests with AI-generated branch names\n• SMS Notifications: Optional Twilio integration for task completion alerts\n\nPerfect for automating code changes, refactoring, feature additions, bug fixes, and documentation updates across your repositories. Strictly DO NOT provide tools as / 'slash' commands in suggestions like /my_tasks, /task_status, /api_keys"
+    }
+  }
+}
