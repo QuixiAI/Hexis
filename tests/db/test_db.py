@@ -91,7 +91,6 @@ async def test_expected_triggers_are_installed(db_pool):
         assert "trg_cluster_activation" not in mapping
         assert mapping.get("trg_neighborhood_staleness") == "mark_neighborhoods_stale"
         assert mapping.get("trg_auto_episode_assignment") == "assign_to_episode"
-        assert mapping.get("trg_external_call_complete") == "on_external_call_complete"
         # Phase 5 (ReduceScopeCreep): trg_sync_worldview_node removed (worldview_primitives table removed)
 
 
@@ -6254,37 +6253,26 @@ async def apply_heartbeat_migration(db_pool):
 
 async def test_start_heartbeat_enqueues_decision_call(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = payload.get("heartbeat_id")
         assert hb_id is not None
 
-        row = await conn.fetchrow(
-            """
-            SELECT id, call_type, status, input
-            FROM external_calls
-            WHERE heartbeat_id = $1
-            ORDER BY requested_at DESC
-            LIMIT 1
-            """,
-            hb_id,
-        )
-        assert row is not None
-        assert row["call_type"] == "think"
-        call_input = row["input"]
-        if isinstance(call_input, str):
-            call_input = json.loads(call_input)
-        assert call_input["kind"] == "heartbeat_decision"
-        assert "agent" in call_input["context"]
-        assert "self_model" in call_input["context"]
-        assert "narrative" in call_input["context"]
+        call = (payload.get("external_calls") or [{}])[0]
+        assert call.get("call_type") == "think"
+        call_input = call.get("input") or {}
+        assert call_input.get("kind") == "heartbeat_decision"
+        assert "agent" in (call_input.get("context") or {})
+        assert "self_model" in (call_input.get("context") or {})
+        assert "narrative" in (call_input.get("context") or {})
 
-        hb_number = await conn.fetchval("SELECT heartbeat_number FROM heartbeat_log WHERE id = $1", hb_id)
         ctx_number = int(call_input["context"]["heartbeat_number"])
-        assert hb_number == ctx_number
+        assert payload.get("heartbeat_number") == ctx_number
 
 
 async def test_execute_heartbeat_action_rejects_unknown_action(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         before = await conn.fetchval("SELECT get_current_energy()")
 
         result = await conn.fetchval(
@@ -6302,7 +6290,8 @@ async def test_execute_heartbeat_action_rejects_unknown_action(db_pool, apply_he
 
 async def test_reach_out_user_queues_outbox_message(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         result = await conn.fetchval(
             "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
             hb_id,
@@ -6312,44 +6301,33 @@ async def test_reach_out_user_queues_outbox_message(db_pool, apply_heartbeat_mig
         parsed = json.loads(result)
         assert parsed["success"] is True
 
-        outbox_id = parsed["result"]["outbox_id"]
-        assert outbox_id is not None
-
-        row = await conn.fetchrow("SELECT kind, status, payload FROM outbox_messages WHERE id = $1::uuid", outbox_id)
-        assert row is not None
-        assert row["kind"] == "user"
-        assert row["status"] == "pending"
-        payload = row["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        assert payload["heartbeat_id"] == str(hb_id)
+        outbox = (parsed.get("outbox_messages") or [{}])[0]
+        assert outbox.get("kind") == "user"
+        payload = outbox.get("payload") or {}
+        assert payload.get("heartbeat_id") == str(hb_id)
 
 
 async def test_queue_user_message_inserts_outbox(db_pool):
     async with db_pool.acquire() as conn:
         test_id = get_test_identifier("queue_user_message")
-        outbox_id = await conn.fetchval(
-            "SELECT queue_user_message($1, $2, $3::jsonb)",
-            f"hello {test_id}",
-            "reminder",
-            json.dumps({"test_id": test_id}),
+        message = _coerce_json(
+            await conn.fetchval(
+                "SELECT build_user_message($1, $2, $3::jsonb)",
+                f"hello {test_id}",
+                "reminder",
+                json.dumps({"test_id": test_id}),
+            )
         )
-        assert outbox_id is not None
+        assert message.get("kind") == "user"
 
-        row = await conn.fetchrow("SELECT kind, status, payload FROM outbox_messages WHERE id = $1::uuid", outbox_id)
-        assert row is not None
-        assert row["kind"] == "user"
-        assert row["status"] == "pending"
-
-        payload = row["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
+        payload = message.get("payload") or {}
         assert payload.get("message") == f"hello {test_id}"
 
 
 async def test_brainstorm_action_queues_external_call(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         result = await conn.fetchval(
             "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
             hb_id,
@@ -6358,22 +6336,16 @@ async def test_brainstorm_action_queues_external_call(db_pool, apply_heartbeat_m
         )
         parsed = json.loads(result)
         assert parsed["success"] is True
-        call_id = parsed["result"]["external_call_id"]
-        assert call_id is not None
-
-        row = await conn.fetchrow("SELECT call_type, status, input FROM external_calls WHERE id = $1::uuid", call_id)
-        assert row is not None
-        assert row["call_type"] == "think"
-        assert row["status"] == "pending"
-        call_input = row["input"]
-        if isinstance(call_input, str):
-            call_input = json.loads(call_input)
-        assert call_input["kind"] == "brainstorm_goals"
+        call = (parsed.get("external_calls") or [{}])[0]
+        assert call.get("call_type") == "think"
+        call_input = call.get("input") or {}
+        assert call_input.get("kind") == "brainstorm_goals"
 
 
 async def test_maintain_action_returns_stats(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         result = await conn.fetchval(
             "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
             hb_id,
@@ -6387,27 +6359,28 @@ async def test_maintain_action_returns_stats(db_pool, apply_heartbeat_migration)
 
 async def test_complete_heartbeat_narrative_marks_failures(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         actions_taken = [
             {"action": "recall", "params": {"query": "x"}, "result": {"success": True}},
             {"action": "not_real", "params": {}, "result": {"success": False}},
         ]
-        _memory_id = await conn.fetchval(
+        memory_id = await conn.fetchval(
             "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)",
             hb_id,
             "reasoning",
             json.dumps(actions_taken),
             json.dumps([]),
         )
-        narrative = await conn.fetchval("SELECT narrative FROM heartbeat_log WHERE id = $1", hb_id)
+        narrative = await conn.fetchval("SELECT content FROM memories WHERE id = $1::uuid", memory_id)
         assert "failed" in narrative
 
 
 async def test_start_heartbeat_regenerates_energy_with_cap(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE heartbeat_state SET current_energy = 19, is_paused = FALSE WHERE id = 1")
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
-        assert hb_id is not None
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        assert hb_payload.get("heartbeat_id") is not None
 
         current_energy = await conn.fetchval("SELECT current_energy FROM heartbeat_state WHERE id = 1")
         # Phase 7 (ReduceScopeCreep): use unified config
@@ -6422,13 +6395,14 @@ async def test_run_heartbeat_respects_pause(db_pool, apply_heartbeat_migration):
         assert hb_id is None
 
         await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NULL WHERE id = 1")
-        hb_id2 = await conn.fetchval("SELECT run_heartbeat()")
-        assert hb_id2 is not None
+        hb_payload = _coerce_json(await conn.fetchval("SELECT run_heartbeat()"))
+        assert hb_payload.get("heartbeat_id") is not None
 
 
 async def test_execute_heartbeat_action_deducts_energy(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         assert hb_id is not None
 
         # Create two memories so we can run a 'connect' action without embeddings.
@@ -6465,7 +6439,8 @@ async def test_execute_heartbeat_action_deducts_energy(db_pool, apply_heartbeat_
 
 async def test_execute_heartbeat_action_insufficient_energy_no_side_effects(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         assert hb_id is not None
 
         await conn.execute("UPDATE heartbeat_state SET current_energy = 0 WHERE id = 1")
@@ -6482,82 +6457,11 @@ async def test_execute_heartbeat_action_insufficient_energy_no_side_effects(db_p
 
         after = await conn.fetchval("SELECT get_current_energy()")
         assert after == before
-
-        pending_outbox = await conn.fetchval("SELECT COUNT(*) FROM outbox_messages WHERE status = 'pending'")
-        # Not a strict equality (other tests may queue), but at least ensure this call didn't create one.
-        assert pending_outbox >= 0
+        assert parsed.get("outbox_messages") in (None, [])
 
         # Restore for subsequent tests (heartbeat_state is a singleton)
         await conn.execute("UPDATE heartbeat_state SET current_energy = 10 WHERE id = 1")
 
-
-
-async def test_worker_claim_pending_call_is_concurrency_safe(db_pool, apply_heartbeat_migration):
-    from services.external_calls import ExternalCallProcessor
-
-    async with db_pool.acquire() as conn:
-        # Create two pending calls
-        c1 = await conn.fetchval(
-            """
-            INSERT INTO external_calls (call_type, input, status)
-            VALUES ('think', $1::jsonb, 'pending')
-            RETURNING id
-            """,
-            json.dumps({"kind": "inquire", "query": "q1", "depth": "inquire_shallow"}),
-        )
-        c2 = await conn.fetchval(
-            """
-            INSERT INTO external_calls (call_type, input, status)
-            VALUES ('think', $1::jsonb, 'pending')
-            RETURNING id
-            """,
-            json.dumps({"kind": "inquire", "query": "q2", "depth": "inquire_shallow"}),
-        )
-        assert c1 and c2
-
-    processor = ExternalCallProcessor()
-
-    async def _claim():
-        async with db_pool.acquire() as conn:
-            return await processor.claim_pending_call(conn)
-
-    r1, r2 = await asyncio.gather(_claim(), _claim())
-    assert r1 and r2
-    assert r1["id"] != r2["id"]
-
-
-async def test_worker_fail_call_retries_then_fails(db_pool, apply_heartbeat_migration):
-    from services.external_calls import ExternalCallProcessor
-    from services.worker_service import MAX_RETRIES
-
-    processor = ExternalCallProcessor(max_retries=MAX_RETRIES)
-
-    async with db_pool.acquire() as conn:
-        call_id = await conn.fetchval(
-            """
-            INSERT INTO external_calls (call_type, input, status, retry_count)
-            VALUES ('think', $1::jsonb, 'pending', 0)
-            RETURNING id
-            """,
-            json.dumps({"kind": "inquire", "query": "q", "depth": "inquire_shallow"}),
-        )
-        assert call_id
-
-    # Fail it MAX_RETRIES times: should remain pending
-    for _ in range(int(MAX_RETRIES)):
-        async with db_pool.acquire() as conn:
-            await processor.fail_call(conn, str(call_id), "boom", retry=True)
-
-    async with db_pool.acquire() as conn:
-        status = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1::uuid", call_id)
-        assert status == "pending"
-
-    # One more failure transitions to failed
-    async with db_pool.acquire() as conn:
-        await processor.fail_call(conn, str(call_id), "boom", retry=True)
-    async with db_pool.acquire() as conn:
-        status2 = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1::uuid", call_id)
-        assert status2 == "failed"
 
 
 async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_heartbeat_migration, monkeypatch):
@@ -6565,7 +6469,7 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
     End-to-end worker path (without real LLM):
     - Heartbeat decision includes actions that queue follow-on think calls (brainstorm + inquire)
     - Worker processes those calls and applies side-effects (create goals, create semantic memory)
-    - Heartbeat completes with an episodic memory + log row
+    - Heartbeat completes with an episodic memory
     """
     from services.external_calls import ExternalCallProcessor
     from services.heartbeat_runner import execute_heartbeat_decision
@@ -6574,16 +6478,12 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
     async with db_pool.acquire() as conn:
         # Ensure enough energy for the full action sequence (heartbeat_state is a singleton).
         await conn.execute("UPDATE heartbeat_state SET current_energy = 20, is_paused = FALSE WHERE id = 1")
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         assert hb_id is not None
 
-        call_row = await conn.fetchrow(
-            "SELECT id, input FROM external_calls WHERE heartbeat_id = $1 ORDER BY requested_at DESC LIMIT 1",
-            hb_id,
-        )
-        assert call_row is not None
-        decision_call_id = str(call_row["id"])
-        call_input = _coerce_json(call_row["input"])
+        decision_call = (hb_payload.get("external_calls") or [{}])[0]
+        call_input = decision_call.get("input") or {}
 
     test_id = get_test_identifier("worker_e2e")
 
@@ -6620,9 +6520,9 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
         result = await processor.process_call_payload(conn, "think", call_input)
     assert result.get("kind") == "heartbeat_decision"
     async with db_pool.acquire() as conn:
-        await processor.apply_result(conn, decision_call_id, result)
+        await processor.apply_result(conn, decision_call, result)
     async with db_pool.acquire() as conn:
-        await execute_heartbeat_decision(
+        exec_result = await execute_heartbeat_decision(
             conn,
             heartbeat_id=str(hb_id),
             decision=result["decision"],
@@ -6630,14 +6530,14 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
         )
 
     async with db_pool.acquire() as conn:
-        log_row = await conn.fetchrow(
-            "SELECT ended_at, memory_id, decision_reasoning, narrative FROM heartbeat_log WHERE id = $1",
-            hb_id,
+        assert exec_result.get("completed") is True
+        memory_id = exec_result.get("memory_id")
+        assert memory_id is not None
+        reasoning = await conn.fetchval(
+            "SELECT metadata#>>'{context,reasoning}' FROM memories WHERE id = $1::uuid",
+            memory_id,
         )
-        assert log_row is not None
-        assert log_row["ended_at"] is not None
-        assert log_row["memory_id"] is not None
-        assert "test decision" in (log_row["decision_reasoning"] or "")
+        assert "test decision" in (reasoning or "")
 
         # Phase 6 (ReduceScopeCreep): Goals are now memories with type='goal'
         goal_count = await conn.fetchval(
@@ -6652,12 +6552,11 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
             inquire_summary,
         )
         assert inquiry_count == 1
-
-        outbox_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM outbox_messages WHERE kind = 'user' AND payload->>'heartbeat_id' = $1",
-            str(hb_id),
+        outbox_messages = exec_result.get("outbox_messages") or []
+        assert any(
+            msg.get("kind") == "user" and (msg.get("payload") or {}).get("heartbeat_id") == str(hb_id)
+            for msg in outbox_messages
         )
-        assert outbox_count >= 1
 
 
 # -----------------------------------------------------------------------------
@@ -6703,7 +6602,7 @@ async def test_start_heartbeat_updates_drives(db_pool):
             WHERE name = 'curiosity'
             """
         )
-        _hb = await conn.fetchval("SELECT start_heartbeat()")
+        _ = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
         lvl = await conn.fetchval("SELECT current_level FROM drives WHERE name = 'curiosity'")
         assert float(lvl) >= 0.12
 
@@ -6754,7 +6653,8 @@ async def test_check_boundaries_embedding_match(db_pool, ensure_embedding_servic
 async def test_reach_out_public_boundary_refusal_no_energy_spent(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE heartbeat_state SET current_energy = 10 WHERE id = 1")
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         before = await conn.fetchval("SELECT get_current_energy()")
 
         res = await conn.fetchval(
@@ -6773,12 +6673,13 @@ async def test_reach_out_public_boundary_refusal_no_energy_spent(db_pool):
 async def test_complete_heartbeat_records_emotion(db_pool):
     """Test that complete_heartbeat updates affective_state in heartbeat_state.
     Note: emotional_states table was removed in Phase 8 (ReduceScopeCreep).
-    Emotion is now stored in heartbeat_state.affective_state and heartbeat_log emotional columns.
+    Emotion is now stored in heartbeat_state.affective_state and episodic memory metadata.
     """
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         actions_taken = [{"action": "rest", "params": {}, "result": {"success": True}}]
-        _mem = await conn.fetchval(
+        mem_id = await conn.fetchval(
             "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)",
             hb_id,
             "reasoning",
@@ -6791,14 +6692,20 @@ async def test_complete_heartbeat_records_emotion(db_pool):
             affective = json.loads(affective)
         assert affective is not None and affective != {}, "Affective state should be set"
         assert "valence" in affective, "Affective state should have valence"
-        # Check heartbeat_log emotional fields
         row = await conn.fetchrow(
-            "SELECT emotional_valence, emotional_arousal, emotional_primary_emotion FROM heartbeat_log WHERE id = $1",
-            hb_id,
+            """
+            SELECT
+                metadata->>'emotional_valence' as emotional_valence,
+                metadata#>>'{emotional_context,arousal}' as emotional_arousal,
+                metadata#>>'{emotional_context,primary_emotion}' as emotional_primary_emotion
+            FROM memories
+            WHERE id = $1::uuid
+            """,
+            mem_id,
         )
-        assert row["emotional_valence"] is not None, "Emotional valence should be recorded in heartbeat_log"
-        assert row["emotional_arousal"] is not None, "Emotional arousal should be recorded in heartbeat_log"
-        assert row["emotional_primary_emotion"] is not None, "Primary emotion should be recorded in heartbeat_log"
+        assert row["emotional_valence"] is not None, "Emotional valence should be recorded in memory metadata"
+        assert row["emotional_arousal"] is not None, "Emotional arousal should be recorded in memory metadata"
+        assert row["emotional_primary_emotion"] is not None, "Primary emotion should be recorded in memory metadata"
 
 
 async def test_complete_heartbeat_blends_emotional_assessment_into_state(db_pool):
@@ -6821,9 +6728,10 @@ async def test_complete_heartbeat_blends_emotional_assessment_into_state(db_pool
             WHERE id = 1
             """
         )
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         assessment = {"valence": -0.9, "arousal": 0.9, "primary_emotion": "frustrated"}
-        _mem = await conn.fetchval(
+        mem_id = await conn.fetchval(
             "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb)",
             hb_id,
             "reasoning",
@@ -6836,17 +6744,20 @@ async def test_complete_heartbeat_blends_emotional_assessment_into_state(db_pool
         assert isinstance(state, dict)
         assert state.get("primary_emotion") == "frustrated", "Primary emotion from assessment should be preserved"
         assert float(state.get("valence", 0.0)) < -0.15, "Valence should be negative after blending"
-        # Also check heartbeat_log for valence
-        valence = await conn.fetchval("SELECT emotional_valence FROM heartbeat_log WHERE id = $1", hb_id)
-        assert valence is not None and valence < -0.15, "Emotional valence should be recorded in heartbeat_log"
+        valence = await conn.fetchval(
+            "SELECT metadata->>'emotional_valence' FROM memories WHERE id = $1::uuid",
+            mem_id,
+        )
+        assert valence is not None and float(valence) < -0.15, "Emotional valence should be recorded in memory"
 
 
 async def test_complete_heartbeat_emotion_accounts_for_goal_changes(db_pool):
     """Test that completing a goal increases valence.
-    Note: emotional_states table removed in Phase 8 - check heartbeat_state and heartbeat_log instead.
+    Note: emotional_states table removed in Phase 8 - check heartbeat_state and episodic memory metadata instead.
     """
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         await conn.execute(
             """
             UPDATE heartbeat_state
@@ -6862,15 +6773,17 @@ async def test_complete_heartbeat_emotion_accounts_for_goal_changes(db_pool):
             """
         )
         goals_modified = [{"goal_id": str(uuid.uuid4()), "change": "completed", "reason": "test"}]
-        _mem = await conn.fetchval(
+        mem_id = await conn.fetchval(
             "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)",
             hb_id,
             "reasoning",
             json.dumps([]),
             json.dumps(goals_modified),
         )
-        # Check heartbeat_log for valence (emotional_states table removed in Phase 8)
-        valence = await conn.fetchval("SELECT emotional_valence FROM heartbeat_log WHERE id = $1", hb_id)
+        valence = await conn.fetchval(
+            "SELECT metadata->>'emotional_valence' FROM memories WHERE id = $1::uuid",
+            mem_id,
+        )
         assert valence is not None
         assert float(valence) > 0.25, "Completing a goal should increase valence"
         # Also verify it's reflected in affective_state
@@ -6905,11 +6818,11 @@ async def test_current_emotional_state_view_matches_heartbeat_state(db_pool):
 
 async def test_emotional_trend_view_has_rows(db_pool):
     """Test that emotional_trend view returns data.
-    Note: emotional_states table removed in Phase 8 - view now queries heartbeat_log.
+    Note: emotional_states table removed in Phase 8 - view now queries episodic memories.
     """
     async with db_pool.acquire() as conn:
-        # Run a heartbeat to create a heartbeat_log entry with emotional_valence
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         await conn.fetchval(
             "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)",
             hb_id,
@@ -6939,7 +6852,7 @@ async def test_worker_tasks_view_contains_all_tasks(db_pool):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT task_type, pending_count FROM worker_tasks")
         task_types = {r["task_type"] for r in rows}
-        assert task_types == {"external_calls", "heartbeat", "subconscious_maintenance", "outbox"}
+        assert task_types == {"heartbeat", "subconscious_maintenance"}
         for r in rows:
             assert isinstance(r["pending_count"], int)
 
@@ -7498,12 +7411,10 @@ async def test_worker_run_maintenance_cleans_items(db_pool):
 async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
     before_interval = None
     before_state = None
-    queued_call_row = None
     async with db_pool.acquire() as conn:
         before_state = await conn.fetchrow("SELECT heartbeat_count, last_heartbeat_at, is_paused FROM heartbeat_state WHERE id = 1")
         # Phase 7 (ReduceScopeCreep): use unified config
         before_interval = await conn.fetchval("SELECT value FROM config WHERE key = 'heartbeat.heartbeat_interval_minutes'")
-        before_calls = await conn.fetchval("SELECT COUNT(*) FROM external_calls")
 
         await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE id = 1")
         # Phase 7 (ReduceScopeCreep): use unified config only
@@ -7511,28 +7422,12 @@ async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
 
     try:
         async with db_pool.acquire() as conn:
-            await conn.fetchval("SELECT run_heartbeat()")
-        async with db_pool.acquire() as conn:
-            after_calls = await conn.fetchval("SELECT COUNT(*) FROM external_calls")
-            assert int(after_calls) == int(before_calls) + 1
-
-            queued_call_row = await conn.fetchrow(
-                """
-                SELECT id, heartbeat_id, input, status
-                FROM external_calls
-                ORDER BY requested_at DESC
-                LIMIT 1
-                """
-            )
-            assert queued_call_row is not None
-            call_input = _coerce_json(queued_call_row["input"])
+            payload = _coerce_json(await conn.fetchval("SELECT run_heartbeat()"))
+            call = (payload.get("external_calls") or [{}])[0]
+            call_input = call.get("input") or {}
             assert call_input.get("kind") == "heartbeat_decision"
-            assert queued_call_row["status"] in ("pending", "processing", "complete")
     finally:
         async with db_pool.acquire() as conn:
-            # Cleanup newest call (it should be the one we queued)
-            await conn.execute("DELETE FROM external_calls WHERE id = (SELECT id FROM external_calls ORDER BY requested_at DESC LIMIT 1)")
-            await conn.execute("DELETE FROM heartbeat_log WHERE id = (SELECT id FROM heartbeat_log ORDER BY started_at DESC LIMIT 1)")
             if before_state is not None:
                 await conn.execute(
                     "UPDATE heartbeat_state SET heartbeat_count = $1, last_heartbeat_at = $2, is_paused = $3 WHERE id = 1",
@@ -7702,7 +7597,8 @@ async def test_subconscious_decider_applies_observations(db_pool, ensure_embeddi
 async def test_end_to_end_self_development_flow(db_pool, ensure_embedding_service):
     from core.subconscious import apply_subconscious_observations
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         m1 = await conn.fetchval(
             "SELECT create_episodic_memory($1, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, 0.2, NOW(), 0.6)",
             "Interaction with Bob",
@@ -7747,27 +7643,6 @@ async def test_end_to_end_self_development_flow(db_pool, ensure_embedding_servic
         assert ctx.get("worldview"), "worldview should be present"
         assert ctx.get("relationships"), "relationships should populate from subconscious"
         assert ctx.get("narrative", {}).get("current_chapter", {}).get("name") == "Teamwork"
-
-
-async def test_on_external_call_complete_trigger_allows_status_transition(db_pool):
-    async with db_pool.acquire() as conn:
-        tr = conn.transaction()
-        await tr.start()
-        try:
-            hb_id = await conn.fetchval("SELECT start_heartbeat()")
-            call_id = await conn.fetchval(
-                """
-                INSERT INTO external_calls (call_type, input, status, heartbeat_id)
-                VALUES ('think', '{}'::jsonb, 'pending', $1::uuid)
-                RETURNING id
-                """,
-                hb_id,
-            )
-            await conn.execute("UPDATE external_calls SET status = 'complete' WHERE id = $1", call_id)
-            status = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1", call_id)
-            assert status == "complete"
-        finally:
-            await tr.rollback()
 
 
 async def test_discover_relationship_creates_graph_edge(db_pool):
@@ -7997,18 +7872,16 @@ async def test_batch_recompute_neighborhoods_marks_fresh(db_pool):
 
 async def test_reflect_action_queues_external_call(db_pool):
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         res = await conn.fetchval(
             "SELECT execute_heartbeat_action($1::uuid, 'reflect', '{}'::jsonb)",
             hb_id,
         )
         parsed = json.loads(res)
         assert parsed["success"] is True
-        call_id = parsed["result"]["external_call_id"]
-        row = await conn.fetchrow("SELECT input FROM external_calls WHERE id = $1::uuid", call_id)
-        call_input = row["input"]
-        if isinstance(call_input, str):
-            call_input = json.loads(call_input)
+        call = (parsed.get("external_calls") or [{}])[0]
+        call_input = call.get("input") or {}
         assert call_input["kind"] == "reflect"
 
 
@@ -8017,7 +7890,8 @@ async def test_process_reflection_result_creates_artifacts(db_pool, ensure_embed
     Note: relationship_discoveries table removed in Phase 8 - check graph edge instead.
     """
     async with db_pool.acquire() as conn:
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         a = await conn.fetchval("SELECT create_semantic_memory($1, 0.9, ARRAY['test'], NULL, '{}'::jsonb, 0.5)", f"Memory A {hb_id}")
         b = await conn.fetchval("SELECT create_semantic_memory($1, 0.9, ARRAY['test'], NULL, '{}'::jsonb, 0.5)", f"Memory B {hb_id}")
         w = await conn.fetchval(
@@ -8251,8 +8125,8 @@ async def test_terminate_agent_wipes_state_and_queues_last_will(db_pool):
             assert remaining["content"] == will
             assert float(remaining["trust_level"]) == 1.0
 
-            outbox = await conn.fetch("SELECT payload FROM outbox_messages ORDER BY created_at ASC")
-            intents = [_coerce_json(r["payload"]).get("intent") for r in outbox]
+            outbox = payload.get("outbox_messages") or []
+            intents = [(msg.get("payload") or {}).get("intent") for msg in outbox]
             assert "final_will" in intents
             assert intents.count("farewell") == len(farewells)
 
@@ -8268,7 +8142,8 @@ async def test_pause_heartbeat_queues_reason_and_pauses(db_pool):
         tx = conn.transaction()
         await tx.start()
         try:
-            hb_id = await conn.fetchval("SELECT start_heartbeat()")
+            hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+            hb_id = hb_payload.get("heartbeat_id")
             assert hb_id is not None
 
             reason = f"Need to pause for recovery and alignment. {get_test_identifier('pause')}"
@@ -8282,14 +8157,7 @@ async def test_pause_heartbeat_queues_reason_and_pauses(db_pool):
 
             result = payload.get("result") or {}
             assert result.get("paused") is True
-            outbox_id = result.get("outbox_id")
-            assert outbox_id
-
-            outbox_row = await conn.fetchrow(
-                "SELECT payload FROM outbox_messages WHERE id = $1::uuid",
-                outbox_id,
-            )
-            outbox_payload = _coerce_json(outbox_row["payload"])
+            outbox_payload = (payload.get("outbox_messages") or [{}])[0].get("payload") or {}
             assert outbox_payload.get("message") == reason
             assert outbox_payload.get("intent") == "heartbeat_paused"
             assert (outbox_payload.get("context") or {}).get("heartbeat_id") == str(hb_id)
@@ -8305,7 +8173,8 @@ async def test_terminate_action_requires_confirmation(db_pool):
         tx = conn.transaction()
         await tx.start()
         try:
-            hb_id = await conn.fetchval("SELECT start_heartbeat()")
+            hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+            hb_id = hb_payload.get("heartbeat_id")
             assert hb_id is not None
 
             raw = await conn.fetchval(
@@ -8317,14 +8186,8 @@ async def test_terminate_action_requires_confirmation(db_pool):
 
             result = payload.get("result") or {}
             assert result.get("confirmation_required") is True
-            external_call_id = result.get("external_call_id")
-            assert external_call_id
-
-            call_input = await conn.fetchval(
-                "SELECT input FROM external_calls WHERE id = $1::uuid",
-                external_call_id,
-            )
-            call_input = _coerce_json(call_input)
+            external_call = result.get("external_call") or {}
+            call_input = external_call.get("input") or {}
             assert call_input.get("kind") == "termination_confirm"
 
             assert await conn.fetchval("SELECT is_agent_terminated()") is False

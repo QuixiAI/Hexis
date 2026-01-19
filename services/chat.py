@@ -28,7 +28,7 @@ You have access to several memory tools that allow you to search and explore you
 9. **get_strategies** - Find strategic patterns and lessons learned.
 10. **list_recent_episodes** - List recent episodes for orientation.
 11. **create_goal** - Create a queued goal/reminder for the agent to pursue later.
-12. **queue_user_message** - Queue a message to the user's outbox (delivery handled externally).
+12. **queue_user_message** - Return a user message payload (delivery handled externally).
 
 ## When to Use Memory Tools
 

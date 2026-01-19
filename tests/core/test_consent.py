@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from core import consent as consent_mod
+from services import consent as consent_mod
 from tests.utils import _db_dsn
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.core]

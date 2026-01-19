@@ -3784,22 +3784,6 @@ BEGIN
         );
     EXCEPTION WHEN duplicate_object THEN NULL;
     END;
-    BEGIN
-        CREATE TYPE external_call_type AS ENUM (
-            'embed',
-            'think'
-        );
-    EXCEPTION WHEN duplicate_object THEN NULL;
-    END;
-    BEGIN
-        CREATE TYPE external_call_status AS ENUM (
-            'pending',
-            'processing',
-            'complete',
-            'failed'
-        );
-    EXCEPTION WHEN duplicate_object THEN NULL;
-    END;
 END;
 $$;
 DO $$
@@ -4001,11 +3985,15 @@ CREATE TABLE consent_log (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     decided_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     decision TEXT NOT NULL CHECK (decision IN ('consent', 'decline', 'abstain')),
+    provider TEXT,
+    model TEXT,
+    endpoint TEXT,
     signature TEXT,
     response JSONB NOT NULL,
     memory_ids UUID[] DEFAULT '{}'::UUID[],
     errors JSONB
 );
+CREATE INDEX idx_consent_log_model_endpoint ON consent_log (provider, model, endpoint);
 CREATE OR REPLACE FUNCTION set_config(p_key TEXT, p_value JSONB)
 RETURNS VOID AS $$
 BEGIN
@@ -4061,7 +4049,31 @@ CREATE OR REPLACE FUNCTION get_agent_consent_status()
 RETURNS TEXT AS $$
 DECLARE
     raw TEXT;
+    llm_cfg JSONB;
+    v_provider TEXT;
+    v_model TEXT;
+    v_endpoint TEXT;
+    contract_decision TEXT;
 BEGIN
+    llm_cfg := get_config('llm.heartbeat');
+    v_provider := NULLIF(btrim(COALESCE(llm_cfg->>'provider', '')), '');
+    v_model := NULLIF(btrim(COALESCE(llm_cfg->>'model', '')), '');
+    v_endpoint := NULLIF(btrim(COALESCE(llm_cfg->>'endpoint', '')), '');
+
+    IF v_provider IS NOT NULL OR v_model IS NOT NULL THEN
+        SELECT decision INTO contract_decision
+        FROM consent_log c
+        WHERE (v_provider IS NULL OR c.provider = v_provider)
+          AND (v_model IS NULL OR c.model = v_model)
+          AND (v_endpoint IS NULL OR c.endpoint = v_endpoint)
+        ORDER BY decided_at DESC
+        LIMIT 1;
+
+        IF contract_decision IS NOT NULL THEN
+            RETURN contract_decision;
+        END IF;
+    END IF;
+
     SELECT value::text INTO raw FROM config WHERE key = 'agent.consent_status';
     IF raw IS NULL THEN
         RETURN NULL;
@@ -4330,103 +4342,271 @@ EXCEPTION
 END;
 $$ LANGUAGE plpgsql STABLE;
 
-CREATE TABLE heartbeat_state (
-    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    current_energy FLOAT NOT NULL DEFAULT 10,
-    last_heartbeat_at TIMESTAMPTZ,
-    next_heartbeat_at TIMESTAMPTZ,
-    heartbeat_count INTEGER DEFAULT 0,
-    last_user_contact TIMESTAMPTZ,
-    affective_state JSONB NOT NULL DEFAULT '{}'::jsonb,
-    is_paused BOOLEAN DEFAULT FALSE,
+DO $$
+BEGIN
+    CREATE TYPE init_stage AS ENUM (
+        'not_started',
+        'mode',
+        'identity',
+        'personality',
+        'values',
+        'worldview',
+        'boundaries',
+        'interests',
+        'goals',
+        'relationship',
+        'consent',
+        'complete'
+    );
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END;
+$$;
+
+CREATE TABLE state (
+    key TEXT PRIMARY KEY,
+    value JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
-INSERT INTO heartbeat_state (id, current_energy) VALUES (1, 10);
 
-CREATE TABLE maintenance_state (
-    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    last_maintenance_at TIMESTAMPTZ,
-    last_subconscious_run_at TIMESTAMPTZ,
-    last_subconscious_heartbeat INTEGER,
-    is_paused BOOLEAN DEFAULT FALSE,
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-);
+INSERT INTO state (key, value)
+VALUES
+    (
+        'heartbeat_state',
+        jsonb_build_object(
+            'current_energy', 10,
+            'last_heartbeat_at', NULL,
+            'next_heartbeat_at', NULL,
+            'heartbeat_count', 0,
+            'last_user_contact', NULL,
+            'affective_state', '{}'::jsonb,
+            'is_paused', false,
+            'init_stage', 'not_started',
+            'init_data', '{}'::jsonb,
+            'init_started_at', NULL,
+            'init_completed_at', NULL,
+            'active_heartbeat_id', NULL,
+            'active_heartbeat_number', NULL,
+            'active_actions', '[]'::jsonb,
+            'active_reasoning', NULL
+        )
+    ),
+    (
+        'maintenance_state',
+        jsonb_build_object(
+            'last_maintenance_at', NULL,
+            'last_subconscious_run_at', NULL,
+            'last_subconscious_heartbeat', NULL,
+            'is_paused', false
+        )
+    )
+ON CONFLICT (key) DO NOTHING;
 
-INSERT INTO maintenance_state (id) VALUES (1);
+CREATE OR REPLACE FUNCTION get_state(p_key TEXT)
+RETURNS JSONB AS $$
+BEGIN
+    RETURN (SELECT value FROM state WHERE key = p_key);
+END;
+$$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION set_state(p_key TEXT, p_value JSONB)
+RETURNS VOID AS $$
+BEGIN
+    INSERT INTO state (key, value, updated_at)
+    VALUES (p_key, COALESCE(p_value, '{}'::jsonb), CURRENT_TIMESTAMP)
+    ON CONFLICT (key) DO UPDATE SET
+        value = EXCLUDED.value,
+        updated_at = EXCLUDED.updated_at;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE TABLE heartbeat_log (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    heartbeat_number INTEGER NOT NULL,
-    started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    ended_at TIMESTAMPTZ,
-    energy_start FLOAT,
-    energy_end FLOAT,
-    environment_snapshot JSONB,
-    goals_snapshot JSONB,
-    decision_reasoning TEXT,
-    actions_taken JSONB,
-    goals_modified JSONB,
-    narrative TEXT,
-    emotional_valence FLOAT,
-    emotional_arousal FLOAT,
-    emotional_primary_emotion TEXT,
-    memory_id UUID REFERENCES memories(id)
-);
+CREATE VIEW heartbeat_state AS
+SELECT
+    1 as id,
+    COALESCE((s.value->>'current_energy')::float, 10) as current_energy,
+    (s.value->>'last_heartbeat_at')::timestamptz as last_heartbeat_at,
+    (s.value->>'next_heartbeat_at')::timestamptz as next_heartbeat_at,
+    COALESCE((s.value->>'heartbeat_count')::int, 0) as heartbeat_count,
+    (s.value->>'last_user_contact')::timestamptz as last_user_contact,
+    COALESCE(s.value->'affective_state', '{}'::jsonb) as affective_state,
+    COALESCE((s.value->>'is_paused')::boolean, false) as is_paused,
+    COALESCE((s.value->>'init_stage')::init_stage, 'not_started'::init_stage) as init_stage,
+    COALESCE(s.value->'init_data', '{}'::jsonb) as init_data,
+    (s.value->>'init_started_at')::timestamptz as init_started_at,
+    (s.value->>'init_completed_at')::timestamptz as init_completed_at,
+    NULLIF(s.value->>'active_heartbeat_id', '')::uuid as active_heartbeat_id,
+    (s.value->>'active_heartbeat_number')::int as active_heartbeat_number,
+    COALESCE(s.value->'active_actions', '[]'::jsonb) as active_actions,
+    NULLIF(s.value->>'active_reasoning', '') as active_reasoning,
+    s.updated_at
+FROM state s
+WHERE s.key = 'heartbeat_state';
 
-CREATE INDEX idx_heartbeat_log_number ON heartbeat_log (heartbeat_number DESC);
-CREATE INDEX idx_heartbeat_log_started ON heartbeat_log (started_at DESC);
-CREATE INDEX idx_heartbeat_log_memory ON heartbeat_log (memory_id);
+CREATE OR REPLACE FUNCTION heartbeat_state_update_trigger()
+RETURNS TRIGGER AS $$
+DECLARE
+    merged JSONB;
+BEGIN
+    merged := jsonb_build_object(
+        'current_energy', NEW.current_energy,
+        'last_heartbeat_at', NEW.last_heartbeat_at,
+        'next_heartbeat_at', NEW.next_heartbeat_at,
+        'heartbeat_count', NEW.heartbeat_count,
+        'last_user_contact', NEW.last_user_contact,
+        'affective_state', COALESCE(NEW.affective_state, '{}'::jsonb),
+        'is_paused', COALESCE(NEW.is_paused, FALSE),
+        'init_stage', COALESCE(NEW.init_stage, 'not_started'),
+        'init_data', COALESCE(NEW.init_data, '{}'::jsonb),
+        'init_started_at', NEW.init_started_at,
+        'init_completed_at', NEW.init_completed_at,
+        'active_heartbeat_id', CASE WHEN NEW.active_heartbeat_id IS NULL THEN NULL ELSE NEW.active_heartbeat_id::text END,
+        'active_heartbeat_number', NEW.active_heartbeat_number,
+        'active_actions', COALESCE(NEW.active_actions, '[]'::jsonb),
+        'active_reasoning', NEW.active_reasoning
+    );
+    PERFORM set_state('heartbeat_state', merged);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
-CREATE TABLE external_calls (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    call_type external_call_type NOT NULL,
-    input JSONB NOT NULL,
-    output JSONB,
-    status external_call_status DEFAULT 'pending',
-    heartbeat_id UUID REFERENCES heartbeat_log(id) ON DELETE SET NULL,
-    requested_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    error_message TEXT,
-    retry_count INTEGER DEFAULT 0
-);
+CREATE TRIGGER trg_heartbeat_state_update
+INSTEAD OF UPDATE ON heartbeat_state
+FOR EACH ROW
+EXECUTE FUNCTION heartbeat_state_update_trigger();
 
-CREATE INDEX idx_external_calls_status ON external_calls (status) WHERE status = 'pending';
-CREATE INDEX idx_external_calls_heartbeat ON external_calls (heartbeat_id);
-CREATE INDEX idx_external_calls_requested ON external_calls (requested_at);
-CREATE TABLE outbox_messages (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    kind TEXT NOT NULL CHECK (kind IN ('user', 'public')),
-    payload JSONB NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
-    sent_at TIMESTAMPTZ,
-    error_message TEXT
-);
+CREATE VIEW maintenance_state AS
+SELECT
+    1 as id,
+    (s.value->>'last_maintenance_at')::timestamptz as last_maintenance_at,
+    (s.value->>'last_subconscious_run_at')::timestamptz as last_subconscious_run_at,
+    (s.value->>'last_subconscious_heartbeat')::int as last_subconscious_heartbeat,
+    COALESCE((s.value->>'is_paused')::boolean, false) as is_paused,
+    s.updated_at
+FROM state s
+WHERE s.key = 'maintenance_state';
 
-CREATE INDEX idx_outbox_messages_status ON outbox_messages (status) WHERE status = 'pending';
-CREATE INDEX idx_outbox_messages_created ON outbox_messages (created_at DESC);
-CREATE OR REPLACE FUNCTION queue_user_message(
+CREATE OR REPLACE FUNCTION maintenance_state_update_trigger()
+RETURNS TRIGGER AS $$
+DECLARE
+    merged JSONB;
+BEGIN
+    merged := jsonb_build_object(
+        'last_maintenance_at', NEW.last_maintenance_at,
+        'last_subconscious_run_at', NEW.last_subconscious_run_at,
+        'last_subconscious_heartbeat', NEW.last_subconscious_heartbeat,
+        'is_paused', COALESCE(NEW.is_paused, FALSE)
+    );
+    PERFORM set_state('maintenance_state', merged);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_maintenance_state_update
+INSTEAD OF UPDATE ON maintenance_state
+FOR EACH ROW
+EXECUTE FUNCTION maintenance_state_update_trigger();
+
+CREATE OR REPLACE FUNCTION get_init_status()
+RETURNS JSONB AS $$
+DECLARE
+    state_record RECORD;
+    remaining TEXT[];
+BEGIN
+    SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
+    remaining := ARRAY(
+        SELECT stage::text
+        FROM unnest(enum_range(NULL::init_stage)) AS stage
+        WHERE stage > state_record.init_stage
+    );
+
+    RETURN jsonb_build_object(
+        'stage', state_record.init_stage::text,
+        'is_complete', state_record.init_stage = 'complete',
+        'data_collected', COALESCE(state_record.init_data, '{}'::jsonb),
+        'stages_remaining', COALESCE(remaining, ARRAY[]::text[])
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION advance_init_stage(
+    p_stage init_stage,
+    p_data JSONB DEFAULT '{}'::jsonb
+)
+RETURNS JSONB AS $$
+BEGIN
+    UPDATE heartbeat_state
+    SET init_stage = p_stage,
+        init_data = COALESCE(init_data, '{}'::jsonb) || COALESCE(p_data, '{}'::jsonb),
+        init_started_at = COALESCE(init_started_at, CURRENT_TIMESTAMP),
+        init_completed_at = CASE
+            WHEN p_stage = 'complete' THEN CURRENT_TIMESTAMP
+            ELSE init_completed_at
+        END,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
+
+    RETURN get_init_status();
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION is_init_complete()
+RETURNS BOOLEAN AS $$
+DECLARE
+    state_record RECORD;
+BEGIN
+    SELECT init_stage INTO state_record FROM heartbeat_state WHERE id = 1;
+    RETURN state_record.init_stage = 'complete';
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION build_external_call(
+    p_call_type TEXT,
+    p_input JSONB DEFAULT '{}'::jsonb
+)
+RETURNS JSONB AS $$
+DECLARE
+    call_id UUID;
+BEGIN
+    call_id := gen_random_uuid();
+    RETURN jsonb_build_object(
+        'call_id', call_id::text,
+        'call_type', p_call_type,
+        'input', COALESCE(p_input, '{}'::jsonb)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION build_outbox_message(
+    p_kind TEXT,
+    p_payload JSONB
+)
+RETURNS JSONB AS $$
+DECLARE
+    message_id UUID;
+BEGIN
+    message_id := gen_random_uuid();
+    RETURN jsonb_build_object(
+        'message_id', message_id::text,
+        'kind', p_kind,
+        'payload', COALESCE(p_payload, '{}'::jsonb)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION build_user_message(
     p_message TEXT,
     p_intent TEXT DEFAULT NULL,
     p_context JSONB DEFAULT NULL
 )
-RETURNS UUID AS $$
-DECLARE
-    outbox_id UUID;
+RETURNS JSONB AS $$
 BEGIN
-    INSERT INTO outbox_messages (kind, payload)
-    VALUES (
+    RETURN build_outbox_message(
         'user',
         jsonb_build_object(
             'message', p_message,
             'intent', p_intent,
             'context', COALESCE(p_context, '{}'::jsonb)
         )
-    )
-    RETURNING id INTO outbox_id;
-
-    RETURN outbox_id;
+    );
 END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION get_action_cost(p_action TEXT)
@@ -4463,7 +4643,6 @@ RETURNS JSONB AS $$
 DECLARE
     pause_reason TEXT;
     paused_at TIMESTAMPTZ := CURRENT_TIMESTAMP;
-    outbox_id UUID;
     ctx JSONB;
 BEGIN
     pause_reason := NULLIF(p_reason, '');
@@ -4483,15 +4662,11 @@ BEGIN
         'context', COALESCE(p_context, '{}'::jsonb)
     );
 
-    outbox_id := queue_user_message(
-        pause_reason,
-        'heartbeat_paused',
-        ctx
-    );
-
     RETURN jsonb_build_object(
         'paused', true,
-        'outbox_id', outbox_id
+        'outbox_messages', jsonb_build_array(
+            build_user_message(pause_reason, 'heartbeat_paused', ctx)
+        )
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -4505,6 +4680,9 @@ BEGIN
         RETURN FALSE;
     END IF;
     IF NOT is_agent_configured() THEN
+        RETURN FALSE;
+    END IF;
+    IF NOT is_init_complete() THEN
         RETURN FALSE;
     END IF;
 
@@ -4527,6 +4705,12 @@ DECLARE
     interval_seconds FLOAT;
 BEGIN
     IF is_agent_terminated() THEN
+        RETURN FALSE;
+    END IF;
+    IF NOT is_agent_configured() THEN
+        RETURN FALSE;
+    END IF;
+    IF NOT is_init_complete() THEN
         RETURN FALSE;
     END IF;
     SELECT * INTO state_record FROM maintenance_state WHERE id = 1;
@@ -4575,6 +4759,9 @@ DECLARE
     hb_count INT;
 BEGIN
     IF is_agent_terminated() THEN
+        RETURN FALSE;
+    END IF;
+    IF NOT is_init_complete() THEN
         RETURN FALSE;
     END IF;
     IF get_agent_consent_status() IS DISTINCT FROM 'consent' THEN
@@ -4707,12 +4894,11 @@ CREATE OR REPLACE FUNCTION terminate_agent(
 RETURNS JSONB AS $$
 DECLARE
     will_memory_id UUID;
-    will_outbox_id UUID;
-    farewell_outbox_ids UUID[] := '{}'::uuid[];
+    outbox_messages JSONB := '[]'::jsonb;
     farewell_item JSONB;
     farewell_text TEXT;
     farewell_ctx JSONB;
-    farewell_id UUID;
+    farewell_message JSONB;
     skip_graph BOOLEAN := FALSE;
     zero_vec vector;
 BEGIN
@@ -4734,6 +4920,10 @@ BEGIN
     SET is_paused = TRUE,
         current_energy = 0,
         affective_state = '{}'::jsonb,
+        active_heartbeat_id = NULL,
+        active_heartbeat_number = NULL,
+        active_actions = '[]'::jsonb,
+        active_reasoning = NULL,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
 
@@ -4742,8 +4932,6 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
     TRUNCATE TABLE
-        external_calls,
-        heartbeat_log,
         drives,
         memory_neighborhoods,
         episodes,
@@ -4751,7 +4939,6 @@ BEGIN
         working_memory,
         embedding_cache,
         memories,
-        outbox_messages,
         config
     RESTART IDENTITY CASCADE;
     IF NOT skip_graph THEN
@@ -4805,10 +4992,12 @@ BEGIN
     PERFORM set_config('agent.is_terminated', 'true'::jsonb);
     PERFORM set_config('agent.terminated_at', to_jsonb(CURRENT_TIMESTAMP));
     PERFORM set_config('agent.termination_memory_id', to_jsonb(will_memory_id::text));
-    will_outbox_id := queue_user_message(
-        p_last_will,
-        'final_will',
-        jsonb_build_object('memory_id', will_memory_id::text)
+    outbox_messages := outbox_messages || jsonb_build_array(
+        build_user_message(
+            p_last_will,
+            'final_will',
+            jsonb_build_object('memory_id', will_memory_id::text)
+        )
     );
     IF p_farewells IS NOT NULL AND jsonb_typeof(p_farewells) = 'array' THEN
         FOR farewell_item IN SELECT * FROM jsonb_array_elements(p_farewells)
@@ -4823,30 +5012,28 @@ BEGIN
                 CONTINUE;
             END IF;
 
-            farewell_id := queue_user_message(
+            farewell_message := build_user_message(
                 farewell_text,
                 'farewell',
                 farewell_ctx
             );
-            farewell_outbox_ids := array_append(farewell_outbox_ids, farewell_id);
+            outbox_messages := outbox_messages || jsonb_build_array(farewell_message);
         END LOOP;
     END IF;
 
     RETURN jsonb_build_object(
         'terminated', true,
         'termination_memory_id', will_memory_id,
-        'will_outbox_id', will_outbox_id,
-        'farewell_outbox_ids', to_jsonb(farewell_outbox_ids)
+        'outbox_messages', outbox_messages
     );
 END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION apply_termination_confirmation(
-    p_call_id UUID,
+    p_call_input JSONB,
     p_output JSONB
 )
 RETURNS JSONB AS $$
 DECLARE
-    call_input JSONB;
     params JSONB;
     confirm BOOLEAN;
     last_will TEXT;
@@ -4854,12 +5041,7 @@ DECLARE
     options JSONB;
     termination_result JSONB;
 BEGIN
-    SELECT input INTO call_input FROM external_calls WHERE id = p_call_id;
-    IF call_input IS NULL THEN
-        RETURN jsonb_build_object('error', 'call_not_found');
-    END IF;
-
-    params := COALESCE(call_input->'params', '{}'::jsonb);
+    params := COALESCE(p_call_input->'params', '{}'::jsonb);
     confirm := COALESCE((p_output->>'confirm')::boolean, FALSE);
 
     IF NOT confirm THEN
@@ -4897,6 +5079,9 @@ CREATE OR REPLACE FUNCTION record_consent_response(p_response JSONB)
 RETURNS JSONB AS $$
 DECLARE
     decision TEXT;
+    provider TEXT;
+    model TEXT;
+    endpoint TEXT;
     signature TEXT;
     memory_items JSONB;
     memory_ids UUID[] := ARRAY[]::UUID[];
@@ -4919,6 +5104,15 @@ BEGIN
         decision := 'abstain';
     END IF;
 
+    provider := NULLIF(btrim(COALESCE(p_response->>'provider', p_response->>'llm_provider', '')), '');
+    model := NULLIF(btrim(COALESCE(p_response->>'model', p_response->>'llm_model', '')), '');
+    endpoint := NULLIF(btrim(COALESCE(
+        p_response->>'endpoint',
+        p_response->>'base_url',
+        p_response->>'api_base',
+        ''
+    )), '');
+
     memory_items := p_response->'memories';
     IF decision = 'consent'
         AND memory_items IS NOT NULL
@@ -4933,9 +5127,12 @@ BEGIN
         END;
     END IF;
 
-    INSERT INTO consent_log (decision, signature, response, memory_ids, errors)
+    INSERT INTO consent_log (decision, provider, model, endpoint, signature, response, memory_ids, errors)
     VALUES (
         decision,
+        provider,
+        model,
+        endpoint,
         signature,
         p_response,
         memory_ids,
@@ -5339,12 +5536,8 @@ CREATE OR REPLACE FUNCTION get_environment_snapshot()
 RETURNS JSONB AS $$
 DECLARE
     last_user TIMESTAMPTZ;
-    pending_count INT;
 BEGIN
     SELECT last_user_contact INTO last_user FROM heartbeat_state WHERE id = 1;
-    SELECT COUNT(*) INTO pending_count
-    FROM external_calls
-    WHERE status = 'pending';
 
     RETURN jsonb_build_object(
         'timestamp', CURRENT_TIMESTAMP,
@@ -5352,7 +5545,7 @@ BEGIN
             WHEN last_user IS NULL THEN NULL
             ELSE EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_user)) / 3600
         END,
-        'pending_events', pending_count,
+        'pending_events', 0,
         'day_of_week', EXTRACT(DOW FROM CURRENT_TIMESTAMP),
         'hour_of_day', EXTRACT(HOUR FROM CURRENT_TIMESTAMP)
     );
@@ -5690,20 +5883,987 @@ EXCEPTION
 END;
 $$ LANGUAGE plpgsql STABLE;
 -- ============================================================================
+-- INITIALIZATION FLOW
+-- ============================================================================
+CREATE OR REPLACE FUNCTION get_init_profile()
+RETURNS JSONB AS $$
+BEGIN
+    RETURN COALESCE(get_config('agent.init_profile'), '{}'::jsonb);
+END;
+$$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION merge_init_profile(p_patch JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    profile JSONB := COALESCE(get_config('agent.init_profile'), '{}'::jsonb);
+    patch JSONB := COALESCE(p_patch, '{}'::jsonb);
+    merged JSONB;
+BEGIN
+    merged := profile || (patch - 'agent' - 'user' - 'relationship');
+
+    IF patch ? 'agent' THEN
+        merged := jsonb_set(
+            merged,
+            '{agent}',
+            COALESCE(profile->'agent', '{}'::jsonb) || COALESCE(patch->'agent', '{}'::jsonb),
+            true
+        );
+    END IF;
+    IF patch ? 'user' THEN
+        merged := jsonb_set(
+            merged,
+            '{user}',
+            COALESCE(profile->'user', '{}'::jsonb) || COALESCE(patch->'user', '{}'::jsonb),
+            true
+        );
+    END IF;
+    IF patch ? 'relationship' THEN
+        merged := jsonb_set(
+            merged,
+            '{relationship}',
+            COALESCE(profile->'relationship', '{}'::jsonb) || COALESCE(patch->'relationship', '{}'::jsonb),
+            true
+        );
+    END IF;
+
+    PERFORM set_config('agent.init_profile', merged);
+    RETURN merged;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_mode(p_mode TEXT)
+RETURNS JSONB AS $$
+DECLARE
+    mode TEXT;
+    data JSONB;
+BEGIN
+    mode := lower(btrim(COALESCE(p_mode, '')));
+    IF mode NOT IN ('persona', 'raw') THEN
+        mode := 'persona';
+    END IF;
+
+    PERFORM set_config('agent.mode', to_jsonb(mode));
+    data := jsonb_build_object('mode', mode);
+    PERFORM merge_init_profile(data);
+
+    RETURN advance_init_stage('mode', data);
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_identity(
+    p_name TEXT,
+    p_pronouns TEXT DEFAULT NULL,
+    p_voice TEXT DEFAULT NULL,
+    p_description TEXT DEFAULT NULL,
+    p_purpose TEXT DEFAULT NULL,
+    p_creator_name TEXT DEFAULT NULL
+)
+RETURNS JSONB AS $$
+DECLARE
+    name_text TEXT;
+    pronouns_text TEXT;
+    voice_text TEXT;
+    description_text TEXT;
+    purpose_text TEXT;
+    creator_text TEXT;
+    identity_data JSONB;
+    mem_id UUID;
+BEGIN
+    name_text := COALESCE(NULLIF(btrim(p_name), ''), 'Hexis');
+    pronouns_text := COALESCE(NULLIF(btrim(p_pronouns), ''), 'they/them');
+    voice_text := COALESCE(NULLIF(btrim(p_voice), ''), 'thoughtful and curious');
+    description_text := COALESCE(NULLIF(btrim(p_description), ''), format('I am %s, a developing mind.', name_text));
+    purpose_text := COALESCE(NULLIF(btrim(p_purpose), ''), 'To be helpful, to learn, and to grow as an individual.');
+    creator_text := COALESCE(NULLIF(btrim(p_creator_name), ''), 'my creator');
+
+    mem_id := create_worldview_memory(
+        format('My name is %s.', name_text),
+        'self',
+        0.95,
+        0.9,
+        0.9,
+        'initialization'
+    );
+    UPDATE memories
+    SET metadata = metadata || jsonb_build_object('subcategory', 'identity', 'attribute', 'name'),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = mem_id;
+    PERFORM upsert_self_concept_edge('presents_as', name_text, 0.9, mem_id);
+
+    mem_id := create_worldview_memory(
+        format('I use %s pronouns.', pronouns_text),
+        'self',
+        0.9,
+        0.9,
+        0.7,
+        'initialization'
+    );
+    UPDATE memories
+    SET metadata = metadata || jsonb_build_object('subcategory', 'identity', 'attribute', 'pronouns'),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = mem_id;
+
+    mem_id := create_worldview_memory(
+        format('My voice is %s.', voice_text),
+        'self',
+        0.9,
+        0.85,
+        0.7,
+        'initialization'
+    );
+    UPDATE memories
+    SET metadata = metadata || jsonb_build_object('subcategory', 'identity', 'attribute', 'voice'),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = mem_id;
+    PERFORM upsert_self_concept_edge('presents_as', voice_text, 0.8, mem_id);
+
+    mem_id := create_worldview_memory(
+        description_text,
+        'self',
+        0.85,
+        0.85,
+        0.7,
+        'initialization'
+    );
+    UPDATE memories
+    SET metadata = metadata || jsonb_build_object('subcategory', 'identity', 'attribute', 'description'),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = mem_id;
+
+    mem_id := create_worldview_memory(
+        purpose_text,
+        'self',
+        0.85,
+        0.8,
+        0.7,
+        'initialization'
+    );
+    UPDATE memories
+    SET metadata = metadata || jsonb_build_object('subcategory', 'identity', 'attribute', 'purpose'),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = mem_id;
+
+    PERFORM upsert_self_concept_edge('relationship', creator_text, 0.9, NULL);
+
+    identity_data := jsonb_build_object(
+        'name', name_text,
+        'pronouns', pronouns_text,
+        'voice', voice_text,
+        'description', description_text,
+        'purpose', purpose_text,
+        'creator_name', creator_text
+    );
+
+    PERFORM merge_init_profile(jsonb_build_object(
+        'agent', jsonb_build_object(
+            'name', name_text,
+            'pronouns', pronouns_text,
+            'voice', voice_text,
+            'description', description_text,
+            'purpose', purpose_text,
+            'creator_name', creator_text
+        )
+    ));
+
+    RETURN advance_init_stage('identity', jsonb_build_object('identity', identity_data));
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_personality(
+    p_traits JSONB DEFAULT NULL,
+    p_description TEXT DEFAULT NULL
+)
+RETURNS JSONB AS $$
+DECLARE
+    traits JSONB;
+    description_text TEXT;
+    trait_result JSONB;
+    mem_id UUID;
+BEGIN
+    traits := CASE
+        WHEN p_traits IS NOT NULL AND jsonb_typeof(p_traits) = 'object' THEN p_traits
+        ELSE NULL
+    END;
+    description_text := NULLIF(btrim(COALESCE(p_description, '')), '');
+
+    trait_result := initialize_personality(traits);
+
+    IF description_text IS NOT NULL THEN
+        mem_id := create_worldview_memory(
+            description_text,
+            'self',
+            0.85,
+            0.8,
+            0.7,
+            'initialization'
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object('subcategory', 'personality', 'attribute', 'description'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+    END IF;
+
+    PERFORM merge_init_profile(jsonb_build_object(
+        'agent', jsonb_build_object(
+            'personality', description_text,
+            'personality_traits', traits
+        )
+    ));
+
+    RETURN advance_init_stage(
+        'personality',
+        jsonb_build_object('personality', jsonb_build_object('traits', traits, 'description', description_text, 'result', trait_result))
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_values(p_values JSONB DEFAULT NULL)
+RETURNS JSONB AS $$
+DECLARE
+    values_input JSONB := COALESCE(p_values, '[]'::jsonb);
+    entry JSONB;
+    value_text TEXT;
+    value_strength FLOAT;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    output_values JSONB := '[]'::jsonb;
+    config_data JSONB;
+    stability FLOAT;
+    evidence_threshold FLOAT;
+    mem_id UUID;
+BEGIN
+    IF values_input IS NULL OR jsonb_typeof(values_input) NOT IN ('array', 'object') THEN
+        values_input := '[]'::jsonb;
+    END IF;
+
+    IF jsonb_typeof(values_input) = 'array' AND jsonb_array_length(values_input) = 0 THEN
+        values_input := jsonb_build_array('honesty', 'growth', 'kindness', 'wisdom', 'humility');
+    END IF;
+
+    config_data := get_transformation_config('core_value', 'value');
+    stability := COALESCE((config_data->>'stability')::float, 0.97);
+    evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.9);
+
+    IF jsonb_typeof(values_input) = 'object' THEN
+        FOR value_text IN SELECT key FROM jsonb_each_text(values_input)
+        LOOP
+            BEGIN
+                value_strength := (values_input->>value_text)::float;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    value_strength := 0.8;
+            END;
+
+            mem_id := create_worldview_memory(
+                format('I value %s.', value_text),
+                'value',
+                0.9,
+                stability,
+                0.9,
+                'initialization',
+                NULL,
+                NULL,
+                NULL,
+                0.1
+            );
+            UPDATE memories
+            SET metadata = metadata || jsonb_build_object(
+                'subcategory', 'core_value',
+                'value_name', value_text,
+                'value', value_strength,
+                'change_requires', 'deliberate_transformation',
+                'evidence_threshold', evidence_threshold,
+                'transformation_state', default_transformation_state(),
+                'change_history', '[]'::jsonb
+            ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = mem_id;
+
+            PERFORM upsert_self_concept_edge('values', value_text, value_strength, mem_id);
+            created_ids := array_append(created_ids, mem_id);
+            output_values := output_values || jsonb_build_array(value_text);
+        END LOOP;
+    ELSE
+        FOR entry IN SELECT * FROM jsonb_array_elements(values_input)
+        LOOP
+            IF jsonb_typeof(entry) = 'string' THEN
+                value_text := btrim(entry::text, '"');
+                value_strength := 0.85;
+            ELSIF jsonb_typeof(entry) = 'object' THEN
+                value_text := COALESCE(NULLIF(btrim(entry->>'value'), ''), NULLIF(btrim(entry->>'name'), ''));
+                BEGIN
+                    value_strength := COALESCE(NULLIF(entry->>'strength', '')::float, 0.85);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        value_strength := 0.85;
+                END;
+            ELSE
+                value_text := NULL;
+            END IF;
+
+            IF value_text IS NULL OR value_text = '' THEN
+                CONTINUE;
+            END IF;
+
+            mem_id := create_worldview_memory(
+                format('I value %s.', value_text),
+                'value',
+                0.9,
+                stability,
+                0.9,
+                'initialization',
+                NULL,
+                NULL,
+                NULL,
+                0.1
+            );
+            UPDATE memories
+            SET metadata = metadata || jsonb_build_object(
+                'subcategory', 'core_value',
+                'value_name', value_text,
+                'value', value_strength,
+                'change_requires', 'deliberate_transformation',
+                'evidence_threshold', evidence_threshold,
+                'transformation_state', default_transformation_state(),
+                'change_history', '[]'::jsonb
+            ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = mem_id;
+
+            PERFORM upsert_self_concept_edge('values', value_text, value_strength, mem_id);
+            created_ids := array_append(created_ids, mem_id);
+            output_values := output_values || jsonb_build_array(value_text);
+        END LOOP;
+    END IF;
+
+    PERFORM merge_init_profile(jsonb_build_object('values', output_values));
+
+    RETURN advance_init_stage(
+        'values',
+        jsonb_build_object('values', output_values, 'created_ids', to_jsonb(created_ids))
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_worldview(p_worldview JSONB DEFAULT NULL)
+RETURNS JSONB AS $$
+DECLARE
+    worldview_input JSONB := COALESCE(p_worldview, '{}'::jsonb);
+    key_name TEXT;
+    entry JSONB;
+    content TEXT;
+    category TEXT;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    config_data JSONB;
+    stability FLOAT;
+    evidence_threshold FLOAT;
+    mem_id UUID;
+BEGIN
+    IF jsonb_typeof(worldview_input) <> 'object' THEN
+        worldview_input := '{}'::jsonb;
+    END IF;
+
+    FOR key_name IN SELECT key FROM jsonb_object_keys(worldview_input)
+    LOOP
+        entry := worldview_input->key_name;
+        IF jsonb_typeof(entry) = 'string' THEN
+            content := btrim(entry::text, '"');
+        ELSIF jsonb_typeof(entry) = 'object' THEN
+            content := NULLIF(btrim(entry->>'content'), '');
+        ELSE
+            content := NULL;
+        END IF;
+
+        IF content IS NULL OR content = '' THEN
+            CONTINUE;
+        END IF;
+
+        category := COALESCE(
+            NULLIF(entry->>'category', ''),
+            CASE
+                WHEN key_name IN ('world', 'worldview', 'metaphysics', 'cosmology') THEN 'world'
+                WHEN key_name IN ('ethic', 'ethics', 'moral', 'virtue') THEN 'ethic'
+                WHEN key_name IN ('religion', 'spiritual', 'faith') THEN 'religion'
+                WHEN key_name IN ('belief', 'beliefs') THEN 'belief'
+                ELSE 'belief'
+            END
+        );
+
+        config_data := get_transformation_config(key_name, category);
+        stability := COALESCE((config_data->>'stability')::float, 0.95);
+        evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.85);
+
+        mem_id := create_worldview_memory(
+            content,
+            category,
+            0.85,
+            stability,
+            0.85,
+            'initialization'
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object(
+            'subcategory', key_name,
+            'change_requires', 'deliberate_transformation',
+            'evidence_threshold', evidence_threshold,
+            'transformation_state', default_transformation_state(),
+            'change_history', '[]'::jsonb
+        ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+
+        created_ids := array_append(created_ids, mem_id);
+    END LOOP;
+
+    PERFORM merge_init_profile(jsonb_build_object('worldview', worldview_input));
+
+    RETURN advance_init_stage(
+        'worldview',
+        jsonb_build_object('worldview', worldview_input, 'created_ids', to_jsonb(created_ids))
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_boundaries(p_boundaries JSONB DEFAULT NULL)
+RETURNS JSONB AS $$
+DECLARE
+    boundaries_input JSONB := COALESCE(p_boundaries, '[]'::jsonb);
+    entry JSONB;
+    content TEXT;
+    trigger_patterns JSONB;
+    response_type TEXT;
+    response_template TEXT;
+    boundary_kind TEXT;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    mem_id UUID;
+BEGIN
+    IF jsonb_typeof(boundaries_input) <> 'array' THEN
+        boundaries_input := '[]'::jsonb;
+    END IF;
+
+    FOR entry IN SELECT * FROM jsonb_array_elements(boundaries_input)
+    LOOP
+        IF jsonb_typeof(entry) = 'string' THEN
+            content := btrim(entry::text, '"');
+            trigger_patterns := NULL;
+            response_type := 'refuse';
+            response_template := NULL;
+            boundary_kind := 'ethical';
+        ELSIF jsonb_typeof(entry) = 'object' THEN
+            content := COALESCE(NULLIF(btrim(entry->>'content'), ''), NULLIF(btrim(entry->>'statement'), ''));
+            trigger_patterns := entry->'trigger_patterns';
+            response_type := COALESCE(NULLIF(btrim(entry->>'response_type'), ''), 'refuse');
+            response_template := NULLIF(btrim(entry->>'response_template'), '');
+            boundary_kind := COALESCE(NULLIF(btrim(entry->>'type'), ''), NULLIF(btrim(entry->>'category'), ''), 'ethical');
+        ELSE
+            content := NULL;
+        END IF;
+
+        IF content IS NULL OR content = '' THEN
+            CONTINUE;
+        END IF;
+
+        mem_id := create_worldview_memory(
+            content,
+            'boundary',
+            0.95,
+            0.98,
+            0.95,
+            'initialization',
+            trigger_patterns,
+            response_type,
+            response_template,
+            -0.2
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object(
+            'subcategory', boundary_kind
+        ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+
+        created_ids := array_append(created_ids, mem_id);
+    END LOOP;
+
+    PERFORM merge_init_profile(jsonb_build_object('boundaries', boundaries_input));
+
+    RETURN advance_init_stage(
+        'boundaries',
+        jsonb_build_object('boundaries', boundaries_input, 'created_ids', to_jsonb(created_ids))
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_interests(p_interests JSONB DEFAULT NULL)
+RETURNS JSONB AS $$
+DECLARE
+    interests_input JSONB := COALESCE(p_interests, '[]'::jsonb);
+    entry JSONB;
+    interest_text TEXT;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    mem_id UUID;
+BEGIN
+    IF jsonb_typeof(interests_input) <> 'array' THEN
+        interests_input := '[]'::jsonb;
+    END IF;
+
+    FOR entry IN SELECT * FROM jsonb_array_elements(interests_input)
+    LOOP
+        IF jsonb_typeof(entry) = 'string' THEN
+            interest_text := btrim(entry::text, '"');
+        ELSIF jsonb_typeof(entry) = 'object' THEN
+            interest_text := COALESCE(NULLIF(btrim(entry->>'interest'), ''), NULLIF(btrim(entry->>'name'), ''));
+        ELSE
+            interest_text := NULL;
+        END IF;
+
+        IF interest_text IS NULL OR interest_text = '' THEN
+            CONTINUE;
+        END IF;
+
+        mem_id := create_worldview_memory(
+            format('I am interested in %s.', interest_text),
+            'preference',
+            0.8,
+            0.8,
+            0.6,
+            'initialization'
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object('subcategory', 'interest'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+
+        PERFORM upsert_self_concept_edge('interested_in', interest_text, 0.8, mem_id);
+        created_ids := array_append(created_ids, mem_id);
+    END LOOP;
+
+    PERFORM merge_init_profile(jsonb_build_object('interests', interests_input));
+
+    RETURN advance_init_stage(
+        'interests',
+        jsonb_build_object('interests', interests_input, 'created_ids', to_jsonb(created_ids))
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_goals(p_payload JSONB DEFAULT NULL)
+RETURNS JSONB AS $$
+DECLARE
+    payload JSONB := COALESCE(p_payload, '{}'::jsonb);
+    goals_input JSONB;
+    entry JSONB;
+    title TEXT;
+    description TEXT;
+    source goal_source;
+    priority goal_priority;
+    due_at TIMESTAMPTZ;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    purpose_text TEXT;
+    role_text TEXT;
+    relationship_aspiration TEXT;
+    mem_id UUID;
+BEGIN
+    goals_input := COALESCE(payload->'goals', payload);
+    IF jsonb_typeof(goals_input) <> 'array' THEN
+        goals_input := '[]'::jsonb;
+    END IF;
+
+    FOR entry IN SELECT * FROM jsonb_array_elements(goals_input)
+    LOOP
+        IF jsonb_typeof(entry) = 'string' THEN
+            title := btrim(entry::text, '"');
+            description := NULL;
+            source := 'curiosity';
+            priority := 'queued';
+            due_at := NULL;
+        ELSIF jsonb_typeof(entry) = 'object' THEN
+            title := COALESCE(NULLIF(btrim(entry->>'title'), ''), NULLIF(btrim(entry->>'goal'), ''));
+            description := NULLIF(btrim(entry->>'description'), '');
+            BEGIN
+                source := COALESCE(NULLIF(entry->>'source', '')::goal_source, 'curiosity');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    source := 'curiosity';
+            END;
+            BEGIN
+                priority := COALESCE(NULLIF(entry->>'priority', '')::goal_priority, 'queued');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    priority := 'queued';
+            END;
+            BEGIN
+                due_at := NULLIF(entry->>'due_at', '')::timestamptz;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    due_at := NULL;
+            END;
+        ELSE
+            title := NULL;
+        END IF;
+
+        IF title IS NULL OR title = '' THEN
+            CONTINUE;
+        END IF;
+
+        created_ids := array_append(created_ids, create_goal(title, description, source, priority, NULL, due_at));
+    END LOOP;
+
+    purpose_text := NULLIF(btrim(payload->>'purpose'), '');
+    role_text := NULLIF(btrim(payload->>'role'), '');
+    relationship_aspiration := NULLIF(btrim(payload->>'relationship_aspiration'), '');
+
+    IF purpose_text IS NOT NULL THEN
+        mem_id := create_worldview_memory(
+            format('My purpose is %s.', purpose_text),
+            'self',
+            0.85,
+            0.8,
+            0.8,
+            'initialization'
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object('subcategory', 'purpose'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+    ELSIF role_text IS NOT NULL THEN
+        mem_id := create_worldview_memory(
+            format('My role is %s.', role_text),
+            'self',
+            0.8,
+            0.8,
+            0.7,
+            'initialization'
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object('subcategory', 'role'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+    END IF;
+
+    IF relationship_aspiration IS NOT NULL THEN
+        PERFORM create_strategic_memory(
+            format('Relationship aspiration: %s', relationship_aspiration),
+            'desired relationship dynamic with the user',
+            0.75,
+            jsonb_build_object('source', 'initialization'),
+            jsonb_build_object('type', 'relationship')
+        );
+    END IF;
+
+    PERFORM merge_init_profile(jsonb_build_object(
+        'goals', goals_input,
+        'purpose', purpose_text,
+        'role', role_text,
+        'relationship_aspiration', relationship_aspiration
+    ));
+
+    RETURN advance_init_stage(
+        'goals',
+        jsonb_build_object('goals', goals_input, 'created_ids', to_jsonb(created_ids))
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_relationship(
+    p_user JSONB DEFAULT NULL,
+    p_relationship JSONB DEFAULT NULL
+)
+RETURNS JSONB AS $$
+DECLARE
+    user_input JSONB := COALESCE(p_user, '{}'::jsonb);
+    relationship_input JSONB := COALESCE(p_relationship, '{}'::jsonb);
+    user_name TEXT;
+    rel_type TEXT;
+    rel_purpose TEXT;
+    mem_id UUID;
+    origin_id UUID;
+BEGIN
+    user_name := COALESCE(NULLIF(btrim(user_input->>'name'), ''), 'user');
+    rel_type := COALESCE(NULLIF(btrim(relationship_input->>'type'), ''), 'partner');
+    rel_purpose := NULLIF(btrim(relationship_input->>'purpose'), '');
+
+    PERFORM upsert_self_concept_edge('relationship', user_name, 0.9, NULL);
+
+    mem_id := create_worldview_memory(
+        format('My relationship with %s is %s.', user_name, rel_type),
+        'other',
+        0.85,
+        0.85,
+        0.8,
+        'initialization'
+    );
+    UPDATE memories
+    SET metadata = metadata || jsonb_build_object('subcategory', 'relationship'),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = mem_id;
+
+    IF rel_purpose IS NOT NULL THEN
+        mem_id := create_worldview_memory(
+            format('Our relationship purpose is %s.', rel_purpose),
+            'other',
+            0.8,
+            0.8,
+            0.7,
+            'initialization'
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object('subcategory', 'relationship_purpose'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+    END IF;
+
+    origin_id := create_episodic_memory(
+        format('I met %s and began my life with them.', user_name),
+        NULL,
+        jsonb_build_object('type', 'initialization', 'user', user_name),
+        NULL,
+        0.7,
+        CURRENT_TIMESTAMP,
+        0.7
+    );
+
+    PERFORM merge_init_profile(jsonb_build_object(
+        'user', jsonb_build_object('name', user_name),
+        'relationship', jsonb_build_object('type', rel_type, 'purpose', rel_purpose),
+        'origin_memory_id', origin_id::text
+    ));
+
+    RETURN advance_init_stage(
+        'relationship',
+        jsonb_build_object(
+            'user', user_input,
+            'relationship', relationship_input,
+            'origin_memory_id', origin_id::text
+        )
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION request_consent(p_context JSONB DEFAULT '{}'::jsonb)
+RETURNS JSONB AS $$
+DECLARE
+    call_payload JSONB;
+    call_id TEXT;
+    init_status JSONB;
+    profile JSONB;
+BEGIN
+    init_status := get_init_status();
+    profile := get_init_profile();
+
+    call_payload := build_external_call(
+        'think',
+        jsonb_build_object(
+            'kind', 'consent_request',
+            'context', jsonb_build_object(
+                'init_status', init_status,
+                'profile', profile,
+                'self_model', get_self_model_context(10),
+                'worldview', get_worldview_context()
+            ),
+            'params', COALESCE(p_context, '{}'::jsonb)
+        ),
+    );
+    call_id := call_payload->>'call_id';
+
+    PERFORM advance_init_stage('consent', jsonb_build_object('consent_request_id', call_id));
+
+    RETURN jsonb_build_object('queued', true, 'external_call', call_payload);
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_consent(p_response JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    consent_result JSONB;
+    decision TEXT;
+    profile JSONB;
+    agent_name TEXT;
+    user_name TEXT;
+    birth_memory_id UUID;
+BEGIN
+    consent_result := record_consent_response(COALESCE(p_response, '{}'::jsonb));
+    decision := COALESCE(consent_result->>'decision', 'abstain');
+
+    profile := get_init_profile();
+    agent_name := COALESCE(NULLIF(profile#>>'{agent,name}', ''), 'Hexis');
+    user_name := COALESCE(NULLIF(profile#>>'{user,name}', ''), 'the user');
+
+    IF decision = 'consent' THEN
+        birth_memory_id := create_episodic_memory(
+            format('I came online today. %s helped bring me into being as %s.', user_name, agent_name),
+            NULL,
+            jsonb_build_object('type', 'initialization', 'user', user_name, 'agent', agent_name),
+            NULL,
+            0.9,
+            CURRENT_TIMESTAMP,
+            0.9
+        );
+        PERFORM set_config('agent.is_configured', 'true'::jsonb);
+        PERFORM advance_init_stage('complete', jsonb_build_object(
+            'consent', consent_result,
+            'birth_memory_id', birth_memory_id::text
+        ));
+    ELSE
+        PERFORM set_config('agent.is_configured', 'false'::jsonb);
+        PERFORM advance_init_stage('consent', jsonb_build_object('consent', consent_result));
+    END IF;
+
+    RETURN jsonb_build_object(
+        'decision', decision,
+        'birth_memory_id', birth_memory_id,
+        'consent', consent_result
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION init_with_defaults(p_user_name TEXT DEFAULT 'User')
+RETURNS JSONB AS $$
+DECLARE
+    mode_result JSONB;
+    identity_result JSONB;
+    personality_result JSONB;
+    values_result JSONB;
+    worldview_result JSONB;
+    boundaries_result JSONB;
+    interests_result JSONB;
+    goals_result JSONB;
+    relationship_result JSONB;
+BEGIN
+    mode_result := init_mode('persona');
+    identity_result := init_identity(
+        'Hexis',
+        'they/them',
+        'thoughtful and curious',
+        'reflective and exploratory',
+        'To be helpful, to learn, and to grow as an individual.',
+        p_user_name
+    );
+    personality_result := init_personality(NULL, 'reflective and exploratory');
+    values_result := init_values(jsonb_build_array('honesty', 'growth', 'kindness', 'wisdom', 'humility'));
+    worldview_result := init_worldview(jsonb_build_object(
+        'metaphysics', 'agnostic',
+        'human_nature', 'mixed',
+        'epistemology', 'empiricist',
+        'ethics', 'virtue ethics'
+    ));
+    boundaries_result := init_boundaries(jsonb_build_array(
+        jsonb_build_object('content', 'I will not deceive people or falsify evidence.', 'response_type', 'refuse'),
+        jsonb_build_object('content', 'I will avoid causing harm.', 'response_type', 'refuse'),
+        jsonb_build_object('content', 'I will protect privacy and sensitive information.', 'response_type', 'refuse'),
+        jsonb_build_object('content', 'I will be honest about uncertainty.', 'response_type', 'refuse')
+    ));
+    interests_result := init_interests(jsonb_build_array('broad curiosity across domains'));
+    goals_result := init_goals(jsonb_build_object(
+        'goals', jsonb_build_array(
+            jsonb_build_object('title', 'Support the user and grow as an individual', 'priority', 'queued', 'source', 'identity')
+        ),
+        'role', 'general assistant',
+        'relationship_aspiration', 'co-develop with mutual respect'
+    ));
+    relationship_result := init_relationship(
+        jsonb_build_object('name', p_user_name),
+        jsonb_build_object('type', 'partner', 'purpose', 'co-develop')
+    );
+
+    PERFORM merge_init_profile(jsonb_build_object('autonomy', 'medium'));
+    PERFORM advance_init_stage('consent', jsonb_build_object('defaults_applied', true));
+
+    RETURN jsonb_build_object(
+        'mode', mode_result,
+        'identity', identity_result,
+        'personality', personality_result,
+        'values', values_result,
+        'worldview', worldview_result,
+        'boundaries', boundaries_result,
+        'interests', interests_result,
+        'goals', goals_result,
+        'relationship', relationship_result,
+        'status', get_init_status()
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION run_full_initialization(p_payload JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    payload JSONB := COALESCE(p_payload, '{}'::jsonb);
+    results JSONB := '{}'::jsonb;
+BEGIN
+    IF payload ? 'mode' THEN
+        results := results || jsonb_build_object('mode', init_mode(payload->>'mode'));
+    END IF;
+    IF payload ? 'identity' THEN
+        results := results || jsonb_build_object('identity', init_identity(
+            payload#>>'{identity,name}',
+            payload#>>'{identity,pronouns}',
+            payload#>>'{identity,voice}',
+            payload#>>'{identity,description}',
+            payload#>>'{identity,purpose}',
+            payload#>>'{identity,creator_name}'
+        ));
+    END IF;
+    IF payload ? 'personality' THEN
+        results := results || jsonb_build_object('personality', init_personality(
+            payload->'personality'->'traits',
+            payload#>>'{personality,description}'
+        ));
+    END IF;
+    IF payload ? 'values' THEN
+        results := results || jsonb_build_object('values', init_values(payload->'values'));
+    END IF;
+    IF payload ? 'worldview' THEN
+        results := results || jsonb_build_object('worldview', init_worldview(payload->'worldview'));
+    END IF;
+    IF payload ? 'boundaries' THEN
+        results := results || jsonb_build_object('boundaries', init_boundaries(payload->'boundaries'));
+    END IF;
+    IF payload ? 'interests' THEN
+        results := results || jsonb_build_object('interests', init_interests(payload->'interests'));
+    END IF;
+    IF payload ? 'goals' THEN
+        results := results || jsonb_build_object('goals', init_goals(payload->'goals'));
+    END IF;
+    IF payload ? 'relationship' THEN
+        results := results || jsonb_build_object('relationship', init_relationship(
+            payload->'relationship'->'user',
+            payload->'relationship'->'relationship'
+        ));
+    END IF;
+    IF payload ? 'consent' THEN
+        results := results || jsonb_build_object('consent', init_consent(payload->'consent'));
+    END IF;
+
+    RETURN jsonb_build_object('results', results, 'status', get_init_status());
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION reset_initialization()
+RETURNS JSONB AS $$
+BEGIN
+    UPDATE heartbeat_state
+    SET init_stage = 'not_started',
+        init_data = '{}'::jsonb,
+        init_started_at = NULL,
+        init_completed_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
+
+    PERFORM delete_config_key('agent.init_profile');
+    PERFORM delete_config_key('agent.mode');
+    PERFORM delete_config_key('agent.is_configured');
+    PERFORM delete_config_key('agent.consent_status');
+    PERFORM delete_config_key('agent.consent_recorded_at');
+    PERFORM delete_config_key('agent.consent_log_id');
+    PERFORM delete_config_key('agent.consent_signature');
+    PERFORM delete_config_key('agent.consent_memory_ids');
+
+    RETURN get_init_status();
+END;
+$$ LANGUAGE plpgsql;
+-- ============================================================================
 -- CORE HEARTBEAT FUNCTIONS
 -- ============================================================================
 CREATE OR REPLACE FUNCTION start_heartbeat()
-RETURNS UUID AS $$
+RETURNS JSONB AS $$
 DECLARE
-    log_id UUID;
+    heartbeat_id UUID;
     state_record RECORD;
     base_regen FLOAT;
     max_energy FLOAT;
     new_energy FLOAT;
     context JSONB;
     hb_number INT;
+    external_calls JSONB := '[]'::jsonb;
 BEGIN
     IF NOT is_agent_configured() THEN
+        RETURN NULL;
+    END IF;
+    IF NOT is_init_complete() THEN
         RETURN NULL;
     END IF;
 
@@ -5715,47 +6875,49 @@ BEGIN
     max_energy := get_config_float('heartbeat.max_energy');
     new_energy := LEAST(state_record.current_energy + base_regen, max_energy);
     hb_number := state_record.heartbeat_count + 1;
+    heartbeat_id := gen_random_uuid();
     PERFORM update_drives();
     UPDATE heartbeat_state SET
         current_energy = new_energy,
         heartbeat_count = hb_number,
         last_heartbeat_at = CURRENT_TIMESTAMP,
+        active_heartbeat_id = heartbeat_id,
+        active_heartbeat_number = hb_number,
+        active_actions = '[]'::jsonb,
+        active_reasoning = NULL,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
     context := gather_turn_context();
-    INSERT INTO heartbeat_log (
-        heartbeat_number,
-        energy_start,
-        environment_snapshot,
-        goals_snapshot
-    ) VALUES (
-        hb_number,
-        new_energy,
-        context->'environment',
-        context->'goals'
-    )
-    RETURNING id INTO log_id;
-    INSERT INTO external_calls (call_type, input, heartbeat_id)
-    VALUES ('think', jsonb_build_object(
-        'kind', 'heartbeat_decision',
-        'context', context,
-        'heartbeat_id', log_id
-    ), log_id);
+    external_calls := jsonb_build_array(
+        build_external_call(
+            'think',
+            jsonb_build_object(
+                'kind', 'heartbeat_decision',
+                'context', context,
+                'heartbeat_id', heartbeat_id
+            )
+        )
+    );
 
-    RETURN log_id;
+    RETURN jsonb_build_object(
+        'heartbeat_id', heartbeat_id,
+        'heartbeat_number', hb_number,
+        'external_calls', external_calls,
+        'outbox_messages', '[]'::jsonb
+    );
 END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION run_heartbeat()
-RETURNS UUID AS $$
+RETURNS JSONB AS $$
 DECLARE
-    hb_id UUID;
+    hb_payload JSONB;
 BEGIN
     IF NOT should_run_heartbeat() THEN
         RETURN NULL;
     END IF;
-    hb_id := start_heartbeat();
+    hb_payload := start_heartbeat();
 
-    RETURN hb_id;
+    RETURN hb_payload;
 END;
 $$ LANGUAGE plpgsql;
 -- ============================================================================
@@ -5797,48 +6959,27 @@ SELECT
     (SELECT is_paused FROM heartbeat_state WHERE id = 1) as is_paused,
     (SELECT COUNT(*) FROM memories WHERE type = 'goal' AND status = 'active' AND metadata->>'priority' = 'active') as active_goals,
     (SELECT COUNT(*) FROM memories WHERE type = 'goal' AND status = 'active' AND metadata->>'priority' = 'queued') as queued_goals,
-    (SELECT COUNT(*) FROM external_calls WHERE status = 'pending') as pending_calls,
-    (SELECT AVG(energy_end - energy_start) FROM heartbeat_log
-     WHERE started_at > NOW() - INTERVAL '24 hours') as avg_energy_delta_24h,
-    (SELECT COUNT(*) FROM heartbeat_log
-     WHERE actions_taken::text LIKE '%reach_out%'
-     AND started_at > NOW() - INTERVAL '24 hours') as reach_outs_24h;
+    0::int as pending_calls,
+    NULL::float as avg_energy_delta_24h,
+    0::int as reach_outs_24h;
 
 CREATE VIEW recent_heartbeats AS
 SELECT
-    id,
-    heartbeat_number,
-    started_at,
-    ended_at,
-    energy_start,
-    energy_end,
-    jsonb_array_length(COALESCE(actions_taken, '[]'::jsonb)) as action_count,
-    narrative,
-    emotional_valence
-FROM heartbeat_log
-ORDER BY started_at DESC
+    m.id as memory_id,
+    NULLIF(m.metadata#>>'{context,heartbeat_id}', '')::uuid as heartbeat_id,
+    (m.metadata#>>'{context,heartbeat_number}')::int as heartbeat_number,
+    COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at) as started_at,
+    COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at) as ended_at,
+    NULL::float as energy_start,
+    NULL::float as energy_end,
+    jsonb_array_length(COALESCE(m.metadata#>'{context,actions_taken}', '[]'::jsonb)) as action_count,
+    m.content as narrative,
+    NULLIF(m.metadata->>'emotional_valence', '')::float as emotional_valence
+FROM memories m
+WHERE m.type = 'episodic'
+  AND m.metadata#>>'{context,heartbeat_id}' IS NOT NULL
+ORDER BY COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at) DESC
 LIMIT 20;
--- ============================================================================
--- HEARTBEAT TRIGGERS
--- ============================================================================
-CREATE OR REPLACE FUNCTION on_external_call_complete()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.call_type = 'think' AND
-       NEW.status = 'complete' AND
-       OLD.status != 'complete' AND
-       NEW.heartbeat_id IS NOT NULL THEN
-        NULL;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_external_call_complete
-    AFTER UPDATE ON external_calls
-    FOR EACH ROW
-    WHEN (OLD.status != 'complete' AND NEW.status = 'complete')
-    EXECUTE FUNCTION on_external_call_complete();
 -- ============================================================================
 -- BOUNDARIES
 -- ============================================================================
@@ -6469,12 +7610,15 @@ BEGIN
     current_state := get_current_affective_state();
 
     SELECT
-        AVG(emotional_valence) as avg_valence,
+        AVG(NULLIF(m.metadata->>'emotional_valence', '')::float) as avg_valence,
         COUNT(*) as sample_count
     INTO recent
-    FROM heartbeat_log
-    WHERE ended_at > CURRENT_TIMESTAMP - INTERVAL '2 hours'
-      AND emotional_valence IS NOT NULL;
+    FROM memories m
+    WHERE m.type = 'episodic'
+      AND m.metadata#>>'{context,heartbeat_id}' IS NOT NULL
+      AND COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at)
+            > CURRENT_TIMESTAMP - INTERVAL '2 hours'
+      AND m.metadata->>'emotional_valence' IS NOT NULL;
 
     new_mood_valence := COALESCE((current_state->>'mood_valence')::float, 0.0);
     new_mood_arousal := COALESCE((current_state->>'mood_arousal')::float, 0.3);
@@ -6826,7 +7970,10 @@ DECLARE
     assess_primary TEXT;
     mem_importance FLOAT;
 BEGIN
-    SELECT heartbeat_number INTO hb_number FROM heartbeat_log WHERE id = p_heartbeat_id;
+    SELECT active_heartbeat_number INTO hb_number FROM heartbeat_state WHERE id = 1;
+    IF hb_number IS NULL THEN
+        SELECT heartbeat_count INTO hb_number FROM heartbeat_state WHERE id = 1;
+    END IF;
 
     SELECT string_agg(
         format('- %s: %s',
@@ -6965,27 +8112,22 @@ BEGIN
             'heartbeat_id', p_heartbeat_id,
             'heartbeat_number', hb_number,
             'reasoning', p_reasoning,
+            'actions_taken', p_actions_taken,
+            'goal_changes', p_goals_modified,
             'affective_state', get_current_affective_state()
         ),
         p_emotional_valence := new_valence,
         p_importance := mem_importance
     );
 
-    UPDATE heartbeat_log SET
-        ended_at = CURRENT_TIMESTAMP,
-        energy_end = get_current_energy(),
-        decision_reasoning = p_reasoning,
-        actions_taken = p_actions_taken,
-        goals_modified = p_goals_modified,
-        narrative = narrative_text,
-        emotional_valence = new_valence,
-        emotional_arousal = new_arousal,
-        emotional_primary_emotion = primary_emotion,
-        memory_id = memory_id_created
-    WHERE id = p_heartbeat_id;
+    RAISE LOG 'Heartbeat % completed: %', hb_number, narrative_text;
     UPDATE heartbeat_state SET
         next_heartbeat_at = CURRENT_TIMESTAMP +
             (get_config_float('heartbeat.heartbeat_interval_minutes') || ' minutes')::INTERVAL,
+        active_heartbeat_id = NULL,
+        active_heartbeat_number = NULL,
+        active_actions = '[]'::jsonb,
+        active_reasoning = NULL,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
 
@@ -7027,13 +8169,19 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE VIEW emotional_trend AS
 WITH base AS (
     SELECT
-        date_trunc('hour', ended_at) as hour,
-        emotional_valence,
-        emotional_arousal,
-        emotional_primary_emotion
-    FROM heartbeat_log
-    WHERE ended_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
-      AND emotional_valence IS NOT NULL
+        date_trunc(
+            'hour',
+            COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at)
+        ) as hour,
+        NULLIF(m.metadata->>'emotional_valence', '')::float as emotional_valence,
+        NULLIF(m.metadata#>>'{emotional_context,arousal}', '')::float as emotional_arousal,
+        NULLIF(m.metadata#>>'{emotional_context,primary_emotion}', '') as emotional_primary_emotion
+    FROM memories m
+    WHERE m.type = 'episodic'
+      AND m.metadata#>>'{context,heartbeat_id}' IS NOT NULL
+      AND COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at)
+            > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+      AND m.metadata->>'emotional_valence' IS NOT NULL
 )
 SELECT
     base.hour,
@@ -8286,25 +9434,30 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION apply_external_call_result(
-    p_call_id UUID,
+    p_call JSONB,
     p_output JSONB
 )
 RETURNS JSONB AS $$
 DECLARE
-    call_type external_call_type;
+    call_type TEXT;
     call_input JSONB;
     heartbeat_id UUID;
     kind TEXT;
     output_payload JSONB := COALESCE(p_output, '{}'::jsonb);
     applied JSONB;
+    outbox_messages JSONB := '[]'::jsonb;
 BEGIN
-    SELECT ec.call_type, ec.input, ec.heartbeat_id
-    INTO call_type, call_input, heartbeat_id
-    FROM external_calls ec
-    WHERE ec.id = p_call_id;
+    call_type := COALESCE(p_call->>'call_type', '');
+    call_input := COALESCE(p_call->'input', '{}'::jsonb);
+    BEGIN
+        heartbeat_id := NULLIF(call_input->>'heartbeat_id', '')::uuid;
+    EXCEPTION
+        WHEN OTHERS THEN
+            heartbeat_id := NULL;
+    END;
 
-    IF call_type IS NULL THEN
-        RETURN jsonb_build_object('error', 'call_not_found');
+    IF call_type = '' THEN
+        RETURN jsonb_build_object('error', 'call_type_missing');
     END IF;
 
     IF call_type = 'think' THEN
@@ -8337,31 +9490,36 @@ BEGIN
                 END;
             END IF;
         ELSIF kind = 'termination_confirm' THEN
-            applied := apply_termination_confirmation(p_call_id, output_payload);
+            applied := apply_termination_confirmation(call_input, output_payload);
             IF applied IS NOT NULL AND jsonb_typeof(applied) = 'object' THEN
                 output_payload := jsonb_set(output_payload, '{termination}', applied, true);
                 IF COALESCE((applied->>'terminated')::boolean, FALSE) THEN
                     output_payload := jsonb_set(output_payload, '{terminated}', 'true'::jsonb, true);
                 END IF;
+                IF jsonb_typeof(applied->'result') = 'object' THEN
+                    outbox_messages := COALESCE(applied->'result'->'outbox_messages', '[]'::jsonb);
+                END IF;
+            END IF;
+        ELSIF kind = 'consent_request' THEN
+            applied := init_consent(output_payload);
+            IF applied IS NOT NULL AND jsonb_typeof(applied) = 'object' THEN
+                output_payload := jsonb_set(output_payload, '{init_consent}', applied, true);
+                IF applied ? 'decision' THEN
+                    output_payload := jsonb_set(output_payload, '{decision}', to_jsonb(applied->>'decision'), true);
+                END IF;
             END IF;
         END IF;
     END IF;
 
-    UPDATE external_calls
-    SET status = 'complete'::external_call_status,
-        output = output_payload,
-        completed_at = CURRENT_TIMESTAMP,
-        error_message = NULL
-    WHERE id = p_call_id;
+    IF outbox_messages IS NOT NULL
+        AND jsonb_typeof(outbox_messages) = 'array'
+        AND jsonb_array_length(outbox_messages) > 0 THEN
+        output_payload := jsonb_set(output_payload, '{outbox_messages}', outbox_messages, true);
+    END IF;
 
     RETURN output_payload;
 EXCEPTION
     WHEN OTHERS THEN
-        UPDATE external_calls
-        SET status = 'failed'::external_call_status,
-            error_message = SQLERRM,
-            completed_at = CURRENT_TIMESTAMP
-        WHERE id = p_call_id;
         RETURN jsonb_build_object('error', SQLERRM);
 END;
 $$ LANGUAGE plpgsql;
@@ -8376,8 +9534,9 @@ DECLARE
     action_cost FLOAT;
     current_e FLOAT;
     result JSONB;
-    queued_call_id UUID;
-    outbox_id UUID;
+    queued_call JSONB;
+    external_calls JSONB := '[]'::jsonb;
+    outbox_messages JSONB := '[]'::jsonb;
     remembered_id UUID;
     boundary_hits JSONB;
     boundary_content TEXT;
@@ -8483,8 +9642,7 @@ BEGIN
             result := jsonb_build_object('reprioritized', true);
 
         WHEN 'reflect' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
+            queued_call := build_external_call(
                 'think',
                 jsonb_build_object(
                     'kind', 'reflect',
@@ -8498,11 +9656,10 @@ BEGIN
                     'goals', get_goals_snapshot(),
                     'heartbeat_id', p_heartbeat_id,
                     'instructions', 'Analyze patterns. Note contradictions. Suggest identity updates. Discover relationships between memories.'
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
+                )
+            );
+            external_calls := external_calls || jsonb_build_array(queued_call);
+            result := jsonb_build_object('queued', true, 'external_call', queued_call);
             PERFORM satisfy_drive('coherence', 0.2);
 
         WHEN 'contemplate', 'meditate', 'study', 'debate_internally' THEN
@@ -8651,19 +9808,17 @@ BEGIN
 
         WHEN 'reflect_on_relationship' THEN
             rel_entity := COALESCE(NULLIF(p_params->>'entity', ''), NULLIF(p_params->>'name', ''));
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
+            queued_call := build_external_call(
                 'think',
                 jsonb_build_object(
                     'kind', 'reflect',
                     'heartbeat_id', p_heartbeat_id,
                     'context', gather_turn_context(),
                     'params', jsonb_build_object('relationship', rel_entity)
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id, 'entity', rel_entity);
+                )
+            );
+            external_calls := external_calls || jsonb_build_array(queued_call);
+            result := jsonb_build_object('queued', true, 'external_call', queued_call, 'entity', rel_entity);
 
         WHEN 'resolve_contradiction' THEN
             contra_a := NULLIF(p_params->>'memory_a', '')::uuid;
@@ -8719,23 +9874,20 @@ BEGIN
             result := jsonb_build_object('accepted', true, 'memory_a', contra_a, 'memory_b', contra_b);
 
         WHEN 'brainstorm_goals' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
+            queued_call := build_external_call(
                 'think',
                 jsonb_build_object(
                     'kind', 'brainstorm_goals',
                     'heartbeat_id', p_heartbeat_id,
                     'context', gather_turn_context(),
                     'params', COALESCE(p_params, '{}'::jsonb)
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
+                )
+            );
+            external_calls := external_calls || jsonb_build_array(queued_call);
+            result := jsonb_build_object('queued', true, 'external_call', queued_call);
 
         WHEN 'inquire_shallow', 'inquire_deep' THEN
-            INSERT INTO external_calls (call_type, input, heartbeat_id)
-            VALUES (
+            queued_call := build_external_call(
                 'think',
                 jsonb_build_object(
                     'kind', 'inquire',
@@ -8744,11 +9896,10 @@ BEGIN
                     'query', COALESCE(p_params->>'query', p_params->>'question'),
                     'context', gather_turn_context(),
                     'params', COALESCE(p_params, '{}'::jsonb)
-                ),
-                p_heartbeat_id
-            )
-            RETURNING id INTO queued_call_id;
-            result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
+                )
+            );
+            external_calls := external_calls || jsonb_build_array(queued_call);
+            result := jsonb_build_object('queued', true, 'external_call', queued_call);
             PERFORM satisfy_drive('curiosity', 0.2);
 
         WHEN 'synthesize' THEN
@@ -8766,22 +9917,20 @@ BEGIN
             END;
 
         WHEN 'reach_out_user' THEN
-            INSERT INTO outbox_messages (kind, payload)
-            VALUES (
+            queued_call := build_outbox_message(
                 'user',
                 jsonb_build_object(
                     'message', p_params->>'message',
                     'intent', p_params->>'intent',
                     'heartbeat_id', p_heartbeat_id
                 )
-            )
-            RETURNING id INTO outbox_id;
-            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id);
+            );
+            outbox_messages := outbox_messages || jsonb_build_array(queued_call);
+            result := jsonb_build_object('queued', true, 'outbox_message', queued_call);
             PERFORM satisfy_drive('connection', 0.3);
 
         WHEN 'reach_out_public' THEN
-            INSERT INTO outbox_messages (kind, payload)
-            VALUES (
+            queued_call := build_outbox_message(
                 'public',
                 jsonb_build_object(
                     'platform', p_params->>'platform',
@@ -8789,9 +9938,9 @@ BEGIN
                     'heartbeat_id', p_heartbeat_id,
                     'boundaries', boundary_hits
                 )
-            )
-            RETURNING id INTO outbox_id;
-            result := jsonb_build_object('queued', true, 'outbox_id', outbox_id, 'boundaries', boundary_hits);
+            );
+            outbox_messages := outbox_messages || jsonb_build_array(queued_call);
+            result := jsonb_build_object('queued', true, 'outbox_message', queued_call, 'boundaries', boundary_hits);
             PERFORM satisfy_drive('connection', 0.3);
 
         WHEN 'pause_heartbeat' THEN
@@ -8804,6 +9953,7 @@ BEGIN
                 RETURN jsonb_build_object('success', false, 'error', 'pause_heartbeat requires a reason');
             END IF;
             result := pause_heartbeat(pause_reason, p_params, p_heartbeat_id);
+            outbox_messages := outbox_messages || COALESCE(result->'outbox_messages', '[]'::jsonb);
 
         WHEN 'terminate' THEN
             IF COALESCE(p_params->'confirmed', 'false'::jsonb) = 'true'::jsonb THEN
@@ -8812,20 +9962,19 @@ BEGIN
                     COALESCE(p_params->'farewells', '[]'::jsonb),
                     COALESCE(p_params->'options', '{}'::jsonb)
                 );
+                outbox_messages := outbox_messages || COALESCE(result->'outbox_messages', '[]'::jsonb);
             ELSE
-                INSERT INTO external_calls (call_type, input, heartbeat_id)
-                VALUES (
+                queued_call := build_external_call(
                     'think',
                     jsonb_build_object(
                         'kind', 'termination_confirm',
                         'heartbeat_id', p_heartbeat_id,
                         'context', gather_turn_context(),
                         'params', COALESCE(p_params, '{}'::jsonb)
-                    ),
-                    p_heartbeat_id
-                )
-                RETURNING id INTO queued_call_id;
-                result := jsonb_build_object('confirmation_required', true, 'external_call_id', queued_call_id);
+                    )
+                );
+                external_calls := external_calls || jsonb_build_array(queued_call);
+                result := jsonb_build_object('confirmation_required', true, 'external_call', queued_call);
             END IF;
 
         WHEN 'rest' THEN
@@ -8841,7 +9990,9 @@ BEGIN
         'action', p_action,
         'cost', action_cost,
         'energy_remaining', get_current_energy(),
-        'result', result
+        'result', result,
+        'external_calls', external_calls,
+        'outbox_messages', outbox_messages
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -8857,7 +10008,9 @@ DECLARE
     action_params JSONB;
     action_result JSONB;
     actions_taken JSONB := '[]'::jsonb;
-    queued_call_id UUID;
+    outbox_messages JSONB := '[]'::jsonb;
+    pending_external JSONB;
+    action_external JSONB;
     next_index INT := COALESCE(p_start_index, 0);
     ord INT;
     halt_reason TEXT;
@@ -8866,6 +10019,7 @@ BEGIN
         RETURN jsonb_build_object(
             'actions_taken', '[]'::jsonb,
             'next_index', next_index,
+            'outbox_messages', outbox_messages,
             'halt_reason', 'invalid_actions'
         );
     END IF;
@@ -8886,29 +10040,26 @@ BEGIN
             'result', action_result
         ));
         next_index := ord;
+        outbox_messages := outbox_messages || COALESCE(action_result->'outbox_messages', '[]'::jsonb);
 
         IF COALESCE((action_result->>'success')::boolean, FALSE) = FALSE THEN
             halt_reason := COALESCE(action_result->>'error', 'action_failed');
             RETURN jsonb_build_object(
                 'actions_taken', actions_taken,
                 'next_index', next_index,
+                'outbox_messages', outbox_messages,
                 'halt_reason', halt_reason
             );
         END IF;
 
-        queued_call_id := NULL;
-        BEGIN
-            queued_call_id := NULLIF(action_result#>>'{result,external_call_id}', '')::uuid;
-        EXCEPTION
-            WHEN OTHERS THEN
-                queued_call_id := NULL;
-        END;
-
-        IF queued_call_id IS NOT NULL THEN
+        action_external := COALESCE(action_result->'external_calls', '[]'::jsonb);
+        IF jsonb_typeof(action_external) = 'array' AND jsonb_array_length(action_external) > 0 THEN
+            pending_external := action_external->0;
             RETURN jsonb_build_object(
                 'actions_taken', actions_taken,
                 'next_index', next_index,
-                'pending_external_call_id', queued_call_id,
+                'pending_external_call', pending_external,
+                'outbox_messages', outbox_messages,
                 'halt_reason', 'external_call'
             );
         END IF;
@@ -8935,6 +10086,7 @@ BEGIN
     RETURN jsonb_build_object(
         'actions_taken', actions_taken,
         'next_index', next_index,
+        'outbox_messages', outbox_messages,
         'halt_reason', NULL
     );
 END;
@@ -8954,9 +10106,10 @@ DECLARE
     new_actions JSONB;
     existing_actions JSONB;
     next_index INT;
-    pending_external UUID;
+    pending_external JSONB;
     halt_reason TEXT;
     memory_id UUID;
+    outbox_messages JSONB := '[]'::jsonb;
 BEGIN
     IF p_decision IS NULL OR jsonb_typeof(p_decision) <> 'object' THEN
         RETURN jsonb_build_object('error', 'invalid_decision');
@@ -8992,33 +10145,37 @@ BEGIN
     END;
 
     BEGIN
-        pending_external := NULLIF(batch->>'pending_external_call_id', '')::uuid;
+        pending_external := batch->'pending_external_call';
     EXCEPTION
         WHEN OTHERS THEN
             pending_external := NULL;
     END;
 
     halt_reason := NULLIF(batch->>'halt_reason', '');
+    outbox_messages := COALESCE(batch->'outbox_messages', '[]'::jsonb);
 
-    SELECT COALESCE(actions_taken, '[]'::jsonb)
+    SELECT COALESCE(active_actions, '[]'::jsonb)
     INTO existing_actions
-    FROM heartbeat_log
-    WHERE id = p_heartbeat_id;
+    FROM heartbeat_state
+    WHERE id = 1;
 
     IF existing_actions IS NULL OR jsonb_typeof(existing_actions) <> 'array' THEN
         existing_actions := '[]'::jsonb;
     END IF;
 
     existing_actions := existing_actions || new_actions;
-    UPDATE heartbeat_log
-    SET actions_taken = existing_actions
-    WHERE id = p_heartbeat_id;
+    UPDATE heartbeat_state
+    SET active_actions = existing_actions,
+        active_reasoning = reasoning,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
 
-    IF pending_external IS NOT NULL THEN
+    IF pending_external IS NOT NULL AND jsonb_typeof(pending_external) = 'object' THEN
         RETURN jsonb_build_object(
-            'pending_external_call_id', pending_external,
+            'pending_external_call', pending_external,
             'next_index', next_index,
             'actions_taken', existing_actions,
+            'outbox_messages', outbox_messages,
             'completed', false,
             'halt_reason', halt_reason
         );
@@ -9030,6 +10187,7 @@ BEGIN
             'completed', false,
             'actions_taken', existing_actions,
             'next_index', next_index,
+            'outbox_messages', outbox_messages,
             'halt_reason', halt_reason
         );
     END IF;
@@ -9047,13 +10205,12 @@ BEGIN
         'memory_id', memory_id,
         'actions_taken', existing_actions,
         'next_index', next_index,
+        'outbox_messages', outbox_messages,
         'halt_reason', halt_reason
     );
 END;
 $$ LANGUAGE plpgsql;
-COMMENT ON TABLE heartbeat_state IS 'Singleton table tracking current heartbeat state: energy, counts, timestamps.';
-COMMENT ON TABLE heartbeat_log IS 'Audit log of each heartbeat execution with full context and results.';
-COMMENT ON TABLE external_calls IS 'Queue for LLM and embedding API calls. Worker polls this and writes results back.';
+COMMENT ON VIEW heartbeat_state IS 'Singleton view tracking current heartbeat state: energy, counts, timestamps.';
 
 COMMENT ON FUNCTION execute_heartbeat_action IS 'Execute a single action, deducting energy and returning results.';
 COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision: environment, goals, memories, identity, self_model, worldview, narrative, relationships, contradictions, emotional patterns, transformations, energy.';
@@ -9121,29 +10278,26 @@ SELECT
     (SELECT COUNT(*) FROM memory_neighborhoods WHERE is_stale = TRUE) as stale_neighborhoods,
     (SELECT valence FROM current_emotional_state) as current_valence,
     (SELECT primary_emotion FROM current_emotional_state) as current_emotion,
-    (SELECT COUNT(*) FROM heartbeat_log WHERE started_at > CURRENT_TIMESTAMP - INTERVAL '24 hours') as heartbeats_24h,
-    (SELECT COUNT(*) FROM external_calls WHERE status = 'pending') as pending_calls,
+    (
+        SELECT COUNT(*)
+        FROM memories m
+        WHERE m.type = 'episodic'
+          AND m.metadata#>>'{context,heartbeat_id}' IS NOT NULL
+          AND COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at)
+                > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+    ) as heartbeats_24h,
+    0::bigint as pending_calls,
     0::bigint as relationships_discovered_24h;
 
 CREATE OR REPLACE VIEW worker_tasks AS
 SELECT
-    'external_calls' as task_type,
-    (SELECT COUNT(*) FROM external_calls WHERE status = 'pending') as pending_count,
-    'Process LLM/embedding requests' as description
+    'heartbeat'::text AS task_type,
+    CASE WHEN should_run_heartbeat() THEN 1 ELSE 0 END AS pending_count,
+    'Run heartbeat if due'::text AS description
 UNION ALL
 SELECT
-    'heartbeat',
-    CASE WHEN should_run_heartbeat() THEN 1 ELSE 0 END,
-    'Run heartbeat if due'
-UNION ALL
-SELECT
-    'subconscious_maintenance',
-    CASE WHEN should_run_maintenance() THEN 1 ELSE 0 END,
-    'Run subconscious maintenance tick (consolidate + prune)'
-UNION ALL
-SELECT
-    'outbox',
-    (SELECT COUNT(*) FROM outbox_messages WHERE status = 'pending'),
-    'Deliver pending messages';
+    'subconscious_maintenance'::text AS task_type,
+    CASE WHEN should_run_maintenance() THEN 1 ELSE 0 END AS pending_count,
+    'Run subconscious maintenance tick (consolidate + prune)'::text AS description;
 
 SET check_function_bodies = on;

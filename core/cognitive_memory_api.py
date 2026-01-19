@@ -716,14 +716,15 @@ class CognitiveMemory:
         *,
         intent: str | None = None,
         context: dict[str, Any] | None = None,
-    ) -> UUID:
+    ) -> dict[str, Any]:
         async with self._pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT queue_user_message($1, $2, $3::jsonb)",
+            raw = await conn.fetchval(
+                "SELECT build_user_message($1, $2, $3::jsonb)",
                 message,
                 intent,
                 _to_jsonb_arg(context or {}),
             )
+            return _coerce_json(raw)
 
     async def get_ingestion_receipts(self, source_file: str, content_hashes: list[str]) -> dict[str, UUID]:
         async with self._pool.acquire() as conn:
@@ -999,8 +1000,16 @@ class CognitiveMemorySync:
             )
         )
 
-    def queue_user_message(self, message: str, *, intent: str | None = None, context: dict[str, Any] | None = None) -> UUID:
-        return self._loop.run_until_complete(self._async.queue_user_message(message, intent=intent, context=context))
+    def queue_user_message(
+        self,
+        message: str,
+        *,
+        intent: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._loop.run_until_complete(
+            self._async.queue_user_message(message, intent=intent, context=context)
+        )
 
     def get_ingestion_receipts(self, source_file: str, content_hashes: list[str]) -> dict[str, UUID]:
         return self._loop.run_until_complete(self._async.get_ingestion_receipts(source_file, content_hashes))

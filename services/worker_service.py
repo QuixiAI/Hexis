@@ -16,10 +16,9 @@ from core.state import (
     run_maintenance_if_due,
     should_run_subconscious_decider,
 )
-from services.consent import ensure_consent
 from services.external_calls import ExternalCallProcessor
+from services.heartbeat_runner import execute_heartbeat_decision
 from services.subconscious import run_subconscious_decider
-from services.worker_tasks import process_pending_call
 
 
 load_dotenv()
@@ -40,57 +39,90 @@ class HeartbeatWorker:
     def __init__(self):
         self.pool: asyncpg.Pool | None = None
         self.running = False
+        self.bridge: RabbitMQBridge | None = None
         self.call_processor = ExternalCallProcessor(max_retries=MAX_RETRIES)
 
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(), min_size=2, max_size=10)
         logger.info("Connected to database")
+        if RABBITMQ_ENABLED:
+            self.bridge = RabbitMQBridge(self.pool)
+            await self.bridge.ensure_ready()
 
     async def disconnect(self) -> None:
         if self.pool:
             await self.pool.close()
             logger.info("Disconnected from database")
 
-    async def _ensure_consent(self) -> bool:
-        if not self.pool:
-            return False
-        try:
-            async with self.pool.acquire() as conn:
-                return await ensure_consent(conn, dsn=db_dsn_from_env())
-        except Exception as exc:
-            logger.error(f"Consent flow failed: {exc}")
-            return False
-
-    async def _process_pending_call(self) -> None:
-        if not self.pool:
+    async def _publish_outbox(self, messages: list[dict]) -> None:
+        if not messages:
             return
-        async with self.pool.acquire() as conn:
-            try:
-                payload = await process_pending_call(conn, call_processor=self.call_processor)
-            except Exception as exc:
-                logger.error(f"Error processing pending call: {exc}")
-                return
-        if payload and payload.get("execution", {}).get("terminated") is True:
-            logger.info("Termination executed; stopping workers and skipping heartbeat completion.")
-            self.stop()
+        if self.bridge:
+            await self.bridge.publish_outbox_payloads(messages)
 
     async def _run_heartbeat_if_due(self) -> None:
         if not self.pool:
             return
         async with self.pool.acquire() as conn:
-            heartbeat_id = await run_heartbeat(conn)
+            payload = await run_heartbeat(conn)
+            if not payload:
+                return
+            heartbeat_id = payload.get("heartbeat_id")
             if heartbeat_id:
                 logger.info(f"Heartbeat started: {heartbeat_id}")
+
+            outbox_messages = payload.get("outbox_messages")
+            if isinstance(outbox_messages, list):
+                await self._publish_outbox(outbox_messages)
+
+            external_calls = payload.get("external_calls")
+            if not isinstance(external_calls, list):
+                return
+
+            for call in external_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_type = str(call.get("call_type") or "")
+                call_input = call.get("input") or {}
+                if not isinstance(call_input, dict):
+                    call_input = {}
+                try:
+                    result = await self.call_processor.process_call_payload(conn, call_type, call_input)
+                    applied = await self.call_processor.apply_result(conn, call, result)
+                except Exception as exc:
+                    logger.error(f"Error processing external call: {exc}")
+                    continue
+
+                if isinstance(applied, dict):
+                    outbox_messages = applied.get("outbox_messages")
+                    if isinstance(outbox_messages, list):
+                        await self._publish_outbox(outbox_messages)
+
+                if (
+                    isinstance(result, dict)
+                    and result.get("kind") == "heartbeat_decision"
+                    and "decision" in result
+                    and heartbeat_id
+                ):
+                    exec_result = await execute_heartbeat_decision(
+                        conn,
+                        heartbeat_id=str(heartbeat_id),
+                        decision=result["decision"],
+                        call_processor=self.call_processor,
+                    )
+                    if isinstance(exec_result, dict):
+                        outbox_messages = exec_result.get("outbox_messages")
+                        if isinstance(outbox_messages, list):
+                            await self._publish_outbox(outbox_messages)
+                        if exec_result.get("terminated") is True:
+                            logger.info("Termination executed; stopping workers.")
+                            self.stop()
+                    return
 
     async def run(self) -> None:
         self.running = True
         logger.info("Heartbeat worker starting...")
         await self.connect()
-
-        if not await self._ensure_consent():
-            logger.warning("LLM consent not granted; heartbeat worker exiting.")
-            self.running = False
-            return
 
         try:
             while self.running:
@@ -98,7 +130,6 @@ class HeartbeatWorker:
                     if await self._is_agent_terminated():
                         logger.info("Agent is terminated; heartbeat worker exiting.")
                         break
-                    await self._process_pending_call()
                     await self._run_heartbeat_if_due()
                 except Exception as exc:
                     logger.error(f"Worker loop error: {exc}")
@@ -173,7 +204,6 @@ class MaintenanceWorker:
                         break
                     if self.bridge:
                         await self.bridge.poll_inbox_messages()
-                        await self.bridge.publish_outbox_messages(max_messages=10)
                     await self._run_maintenance_if_due()
                     await self._run_subconscious_if_due()
                 except Exception as exc:

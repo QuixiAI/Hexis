@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from core import chat as chat_mod
+from services import chat as chat_mod
 from core.cognitive_memory_api import HydratedContext
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.core]

@@ -25,7 +25,10 @@ async def test_finalize_heartbeat_applies_goal_changes(db_pool, ensure_embedding
         )
         assert goal_id is not None
 
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = await conn.fetchval("SELECT start_heartbeat()")
+        if isinstance(hb_payload, str):
+            hb_payload = json.loads(hb_payload)
+        hb_id = hb_payload.get("heartbeat_id")
         assert hb_id is not None
 
         goal_changes = [
@@ -52,9 +55,8 @@ async def test_finalize_heartbeat_applies_goal_changes(db_pool, ensure_embedding
         assert goal_row["status"] == "archived"
 
         hb_row = await conn.fetchrow(
-            "SELECT ended_at, memory_id FROM heartbeat_log WHERE id = $1::uuid",
-            hb_id,
+            "SELECT metadata#>>'{context,heartbeat_id}' as heartbeat_id FROM memories WHERE id = $1::uuid",
+            memory_id,
         )
         assert hb_row is not None
-        assert hb_row["ended_at"] is not None
-        assert hb_row["memory_id"] is not None
+        assert hb_row["heartbeat_id"] == str(hb_id)

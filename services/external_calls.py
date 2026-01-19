@@ -6,9 +6,10 @@ from typing import Any
 from services.heartbeat_prompt import build_heartbeat_decision_prompt
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
-from core import external_calls as external_calls_store
+from core.state import apply_external_call_result
 from services.prompt_resources import (
     compose_personhood_prompt,
+    load_consent_prompt,
     load_heartbeat_prompt,
     load_termination_confirm_prompt,
 )
@@ -18,23 +19,8 @@ class ExternalCallProcessor:
     def __init__(self, *, max_retries: int = 3):
         self.max_retries = max_retries
 
-    async def claim_pending_call(self, conn) -> dict[str, Any] | None:
-        return await external_calls_store.claim_pending_call(conn)
-
-    async def claim_call_by_id(self, conn, call_id: str) -> dict[str, Any] | None:
-        return await external_calls_store.claim_call_by_id(conn, call_id)
-
-    async def apply_result(self, conn, call_id: str, output: dict[str, Any]) -> dict[str, Any]:
-        return await external_calls_store.apply_result(conn, call_id, output)
-
-    async def fail_call(self, conn, call_id: str, error: str, *, retry: bool = True) -> None:
-        await external_calls_store.fail_call(
-            conn,
-            call_id,
-            error,
-            max_retries=self.max_retries,
-            retry=retry,
-        )
+    async def apply_result(self, conn, call: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
+        return await apply_external_call_result(conn, call=call, output=output)
 
     async def process_call_payload(self, conn, call_type: str, call_input: dict[str, Any]) -> dict[str, Any]:
         if call_type == "think":
@@ -42,23 +28,6 @@ class ExternalCallProcessor:
         if call_type == "embed":
             raise RuntimeError("external_calls type 'embed' is unsupported; use get_embedding() inside Postgres")
         return {"error": f"Unsupported call_type: {call_type}"}
-
-    async def process_call_by_id(self, conn, call_id: str) -> dict[str, Any]:
-        row = await self.claim_call_by_id(conn, call_id)
-        if not row:
-            cur = await external_calls_store.get_call_status(conn, call_id)
-            return cur if cur else {"error": "call not found"}
-
-        call_type = row["call_type"]
-        call_input = row.get("input") or {}
-        if isinstance(call_input, str):
-            try:
-                call_input = json.loads(call_input)
-            except Exception:
-                call_input = {}
-
-        result = await self.process_call_payload(conn, call_type, call_input)
-        return await self.apply_result(conn, call_id, result)
 
     async def _process_think_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
         kind = (call_input.get("kind") or "").strip() or "heartbeat_decision"
@@ -72,6 +41,8 @@ class ExternalCallProcessor:
             return await self._process_reflect_call(conn, call_input)
         if kind == "termination_confirm":
             return await self._process_termination_confirm_call(conn, call_input)
+        if kind == "consent_request":
+            return await self._process_consent_request_call(conn, call_input)
         return {"error": f"Unknown think kind: {kind!r}"}
 
     async def _process_heartbeat_decision_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
@@ -227,6 +198,36 @@ class ExternalCallProcessor:
         if not isinstance(doc, dict):
             doc = {}
         return {"kind": "reflect", "heartbeat_id": heartbeat_id, "result": doc, "raw_response": raw}
+
+    async def _process_consent_request_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
+        context = call_input.get("context", {})
+        params = call_input.get("params", {})
+        system_prompt = load_consent_prompt().strip()
+        user_prompt = (
+            "Initialization context (JSON):\n"
+            f"{json.dumps(context)[:12000]}\n\n"
+            "Params (JSON):\n"
+            f"{json.dumps(params)[:2000]}"
+        )
+        llm_config = await load_llm_config(conn, "llm.heartbeat")
+        fallback = {"decision": "abstain", "signature": "", "memories": []}
+        doc, raw = await chat_json(
+            llm_config=llm_config,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+            fallback=fallback,
+        )
+        if not isinstance(doc, dict):
+            doc = fallback
+        return {
+            "kind": "consent_request",
+            **doc,
+            "raw_response": raw,
+        }
 
     async def _process_termination_confirm_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
         heartbeat_id = call_input.get("heartbeat_id")

@@ -10,18 +10,9 @@ async def test_apply_termination_confirmation(db_pool):
         tr = conn.transaction()
         await tr.start()
         try:
-            call_id = await conn.fetchval(
-                """
-                INSERT INTO external_calls (call_type, input)
-                VALUES ('think', $1::jsonb)
-                RETURNING id
-                """,
-                json.dumps({"params": {"last_will": "Final message"}}),
-            )
-
             declined_raw = await conn.fetchval(
-                "SELECT apply_termination_confirmation($1::uuid, $2::jsonb)",
-                call_id,
+                "SELECT apply_termination_confirmation($1::jsonb, $2::jsonb)",
+                json.dumps({"params": {"last_will": "Final message"}}),
                 json.dumps({"confirm": False}),
             )
             declined = json.loads(declined_raw) if isinstance(declined_raw, str) else declined_raw
@@ -29,8 +20,8 @@ async def test_apply_termination_confirmation(db_pool):
             assert declined.get("terminated") is False
 
             confirmed_raw = await conn.fetchval(
-                "SELECT apply_termination_confirmation($1::uuid, $2::jsonb)",
-                call_id,
+                "SELECT apply_termination_confirmation($1::jsonb, $2::jsonb)",
+                json.dumps({"params": {"last_will": "Final message"}}),
                 json.dumps(
                     {
                         "confirm": True,

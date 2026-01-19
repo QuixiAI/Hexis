@@ -278,14 +278,13 @@ async def test_api_create_goal_sets_due_at(cognitive_memory_client, db_pool):
 
 async def test_api_queue_user_message_creates_outbox(cognitive_memory_client, db_pool):
     test_id = get_test_identifier("api_outbox")
-    outbox_id = await cognitive_memory_client.queue_user_message(f"hi {test_id}", intent="status", context={"test_id": test_id})
-    assert outbox_id is not None
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT kind, status, payload FROM outbox_messages WHERE id = $1::uuid", outbox_id)
-        assert row is not None
-        assert row["kind"] == "user"
-        assert row["status"] == "pending"
+    message = await cognitive_memory_client.queue_user_message(
+        f"hi {test_id}", intent="status", context={"test_id": test_id}
+    )
+    assert message is not None
+    assert message.get("kind") == "user"
+    payload = message.get("payload") or {}
+    assert payload.get("message") == f"hi {test_id}"
 
 
 async def test_api_ingestion_receipts_roundtrip(cognitive_memory_client):

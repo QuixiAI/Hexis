@@ -10,7 +10,8 @@ pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
 async def test_apply_external_call_result_applies_side_effects(db_pool, ensure_embedding_service):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE heartbeat_state SET current_energy = 20, is_paused = FALSE WHERE id = 1")
-        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
+        hb_id = hb_payload.get("heartbeat_id")
         assert hb_id is not None
 
         brainstorm_raw = await conn.fetchval(
@@ -18,8 +19,8 @@ async def test_apply_external_call_result_applies_side_effects(db_pool, ensure_e
             hb_id,
         )
         brainstorm_result = _coerce_json(brainstorm_raw)
-        brainstorm_call_id = (brainstorm_result.get("result") or {}).get("external_call_id")
-        assert brainstorm_call_id is not None
+        brainstorm_call = (brainstorm_result.get("external_calls") or [{}])[0]
+        assert brainstorm_call.get("call_type") == "think"
 
         test_id = get_test_identifier("apply_external_call")
         brainstorm_output = {
@@ -31,8 +32,8 @@ async def test_apply_external_call_result_applies_side_effects(db_pool, ensure_e
         }
 
         await conn.fetchval(
-            "SELECT apply_external_call_result($1::uuid, $2::jsonb)",
-            brainstorm_call_id,
+            "SELECT apply_external_call_result($1::jsonb, $2::jsonb)",
+            json.dumps(brainstorm_call),
             json.dumps(brainstorm_output),
         )
 
@@ -54,8 +55,8 @@ async def test_apply_external_call_result_applies_side_effects(db_pool, ensure_e
             json.dumps({"query": f"What is an embedding? {test_id}"}),
         )
         inquire_result = _coerce_json(inquire_raw)
-        inquire_call_id = (inquire_result.get("result") or {}).get("external_call_id")
-        assert inquire_call_id is not None
+        inquire_call = (inquire_result.get("external_calls") or [{}])[0]
+        assert inquire_call.get("call_type") == "think"
 
         inquiry_summary = f"Embeddings are vectors ({test_id})."
         inquire_output = {
@@ -68,8 +69,8 @@ async def test_apply_external_call_result_applies_side_effects(db_pool, ensure_e
         }
 
         await conn.fetchval(
-            "SELECT apply_external_call_result($1::uuid, $2::jsonb)",
-            inquire_call_id,
+            "SELECT apply_external_call_result($1::jsonb, $2::jsonb)",
+            json.dumps(inquire_call),
             json.dumps(inquire_output),
         )
 

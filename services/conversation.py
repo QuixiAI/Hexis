@@ -80,7 +80,7 @@ You have access to several memory tools that allow you to search and explore you
 4. **get_procedures** - Find procedural/how-to knowledge for tasks.
 5. **get_strategies** - Find strategic patterns and lessons learned.
 6. **create_goal** - Create a queued goal/reminder for the agent to pursue later.
-7. **queue_user_message** - Queue a message to the user's outbox (for delivery by an external integration).
+7. **queue_user_message** - Return a user message payload for external delivery.
 
 ## When to Use Memory Tools
 

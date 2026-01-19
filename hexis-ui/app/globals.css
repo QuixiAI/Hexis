@@ -1,0 +1,100 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f6f1e8;
+  --foreground: #1c1915;
+  --surface: #fbf7f0;
+  --surface-strong: #f1e7da;
+  --ink-soft: #4e463d;
+  --accent: #d8774f;
+  --accent-strong: #b45835;
+  --teal: #3c6f64;
+  --outline: rgba(28, 25, 21, 0.12);
+  --shadow: rgba(28, 25, 21, 0.12);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body);
+  --font-serif: var(--font-display);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-body), "Georgia", serif;
+  min-height: 100vh;
+}
+
+.font-display {
+  font-family: var(--font-display), "Georgia", serif;
+}
+
+.app-shell {
+  background: radial-gradient(circle at top left, rgba(216, 119, 79, 0.15), transparent 45%),
+    radial-gradient(circle at 20% 80%, rgba(60, 111, 100, 0.12), transparent 40%),
+    linear-gradient(135deg, #f6f1e8 0%, #efe4d7 45%, #f7f1e6 100%);
+  position: relative;
+  overflow: hidden;
+}
+
+.app-shell::before,
+.app-shell::after {
+  content: "";
+  position: absolute;
+  width: 420px;
+  height: 420px;
+  border-radius: 999px;
+  filter: blur(0px);
+  opacity: 0.7;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.app-shell::before {
+  top: -120px;
+  right: -140px;
+  background: radial-gradient(circle, rgba(216, 119, 79, 0.25), transparent 60%);
+  animation: drift 18s ease-in-out infinite;
+}
+
+.app-shell::after {
+  bottom: -160px;
+  left: -140px;
+  background: radial-gradient(circle, rgba(60, 111, 100, 0.2), transparent 65%);
+  animation: drift 22s ease-in-out infinite reverse;
+}
+
+@keyframes drift {
+  0% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(18px);
+  }
+  100% {
+    transform: translateY(0px);
+  }
+}
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-up {
+  animation: fadeUp 0.6s ease-out both;
+}
+
+.card-surface {
+  background: var(--surface);
+  border: 1px solid var(--outline);
+  box-shadow: 0 20px 40px -30px var(--shadow);
+}

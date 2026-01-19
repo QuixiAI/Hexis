@@ -178,10 +178,10 @@ async def test_tool_create_goal_and_queue_message(mem_client, db_pool):
         mem_client=mem_client,
     )
     assert message_result.get("queued") is True
+    assert message_result.get("outbox_message", {}).get("kind") == "user"
 
     async with db_pool.acquire() as conn:
         await conn.execute(
             "DELETE FROM memories WHERE id = $1::uuid AND type = 'goal'::memory_type",
             goal_result["goal_id"],
         )
-        await conn.execute("DELETE FROM outbox_messages WHERE id = $1::uuid", message_result["outbox_id"])

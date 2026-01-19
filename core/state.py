@@ -17,8 +17,11 @@ def _coerce_json(raw: Any) -> dict[str, Any]:
     return {}
 
 
-async def run_heartbeat(conn) -> str | None:
-    return await conn.fetchval("SELECT run_heartbeat()")
+async def run_heartbeat(conn) -> dict[str, Any] | None:
+    raw = await conn.fetchval("SELECT run_heartbeat()")
+    if raw is None:
+        return None
+    return _coerce_json(raw)
 
 
 async def apply_heartbeat_decision(
@@ -44,6 +47,20 @@ async def run_maintenance_if_due(conn, stats_hint: dict[str, Any] | None = None)
     )
     if raw is None:
         return None
+    return _coerce_json(raw)
+
+
+async def apply_external_call_result(
+    conn,
+    *,
+    call: dict[str, Any],
+    output: dict[str, Any],
+) -> dict[str, Any]:
+    raw = await conn.fetchval(
+        "SELECT apply_external_call_result($1::jsonb, $2::jsonb)",
+        json.dumps(call),
+        json.dumps(output),
+    )
     return _coerce_json(raw)
 
 

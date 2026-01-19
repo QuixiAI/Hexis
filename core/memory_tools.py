@@ -300,7 +300,7 @@ MEMORY_TOOLS = [
         "type": "function",
         "function": {
             "name": "queue_user_message",
-            "description": "Queue a message to the user in the outbox for delivery by an external integration (worker/webhook).",
+            "description": "Return a message payload for external delivery to the user.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -859,12 +859,12 @@ class ApiMemoryToolHandler:
 
         intent = args.get("intent")
         context = args.get("context")
-        outbox_id = self.client.queue_user_message(
+        outbox_message = self.client.queue_user_message(
             message,
             intent=str(intent) if isinstance(intent, str) else None,
             context=context if isinstance(context, dict) else None,
         )
-        return {"outbox_id": str(outbox_id), "queued": True}
+        return {"outbox_message": outbox_message, "queued": True}
 
 
 # ============================================================================

@@ -167,6 +167,10 @@ async def configure_agent_for_tests(db_pool):
     original_config: dict[str, Any] = {}
     original_hb_interval: float | None = None
     original_hb_paused: bool | None = None
+    original_init_stage: str | None = None
+    original_init_data: Any | None = None
+    original_init_started_at: Any | None = None
+    original_init_completed_at: Any | None = None
     inserted_consent_log_id: str | None = None
 
     async with db_pool.acquire() as conn:
@@ -182,6 +186,14 @@ async def configure_agent_for_tests(db_pool):
         original_hb_paused = await conn.fetchval(
             "SELECT is_paused FROM heartbeat_state WHERE id = 1"
         )
+        init_state = await conn.fetchrow(
+            "SELECT init_stage, init_data, init_started_at, init_completed_at FROM heartbeat_state WHERE id = 1"
+        )
+        if init_state:
+            original_init_stage = str(init_state["init_stage"])
+            original_init_data = init_state["init_data"]
+            original_init_started_at = init_state["init_started_at"]
+            original_init_completed_at = init_state["init_completed_at"]
 
         consent_payload = {
             "decision": "consent",
@@ -212,6 +224,16 @@ async def configure_agent_for_tests(db_pool):
             json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
         )
         await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
+        await conn.execute(
+            """
+            UPDATE heartbeat_state
+            SET init_stage = 'complete',
+                init_started_at = COALESCE(init_started_at, CURRENT_TIMESTAMP),
+                init_completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """
+        )
         # Phase 7 (ReduceScopeCreep): use unified config
         await conn.execute("SELECT set_config('heartbeat.heartbeat_interval_minutes', '60'::jsonb)")
 
@@ -241,6 +263,22 @@ async def configure_agent_for_tests(db_pool):
             await conn.execute(
                 "UPDATE heartbeat_state SET is_paused = $1 WHERE id = 1",
                 bool(original_hb_paused),
+            )
+        if original_init_stage is not None:
+            await conn.execute(
+                """
+                UPDATE heartbeat_state
+                SET init_stage = $1::init_stage,
+                    init_data = $2::jsonb,
+                    init_started_at = $3,
+                    init_completed_at = $4,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = 1
+                """,
+                original_init_stage,
+                json.dumps(original_init_data or {}),
+                original_init_started_at,
+                original_init_completed_at,
             )
 
 

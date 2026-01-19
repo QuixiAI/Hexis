@@ -254,5 +254,5 @@ async def _handle_queue_user_message(args: dict[str, Any], mem_client: Cognitive
         return {"error": "Missing message"}
     intent = args.get("intent")
     context = args.get("context")
-    outbox_id = await mem_client.queue_user_message(message, intent=intent, context=context)
-    return {"outbox_id": str(outbox_id), "queued": True}
+    outbox_message = await mem_client.queue_user_message(message, intent=intent, context=context)
+    return {"outbox_message": outbox_message, "queued": True}

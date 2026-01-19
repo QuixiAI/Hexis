@@ -56,30 +56,17 @@ class RabbitMQBridge:
         except Exception:
             return
 
-    async def publish_outbox_messages(self, max_messages: int = 20) -> int:
-        if not RABBITMQ_ENABLED or not self.pool:
+    async def publish_outbox_payloads(self, payloads: list[dict[str, Any]]) -> int:
+        if not RABBITMQ_ENABLED:
             return 0
 
         published = 0
         vhost = self._vhost_path()
-        for _ in range(max_messages):
-            async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, kind, payload
-                    FROM outbox_messages
-                    WHERE status = 'pending'
-                    ORDER BY created_at
-                    LIMIT 1
-                    """
-                )
-                if not row:
-                    return published
-                msg_id = row["id"]
-                kind = row["kind"]
-                payload = row["payload"]
-
-            body = {"id": str(msg_id), "kind": kind, "payload": payload}
+        for msg in payloads or []:
+            kind = msg.get("kind")
+            payload = msg.get("payload")
+            msg_id = msg.get("message_id") or msg.get("id")
+            body = {"id": msg_id, "kind": kind, "payload": payload}
             try:
                 resp = await self._request(
                     "POST",
@@ -94,28 +81,8 @@ class RabbitMQBridge:
                 ok = resp.status_code == 200 and bool(resp.json().get("routed"))
                 if not ok:
                     raise RuntimeError(f"publish not routed: HTTP {resp.status_code} body={resp.text[:200]}")
-
-                async with self.pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE outbox_messages
-                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP, error_message = NULL
-                        WHERE id = $1::uuid
-                        """,
-                        msg_id,
-                    )
                 published += 1
-            except Exception as exc:
-                async with self.pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        UPDATE outbox_messages
-                        SET status = 'failed', error_message = $2
-                        WHERE id = $1::uuid
-                        """,
-                        msg_id,
-                        str(exc),
-                    )
+            except Exception:
                 return published
 
         return published
