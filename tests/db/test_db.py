@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
@@ -38,7 +38,7 @@ async def _ensure_memory_node(conn, memory_id: uuid.UUID, mem_type: str) -> None
             RETURN n
         $q$) as (n agtype);
         """
-        % (memory_id, mem_type, datetime.utcnow().isoformat())
+        % (memory_id, mem_type, datetime.now(timezone.utc).isoformat())
     )
 
 
@@ -1743,48 +1743,39 @@ async def test_large_dataset_performance(db_pool):
         import time
         
         # Create large number of memories (1000 for testing, would be 10K+ in production)
-        batch_size = 100
         total_memories = 1000
-        memory_ids = []
-        
-        print(f"Creating {total_memories} memories in batches of {batch_size}...")
-        
-        for batch_start in range(0, total_memories, batch_size):
-            batch_end = min(batch_start + batch_size, total_memories)
-            batch_memories = []
-            
-            # Create batch of memories
-            for i in range(batch_start, batch_end):
-                # Create diverse embeddings
-                embedding = [0.0] * EMBEDDING_DIMENSION
-                # Create patterns in embeddings for clustering
-                pattern_start = (i % 10) * 150
-                pattern_end = min(pattern_start + 150, EMBEDDING_DIMENSION)
-                embedding[pattern_start:pattern_end] = [0.8] * (pattern_end - pattern_start)
-                
-                memory_id = await conn.fetchval("""
-                    INSERT INTO memories (
-                        type,
-                        content,
-                        embedding,
-                        importance
-                    ) VALUES (
-                        $1::memory_type,
-                        'Large dataset memory ' || $2,
-                        $3::vector,
-                        $4
-                    ) RETURNING id
-                """, 
-                    ['episodic', 'semantic', 'procedural', 'strategic'][i % 4],
-                    str(i),
-                    str(embedding),
-                    0.1 + (i % 100) * 0.01
-                )
-                batch_memories.append(memory_id)
-            
-            memory_ids.extend(batch_memories)
-        
-        print(f"Created {len(memory_ids)} memories")
+        memory_types = ["episodic", "semantic", "procedural", "strategic"]
+        type_values: list[str] = []
+        content_values: list[str] = []
+        embedding_values: list[str] = []
+        importance_values: list[float] = []
+
+        print(f"Creating {total_memories} memories in a single batch...")
+
+        for i in range(total_memories):
+            embedding = [0.0] * EMBEDDING_DIMENSION
+            pattern_start = (i % 10) * 150
+            pattern_end = min(pattern_start + 150, EMBEDDING_DIMENSION)
+            embedding[pattern_start:pattern_end] = [0.8] * (pattern_end - pattern_start)
+
+            type_values.append(memory_types[i % 4])
+            content_values.append(f"Large dataset memory {i}")
+            embedding_values.append(str(embedding))
+            importance_values.append(0.1 + (i % 100) * 0.01)
+
+        await conn.execute(
+            """
+            INSERT INTO memories (type, content, embedding, importance)
+            SELECT t::memory_type, c, e::vector, i
+            FROM unnest($1::text[], $2::text[], $3::text[], $4::float[]) AS x(t, c, e, i)
+            """,
+            type_values,
+            content_values,
+            embedding_values,
+            importance_values,
+        )
+
+        print(f"Created {total_memories} memories")
         
         # Test 1: Vector similarity search performance
         head_len = min(150, EMBEDDING_DIMENSION)
@@ -2836,8 +2827,8 @@ async def test_embedding_error_handling(db_pool):
         )
         original_retry_seconds, original_retry_interval_seconds = await _set_embedding_retry_config(
             conn,
-            retry_seconds=1,
-            retry_interval_seconds=0.1,
+            retry_seconds=0,
+            retry_interval_seconds=0.0,
         )
 
         # Test with invalid service URL
@@ -5559,8 +5550,8 @@ async def test_get_embedding_http_error_handling(db_pool):
         original_url = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
         original_retry_seconds, original_retry_interval_seconds = await _set_embedding_retry_config(
             conn,
-            retry_seconds=1,
-            retry_interval_seconds=0.1,
+            retry_seconds=0,
+            retry_interval_seconds=0.0,
         )
 
         try:
@@ -5595,8 +5586,8 @@ async def test_get_embedding_non_200_response_handling(db_pool):
         original_url = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
         original_retry_seconds, original_retry_interval_seconds = await _set_embedding_retry_config(
             conn,
-            retry_seconds=1,
-            retry_interval_seconds=0.1,
+            retry_seconds=0,
+            retry_interval_seconds=0.0,
         )
 
         try:

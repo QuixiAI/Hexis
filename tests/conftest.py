@@ -18,6 +18,19 @@ from tenacity import (
 from tests.utils import _db_dsn
 
 
+async def _connect_with_retry(dsn: str, *, wait_seconds: int, timeout_seconds: float) -> asyncpg.Connection:
+    retrying = AsyncRetrying(
+        stop=stop_after_delay(wait_seconds),
+        wait=wait_fixed(1),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    async for attempt in retrying:
+        with attempt:
+            return await asyncpg.connect(dsn, timeout=timeout_seconds)
+    raise RuntimeError("connect retry loop exhausted")
+
+
 @pytest.fixture(scope="module", autouse=True)
 async def temp_test_db():
     """Create a dedicated test database per module and drop it after tests."""
@@ -28,7 +41,19 @@ async def temp_test_db():
     admin_db = os.getenv("POSTGRES_ADMIN_DB", "postgres")
     admin_dsn = _db_dsn(admin_db)
 
-    admin_conn = await asyncpg.connect(admin_dsn)
+    wait_seconds = int(os.getenv("POSTGRES_WAIT_SECONDS", "60"))
+    connect_timeout = float(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5"))
+    try:
+        admin_conn = await _connect_with_retry(
+            admin_dsn,
+            wait_seconds=wait_seconds,
+            timeout_seconds=connect_timeout,
+        )
+    except Exception as exc:
+        pytest.fail(
+            f"Postgres not available for test DB creation after {wait_seconds}s "
+            f"(connect_timeout={connect_timeout}s): {exc!r}"
+        )
     try:
         await admin_conn.execute(f'CREATE DATABASE "{temp_db}"')
     finally:
@@ -36,7 +61,17 @@ async def temp_test_db():
 
     schema_path = Path(__file__).resolve().parents[1] / "db" / "schema.sql"
     schema_sql = schema_path.read_text(encoding="utf-8")
-    test_conn = await asyncpg.connect(_db_dsn(temp_db))
+    try:
+        test_conn = await _connect_with_retry(
+            _db_dsn(temp_db),
+            wait_seconds=wait_seconds,
+            timeout_seconds=connect_timeout,
+        )
+    except Exception as exc:
+        pytest.fail(
+            f"Postgres not available for schema init after {wait_seconds}s "
+            f"(connect_timeout={connect_timeout}s): {exc!r}"
+        )
     try:
         await test_conn.execute(schema_sql)
     finally:
@@ -44,7 +79,17 @@ async def temp_test_db():
 
     yield
 
-    admin_conn = await asyncpg.connect(admin_dsn)
+    try:
+        admin_conn = await _connect_with_retry(
+            admin_dsn,
+            wait_seconds=wait_seconds,
+            timeout_seconds=connect_timeout,
+        )
+    except Exception as exc:
+        pytest.fail(
+            f"Postgres not available for test DB cleanup after {wait_seconds}s "
+            f"(connect_timeout={connect_timeout}s): {exc!r}"
+        )
     try:
         await admin_conn.execute(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
@@ -65,7 +110,8 @@ async def db_pool(temp_test_db):
     """Create a connection pool for testing."""
     db_url = _db_dsn()
     # Postgres restarts once during initdb, and this repo's schema init can take >60s on cold starts.
-    wait_seconds = int(os.getenv("POSTGRES_WAIT_SECONDS", "180"))
+    wait_seconds = int(os.getenv("POSTGRES_WAIT_SECONDS", "60"))
+    connect_timeout = float(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5"))
     pool = None
     retrying = AsyncRetrying(
         stop=stop_after_delay(wait_seconds),
@@ -81,6 +127,7 @@ async def db_pool(temp_test_db):
                 min_size=2,
                 max_size=20,
                 command_timeout=60.0,
+                timeout=connect_timeout,
             )
     assert pool is not None
     yield pool

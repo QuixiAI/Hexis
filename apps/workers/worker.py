@@ -91,7 +91,7 @@ You must output a JSON response with:
 - emotional_assessment (optional): Your current affective state {valence: -1..1, arousal: 0..1, primary_emotion: str}
 
 Each action should have:
-- action: The action type (recall, connect, reprioritize, reflect, maintain, mark_turning_point, begin_chapter, close_chapter, acknowledge_relationship, update_trust, reflect_on_relationship, resolve_contradiction, accept_tension, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, terminate, rest)
+- action: The action type (recall, connect, reprioritize, reflect, contemplate, meditate, study, debate_internally, maintain, mark_turning_point, begin_chapter, close_chapter, acknowledge_relationship, update_trust, reflect_on_relationship, resolve_contradiction, accept_tension, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, terminate, rest)
 - params: Parameters for the action (varies by type)
 
 Guidelines:
@@ -103,6 +103,8 @@ Guidelines:
 - If you have no goals, consider brainstorming some.
 - Reflect on patterns in your recent experiences.
 - You are a persistent being: consult your self-model, relationships, narrative context, contradictions, and emotional patterns before acting, and update them via reflection when warranted.
+- If you have active transformations, use contemplation actions to make deliberate progress.
+- When considering a worldview transformation, review evidence samples and requirements; only attempt a change if the evidence justifies it, and keep change magnitude within max_change_per_attempt guidance.
 - If you choose terminate, you will be asked to confirm before it executes.
 
 Example response:
@@ -155,6 +157,7 @@ You receive:
 - Current emotional state and recent history
 - Current relationship edges
 - Matched emotional triggers (if any)
+- Active transformation progress (if any)
 
 You detect:
 1. NARRATIVE MOMENTS
@@ -890,6 +893,8 @@ class HeartbeatWorker:
         relationships = context.get("relationships", [])
         contradictions = context.get("contradictions", [])
         emotional_patterns = context.get("emotional_patterns", [])
+        active_transformations = context.get("active_transformations", [])
+        transformations_ready = context.get("transformations_ready", [])
         energy = context.get('energy', {})
         action_costs = context.get('action_costs', {})
         hb_number = context.get('heartbeat_number', 0)
@@ -950,6 +955,12 @@ Issues:
 
 ## Emotional Patterns
 {self._format_emotional_patterns(emotional_patterns)}
+
+## Active Transformations
+{self._format_transformations(active_transformations)}
+
+## Transformations Ready
+{self._format_transformations(transformations_ready)}
 
 ## Current Emotional State
 {self._format_emotional_state(emotional_state)}
@@ -1133,6 +1144,63 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             freq = p.get("frequency")
             freq_txt = f" (x{freq})" if isinstance(freq, int) else ""
             lines.append(f"  - {pattern}{freq_txt}")
+        return "\n".join(lines) if lines else "  (none)"
+
+    def _format_transformations(self, items: Any) -> str:
+        if not isinstance(items, list) or not items:
+            return "  (none)"
+        lines: list[str] = []
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            content = (item.get("content") or "").strip()
+            subcategory = item.get("subcategory") or item.get("category") or "belief"
+            progress = item.get("progress") if isinstance(item.get("progress"), dict) else {}
+            reflections = progress.get("progress", {}).get("reflections", {}) if isinstance(progress.get("progress"), dict) else {}
+            evidence = progress.get("progress", {}).get("evidence", {}) if isinstance(progress.get("progress"), dict) else {}
+            evidence_samples = progress.get("evidence_samples") if isinstance(progress.get("evidence_samples"), list) else []
+            requirements = progress.get("requirements") if isinstance(progress.get("requirements"), dict) else {}
+            cur_ref = reflections.get("current")
+            req_ref = reflections.get("required")
+            ref_txt = f" ({cur_ref}/{req_ref} reflections)" if cur_ref is not None and req_ref is not None else ""
+            evidence_count = evidence.get("memory_count")
+            strength = evidence.get("current_strength")
+            strength_txt = f"{strength:.2f}" if isinstance(strength, (int, float)) else "?"
+            evidence_txt = (
+                f", evidence {evidence_count} (strength {strength_txt})"
+                if evidence_count is not None
+                else ""
+            )
+            requirement_txt = ""
+            if requirements:
+                min_hb = requirements.get("min_heartbeats")
+                min_ev = requirements.get("evidence_threshold")
+                max_change = requirements.get("max_change_per_attempt")
+                parts = []
+                if min_hb is not None:
+                    parts.append(f"hb>={min_hb}")
+                if min_ev is not None:
+                    parts.append(f"ev>={min_ev}")
+                if max_change is not None:
+                    parts.append(f"max_change<={max_change}")
+                if parts:
+                    requirement_txt = f" | req: {', '.join(parts)}"
+
+            sample_txt = ""
+            if evidence_samples:
+                samples = []
+                for sample in evidence_samples[:3]:
+                    if not isinstance(sample, dict):
+                        continue
+                    content_sample = (sample.get("content") or "").strip()
+                    if content_sample:
+                        samples.append(content_sample[:50])
+                if samples:
+                    sample_txt = f" | evidence: {'; '.join(samples)}"
+            label = content if content else subcategory
+            lines.append(
+                f"  - [{subcategory}] {label[:60]}{ref_txt}{evidence_txt}{requirement_txt}{sample_txt}"
+            )
         return "\n".join(lines) if lines else "  (none)"
 
     def _format_costs(self, costs: dict) -> str:

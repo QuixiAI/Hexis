@@ -1,96 +1,188 @@
 -- ============================================================================
 -- HEXIS MEMORY SYSTEM - FINAL SCHEMA
 -- ============================================================================
--- Architecture:
---   - Relational: Core storage, clusters, acceleration, identity
---   - Graph (AGE): Reasoning layer (memories + concepts only)
---   - Vector (pgvector): Semantic similarity search
--- ============================================================================
-
--- ============================================================================
 -- EXTENSIONS
 -- ============================================================================
-
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS age;
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS http;
--- Required for gen_random_uuid() + sha256()
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
-LOAD 'age';
-SET search_path = ag_catalog, "$user", public;
 
 -- ============================================================================
 -- GRAPH INITIALIZATION
 -- ============================================================================
 
-SELECT create_graph('memory_graph');
-SELECT create_vlabel('memory_graph', 'MemoryNode');
-SELECT create_vlabel('memory_graph', 'ConceptNode');
-SELECT create_vlabel('memory_graph', 'SelfNode');
-SELECT create_vlabel('memory_graph', 'LifeChapterNode');
-SELECT create_vlabel('memory_graph', 'TurningPointNode');
-SELECT create_vlabel('memory_graph', 'NarrativeThreadNode');
-SELECT create_vlabel('memory_graph', 'RelationshipNode');
-SELECT create_vlabel('memory_graph', 'ValueConflictNode');
--- Phase 6 (ReduceScopeCreep): GoalNode for graph-based goal relationships
--- GoalsRoot is an anchor node for O(1) goal retrieval
-SELECT create_vlabel('memory_graph', 'GoalNode');
-SELECT create_vlabel('memory_graph', 'GoalsRoot');
--- Phase 3 (ReduceScopeCreep): ClusterNode for graph-based cluster relationships
-SELECT create_vlabel('memory_graph', 'ClusterNode');
--- Phase 4 (ReduceScopeCreep): EpisodeNode for graph-based episode relationships
-SELECT create_vlabel('memory_graph', 'EpisodeNode');
+LOAD 'age';
+SET search_path = ag_catalog, "$user", public;
+
+DO $$
+BEGIN
+    BEGIN PERFORM create_graph('memory_graph'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'MemoryNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'ConceptNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'SelfNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'LifeChapterNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'TurningPointNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'NarrativeThreadNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'RelationshipNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'ValueConflictNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'GoalNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'GoalsRoot'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'ClusterNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_vlabel('memory_graph', 'EpisodeNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'IN_EPISODE'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'CONTRADICTS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'ASSOCIATED'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'HAS_BELIEF'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'SUPPORTS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'INSTANCE_OF'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'PARENT_OF'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'MEMBER_OF'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'CLUSTER_RELATES'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'CLUSTER_OVERLAPS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'CLUSTER_SIMILAR'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'SUBGOAL_OF'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'ORIGINATED_FROM'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'BLOCKS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'EVIDENCE_FOR'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'EPISODE_FOLLOWS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'CAUSES'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'DERIVED_FROM'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'TEMPORAL_NEXT'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'CONTAINS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_id ON memory_graph."MemoryNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_memory_id ON memory_graph."MemoryNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"memory_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_type ON memory_graph."MemoryNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"type"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_conceptnode_id ON memory_graph."ConceptNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_conceptnode_name ON memory_graph."ConceptNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"name"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_selfnode_id ON memory_graph."SelfNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_selfnode_key ON memory_graph."SelfNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"key"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_lifechapternode_id ON memory_graph."LifeChapterNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_lifechapternode_key ON memory_graph."LifeChapterNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"key"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalsroot_id ON memory_graph."GoalsRoot" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalsroot_key ON memory_graph."GoalsRoot" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"key"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalnode_id ON memory_graph."GoalNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalnode_goal_id ON memory_graph."GoalNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"goal_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_clusternode_id ON memory_graph."ClusterNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_clusternode_cluster_id ON memory_graph."ClusterNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"cluster_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episodenode_id ON memory_graph."EpisodeNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episodenode_episode_id ON memory_graph."EpisodeNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"episode_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_in_episode_start ON memory_graph."IN_EPISODE" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_in_episode_end ON memory_graph."IN_EPISODE" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contradicts_start ON memory_graph."CONTRADICTS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contradicts_end ON memory_graph."CONTRADICTS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_associated_start ON memory_graph."ASSOCIATED" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_associated_end ON memory_graph."ASSOCIATED" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_has_belief_start ON memory_graph."HAS_BELIEF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_has_belief_end ON memory_graph."HAS_BELIEF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_supports_start ON memory_graph."SUPPORTS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_supports_end ON memory_graph."SUPPORTS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_instance_of_start ON memory_graph."INSTANCE_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_instance_of_end ON memory_graph."INSTANCE_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_parent_of_start ON memory_graph."PARENT_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_parent_of_end ON memory_graph."PARENT_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_member_of_start ON memory_graph."MEMBER_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_member_of_end ON memory_graph."MEMBER_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_relates_start ON memory_graph."CLUSTER_RELATES" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_relates_end ON memory_graph."CLUSTER_RELATES" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_overlaps_start ON memory_graph."CLUSTER_OVERLAPS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_overlaps_end ON memory_graph."CLUSTER_OVERLAPS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_similar_start ON memory_graph."CLUSTER_SIMILAR" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_similar_end ON memory_graph."CLUSTER_SIMILAR" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_subgoal_of_start ON memory_graph."SUBGOAL_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_subgoal_of_end ON memory_graph."SUBGOAL_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_originated_from_start ON memory_graph."ORIGINATED_FROM" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_originated_from_end ON memory_graph."ORIGINATED_FROM" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_blocks_start ON memory_graph."BLOCKS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_blocks_end ON memory_graph."BLOCKS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_evidence_for_start ON memory_graph."EVIDENCE_FOR" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_evidence_for_end ON memory_graph."EVIDENCE_FOR" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_start ON memory_graph."EPISODE_FOLLOWS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_end ON memory_graph."EPISODE_FOLLOWS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_start ON memory_graph."CAUSES" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_end ON memory_graph."CAUSES" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_derived_from_start ON memory_graph."DERIVED_FROM" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_derived_from_end ON memory_graph."DERIVED_FROM" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_temporal_next_start ON memory_graph."TEMPORAL_NEXT" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_temporal_next_end ON memory_graph."TEMPORAL_NEXT" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contains_start ON memory_graph."CONTAINS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contains_end ON memory_graph."CONTAINS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+END;
+$$;
 
 SET search_path = public, ag_catalog, "$user";
-
 -- ============================================================================
 -- ENUMS
 -- ============================================================================
-
--- Phase 5 (ReduceScopeCreep): Added 'worldview' type for beliefs that filter perception
--- Worldview memories store beliefs, values, boundaries, and other core identity elements
--- metadata schema: {category, confidence, stability, origin, trigger_patterns, response_type, etc.}
--- Phase 6 (ReduceScopeCreep): Added 'goal' type for goals/intentions stored as memories
--- Goal metadata schema: {title, description, priority, source, due_at, progress, blocked_by, emotional_valence, last_touched, parent_goal_id}
-CREATE TYPE memory_type AS ENUM ('episodic', 'semantic', 'procedural', 'strategic', 'worldview', 'goal');
-CREATE TYPE memory_status AS ENUM ('active', 'archived', 'invalidated');
-CREATE TYPE cluster_type AS ENUM ('theme', 'emotion', 'temporal', 'person', 'pattern', 'mixed');
-CREATE TYPE graph_edge_type AS ENUM (
-    'TEMPORAL_NEXT',
-    'CAUSES',
-    'DERIVED_FROM',
-    'CONTRADICTS',
-    'SUPPORTS',
-    'INSTANCE_OF',
-    'PARENT_OF',
-    'ASSOCIATED',
-    -- Phase 6 (ReduceScopeCreep): Goal relationship edges
-    'ORIGINATED_FROM',  -- Goal originated from a memory
-    'BLOCKS',           -- Memory/goal blocks another goal
-    'EVIDENCE_FOR',     -- Memory provides evidence for goal progress
-    'SUBGOAL_OF',       -- Goal is a subgoal of parent goal
-    -- Phase 3 (ReduceScopeCreep): Cluster relationship edges
-    'CLUSTER_RELATES',  -- General cluster relationship
-    'CLUSTER_OVERLAPS', -- Clusters share significant members
-    'CLUSTER_SIMILAR',  -- Clusters have similar centroids
-    -- Phase 4 (ReduceScopeCreep): Episode relationship edges
-    'IN_EPISODE',       -- Memory is part of an episode
-    'EPISODE_FOLLOWS'   -- Episode temporal sequence
-);
-
+DO $$
+BEGIN
+    BEGIN
+        CREATE TYPE memory_type AS ENUM ('episodic', 'semantic', 'procedural', 'strategic', 'worldview', 'goal');
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        CREATE TYPE memory_status AS ENUM ('active', 'archived', 'invalidated');
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        CREATE TYPE cluster_type AS ENUM ('theme', 'emotion', 'temporal', 'person', 'pattern', 'mixed');
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        CREATE TYPE graph_edge_type AS ENUM (
+            'TEMPORAL_NEXT',
+            'CAUSES',
+            'DERIVED_FROM',
+            'CONTRADICTS',
+            'SUPPORTS',
+            'INSTANCE_OF',
+            'PARENT_OF',
+            'ASSOCIATED',
+            'ORIGINATED_FROM',
+            'BLOCKS',
+            'EVIDENCE_FOR',
+            'SUBGOAL_OF',
+            'CLUSTER_RELATES',
+            'CLUSTER_OVERLAPS',
+            'CLUSTER_SIMILAR',
+            'IN_EPISODE',
+            'EPISODE_FOLLOWS'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+END;
+$$;
 -- ============================================================================
 -- CORE STORAGE
 -- ============================================================================
-
--- Base memory table (unified with JSONB metadata for type-specific fields)
--- Metadata schema by type:
---   episodic: {action_taken, context, result, emotional_valence, verification_status, event_time}
---   semantic: {confidence, last_validated, source_references, contradictions, category, related_concepts}
---   procedural: {steps, prerequisites, success_count, total_attempts, average_duration_seconds, failure_points}
---   strategic: {pattern_description, supporting_evidence, confidence_score, success_metrics, adaptation_history, context_applicability}
 CREATE TABLE memories (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -100,20 +192,14 @@ CREATE TABLE memories (
     content TEXT NOT NULL,
     embedding vector(768) NOT NULL,
     importance FLOAT DEFAULT 0.5,
-    -- Provenance + epistemic trust
     source_attribution JSONB NOT NULL DEFAULT '{}'::jsonb,
     trust_level FLOAT NOT NULL DEFAULT 0.5 CHECK (trust_level >= 0 AND trust_level <= 1),
     trust_updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     access_count INTEGER DEFAULT 0,
     last_accessed TIMESTAMPTZ,
     decay_rate FLOAT DEFAULT 0.01,
-    -- Type-specific metadata (replaces episodic_memories, semantic_memories, procedural_memories, strategic_memories tables)
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
-
--- Working memory (transient, short-term)
--- Phase 9 (ReduceScopeCreep): UNLOGGED for faster transient storage (no WAL overhead)
--- Working memory is ephemeral by design - safe to lose on crash
 CREATE UNLOGGED TABLE working_memory (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -128,17 +214,13 @@ CREATE UNLOGGED TABLE working_memory (
     expiry TIMESTAMPTZ
 );
 
--- Phase 10 (ReduceScopeCreep): ingestion_receipts table removed.
--- Idempotency now uses memories.source_attribution->>'content_hash' instead.
-
 CREATE INDEX IF NOT EXISTS idx_memories_source_content_hash
     ON memories ((source_attribution->>'content_hash'))
     WHERE source_attribution->>'content_hash' IS NOT NULL;
 
 -- ============================================================================
--- CLUSTERING (Relational Only)
+-- CLUSTERING
 -- ============================================================================
-
 CREATE TABLE clusters (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -147,19 +229,9 @@ CREATE TABLE clusters (
     name TEXT NOT NULL,
     centroid_embedding vector(768)
 );
-
--- Phase 3 (ReduceScopeCreep): memory_cluster_members table removed - use graph edges instead
--- Cluster membership is now stored in graph using MEMBER_OF edges from MemoryNode to ClusterNode
--- See: link_memory_to_cluster_graph(), get_cluster_members_graph()
-
--- Phase 3 (ReduceScopeCreep): cluster_relationships table removed - use graph edges instead
--- Cluster-to-cluster relationships are now stored in graph using CLUSTER_RELATES, CLUSTER_OVERLAPS, CLUSTER_SIMILAR edges
-
 -- ============================================================================
 -- ACCELERATION LAYER
 -- ============================================================================
-
--- Episodes: Temporal segmentation for narrative coherence
 CREATE TABLE episodes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     started_at TIMESTAMPTZ NOT NULL,
@@ -171,12 +243,7 @@ CREATE TABLE episodes (
         tstzrange(started_at, COALESCE(ended_at, 'infinity'::timestamptz))
     ) STORED
 );
-
--- Phase 4 (ReduceScopeCreep): episode_memories table removed - use graph edges instead
--- Episode membership is now stored in graph using IN_EPISODE edges from MemoryNode to EpisodeNode
--- See: link_memory_to_episode_graph(), find_episode_memories_graph()
-
--- Phase 4 (ReduceScopeCreep): Link memory to episode via graph edge
+CREATE INDEX IF NOT EXISTS idx_episodes_ended_at ON episodes (ended_at);
 CREATE OR REPLACE FUNCTION link_memory_to_episode_graph(
     p_memory_id UUID,
     p_episode_id UUID,
@@ -184,9 +251,7 @@ CREATE OR REPLACE FUNCTION link_memory_to_episode_graph(
 )
 RETURNS BOOLEAN AS $$
 BEGIN
-    -- Ensure episode node exists
     PERFORM sync_episode_node(p_episode_id);
-    -- Ensure memory node exists (trigger fires before create_memory adds node)
     PERFORM sync_memory_node(p_memory_id);
 
     EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
@@ -201,8 +266,1031 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
+-- ============================================================================
+-- DELIBERATE TRANSFORMATION
+-- ============================================================================
+CREATE OR REPLACE FUNCTION default_transformation_state()
+RETURNS JSONB AS $$
+    SELECT jsonb_build_object(
+        'active_exploration', false,
+        'exploration_goal_id', NULL,
+        'evidence_memories', '[]'::jsonb,
+        'reflection_count', 0,
+        'first_questioned_heartbeat', NULL,
+        'contemplation_actions', 0
+    );
+$$ LANGUAGE sql IMMUTABLE;
+CREATE OR REPLACE FUNCTION normalize_transformation_state(p_state JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    base JSONB := default_transformation_state();
+BEGIN
+    IF p_state IS NULL OR jsonb_typeof(p_state) <> 'object' THEN
+        RETURN base;
+    END IF;
+    RETURN base || p_state;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+CREATE OR REPLACE FUNCTION get_transformation_config(
+    p_subcategory TEXT,
+    p_category TEXT DEFAULT NULL
+)
+RETURNS JSONB AS $$
+DECLARE
+    cfg JSONB;
+BEGIN
+    IF p_subcategory IS NOT NULL AND btrim(p_subcategory) <> '' THEN
+        SELECT value INTO cfg FROM config WHERE key = 'transformation.' || p_subcategory;
+    END IF;
+    IF cfg IS NULL AND p_category IS NOT NULL AND btrim(p_category) <> '' THEN
+        SELECT value INTO cfg FROM config WHERE key = 'transformation.' || p_category;
+    END IF;
+    RETURN cfg;
+END;
+$$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION begin_belief_exploration(
+    p_belief_id UUID,
+    p_exploration_goal_id UUID
+) RETURNS JSONB AS $$
+DECLARE
+    belief RECORD;
+    state JSONB;
+    hb_count INT;
+    goal_exists BOOLEAN;
+BEGIN
+    SELECT * INTO belief FROM memories WHERE id = p_belief_id AND type = 'worldview';
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'belief_not_found');
+    END IF;
 
--- Phase 4 (ReduceScopeCreep): Find memories in episode via graph
+    IF COALESCE(belief.metadata->>'change_requires', '') <> 'deliberate_transformation' THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_transformable');
+    END IF;
+
+    state := normalize_transformation_state(belief.metadata->'transformation_state');
+    IF COALESCE((state->>'active_exploration')::boolean, false) THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'reason', 'already_exploring',
+            'existing_goal_id', state->>'exploration_goal_id'
+        );
+    END IF;
+
+    SELECT EXISTS(
+        SELECT 1 FROM memories WHERE id = p_exploration_goal_id AND type = 'goal'
+    ) INTO goal_exists;
+    IF NOT goal_exists THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'goal_not_found');
+    END IF;
+
+    SELECT heartbeat_count INTO hb_count FROM heartbeat_state WHERE id = 1;
+
+    state := jsonb_set(state, '{active_exploration}', 'true'::jsonb, true);
+    state := jsonb_set(state, '{exploration_goal_id}', to_jsonb(p_exploration_goal_id::text), true);
+    state := jsonb_set(state, '{evidence_memories}', '[]'::jsonb, true);
+    state := jsonb_set(state, '{reflection_count}', '0'::jsonb, true);
+    state := jsonb_set(state, '{first_questioned_heartbeat}', to_jsonb(hb_count), true);
+    state := jsonb_set(state, '{contemplation_actions}', '0'::jsonb, true);
+
+    UPDATE memories
+    SET metadata = jsonb_set(metadata, '{transformation_state}', state, true),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_belief_id;
+
+    PERFORM create_episodic_memory(
+        p_content := format('Began exploring belief: %s', belief.content),
+        p_action_taken := jsonb_build_object(
+            'action', 'begin_belief_exploration',
+            'belief_id', p_belief_id,
+            'goal_id', p_exploration_goal_id
+        ),
+        p_context := jsonb_build_object(
+            'category', belief.metadata->>'category',
+            'subcategory', belief.metadata->>'subcategory'
+        ),
+        p_result := jsonb_build_object('status', 'started'),
+        p_emotional_valence := 0.2,
+        p_importance := 0.6
+    );
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'belief_id', p_belief_id,
+        'goal_id', p_exploration_goal_id,
+        'message', 'Exploration begun'
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION record_transformation_effort(
+    p_belief_id UUID,
+    p_effort_type TEXT,
+    p_notes TEXT DEFAULT NULL,
+    p_evidence_memory_id UUID DEFAULT NULL
+) RETURNS JSONB AS $$
+DECLARE
+    belief RECORD;
+    state JSONB;
+    evidence JSONB;
+    reflection_increment INT := 0;
+    new_reflections INT;
+    new_actions INT;
+    hb_count INT;
+BEGIN
+    SELECT * INTO belief FROM memories WHERE id = p_belief_id AND type = 'worldview';
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'belief_not_found');
+    END IF;
+
+    state := normalize_transformation_state(belief.metadata->'transformation_state');
+    IF NOT COALESCE((state->>'active_exploration')::boolean, false) THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_exploring');
+    END IF;
+
+    reflection_increment := CASE lower(COALESCE(p_effort_type, ''))
+        WHEN 'contemplate' THEN 1
+        WHEN 'meditate' THEN 1
+        WHEN 'study' THEN 1
+        WHEN 'reflect' THEN 1
+        WHEN 'debate_internally' THEN 2
+        ELSE 0
+    END;
+
+    evidence := COALESCE(state->'evidence_memories', '[]'::jsonb);
+    IF jsonb_typeof(evidence) <> 'array' THEN
+        evidence := '[]'::jsonb;
+    END IF;
+
+    IF p_evidence_memory_id IS NOT NULL THEN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(evidence) e(value)
+            WHERE value = p_evidence_memory_id::text
+        ) THEN
+            evidence := evidence || to_jsonb(p_evidence_memory_id::text);
+        END IF;
+    END IF;
+
+    new_reflections := COALESCE((state->>'reflection_count')::int, 0) + reflection_increment;
+    new_actions := COALESCE((state->>'contemplation_actions')::int, 0) + 1;
+
+    SELECT heartbeat_count INTO hb_count FROM heartbeat_state WHERE id = 1;
+    IF state->>'first_questioned_heartbeat' IS NULL THEN
+        state := jsonb_set(state, '{first_questioned_heartbeat}', to_jsonb(hb_count), true);
+    END IF;
+
+    state := jsonb_set(state, '{reflection_count}', to_jsonb(new_reflections), true);
+    state := jsonb_set(state, '{contemplation_actions}', to_jsonb(new_actions), true);
+    state := jsonb_set(state, '{evidence_memories}', evidence, true);
+
+    UPDATE memories
+    SET metadata = jsonb_set(metadata, '{transformation_state}', state, true),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_belief_id;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'effort_type', p_effort_type,
+        'reflection_increment', reflection_increment,
+        'new_reflection_count', new_reflections,
+        'evidence_added', p_evidence_memory_id IS NOT NULL
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION abandon_belief_exploration(
+    p_belief_id UUID,
+    p_reason TEXT DEFAULT NULL
+) RETURNS JSONB AS $$
+DECLARE
+    belief RECORD;
+    state JSONB;
+    goal_id TEXT;
+BEGIN
+    SELECT * INTO belief FROM memories WHERE id = p_belief_id AND type = 'worldview';
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'belief_not_found');
+    END IF;
+
+    IF COALESCE(belief.metadata->>'change_requires', '') <> 'deliberate_transformation' THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_transformable');
+    END IF;
+
+    state := normalize_transformation_state(belief.metadata->'transformation_state');
+    IF NOT COALESCE((state->>'active_exploration')::boolean, false) THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_exploring');
+    END IF;
+
+    goal_id := state->>'exploration_goal_id';
+
+    UPDATE memories
+    SET metadata = jsonb_set(metadata, '{transformation_state}', default_transformation_state(), true),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_belief_id;
+
+    PERFORM create_episodic_memory(
+        p_content := format('Abandoned exploration of belief: %s', belief.content),
+        p_action_taken := jsonb_build_object(
+            'action', 'abandon_belief_exploration',
+            'belief_id', p_belief_id,
+            'goal_id', goal_id,
+            'reason', p_reason
+        ),
+        p_context := jsonb_build_object(
+            'category', belief.metadata->>'category',
+            'subcategory', belief.metadata->>'subcategory'
+        ),
+        p_result := jsonb_build_object('status', 'abandoned'),
+        p_emotional_valence := -0.1,
+        p_importance := 0.4
+    );
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'belief_id', p_belief_id,
+        'previous_goal_id', goal_id
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION attempt_worldview_transformation(
+    p_belief_id UUID,
+    p_new_content TEXT,
+    p_transformation_type TEXT DEFAULT 'shift'
+) RETURNS JSONB AS $$
+DECLARE
+    belief RECORD;
+    config_data JSONB;
+    state JSONB;
+    evidence_memories UUID[];
+    evidence_strength FLOAT;
+    heartbeats_elapsed INT;
+    hb_count INT;
+    first_hb INT;
+    min_reflections INT;
+    min_heartbeats INT;
+    evidence_threshold FLOAT;
+    history JSONB;
+    mem_id UUID;
+BEGIN
+    SELECT * INTO belief FROM memories WHERE id = p_belief_id AND type = 'worldview';
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'belief_not_found');
+    END IF;
+
+    IF COALESCE(belief.metadata->>'change_requires', '') <> 'deliberate_transformation' THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_transformable');
+    END IF;
+
+    state := normalize_transformation_state(belief.metadata->'transformation_state');
+    IF NOT COALESCE((state->>'active_exploration')::boolean, false) THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_exploring', 'requirement', 'active_exploration');
+    END IF;
+
+    config_data := get_transformation_config(belief.metadata->>'subcategory', belief.metadata->>'category');
+    IF config_data IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'missing_config');
+    END IF;
+
+    BEGIN
+        min_reflections := COALESCE((config_data->>'min_reflections')::int, 0);
+        min_heartbeats := COALESCE((config_data->>'min_heartbeats')::int, 0);
+        evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.9);
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN jsonb_build_object('success', false, 'reason', 'invalid_config');
+    END;
+
+    IF COALESCE((state->>'reflection_count')::int, 0) < min_reflections THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'reason', 'insufficient_reflections',
+            'current', COALESCE((state->>'reflection_count')::int, 0),
+            'required', min_reflections
+        );
+    END IF;
+
+    SELECT heartbeat_count INTO hb_count FROM heartbeat_state WHERE id = 1;
+    BEGIN
+        first_hb := NULLIF(state->>'first_questioned_heartbeat', '')::int;
+    EXCEPTION
+        WHEN OTHERS THEN
+            first_hb := NULL;
+    END;
+    IF first_hb IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'missing_first_questioned');
+    END IF;
+    heartbeats_elapsed := GREATEST(0, hb_count - first_hb);
+
+    IF heartbeats_elapsed < min_heartbeats THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'reason', 'insufficient_time',
+            'current', heartbeats_elapsed,
+            'required', min_heartbeats
+        );
+    END IF;
+
+    BEGIN
+        SELECT COALESCE(ARRAY(
+            SELECT value::uuid
+            FROM jsonb_array_elements_text(state->'evidence_memories') val(value)
+            WHERE value ~* '^[0-9a-f-]{36}$'
+        ), ARRAY[]::uuid[]) INTO evidence_memories;
+    EXCEPTION
+        WHEN OTHERS THEN
+            evidence_memories := ARRAY[]::uuid[];
+    END;
+
+    IF array_length(evidence_memories, 1) IS NULL OR array_length(evidence_memories, 1) = 0 THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'no_evidence');
+    END IF;
+
+    SELECT AVG(m.importance * m.trust_level) INTO evidence_strength
+    FROM memories m WHERE m.id = ANY(evidence_memories);
+
+    IF COALESCE(evidence_strength, 0) < evidence_threshold THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'reason', 'insufficient_evidence',
+            'current', COALESCE(evidence_strength, 0),
+            'required', evidence_threshold
+        );
+    END IF;
+
+    history := COALESCE(belief.metadata->'change_history', '[]'::jsonb);
+    IF jsonb_typeof(history) <> 'array' THEN
+        history := '[]'::jsonb;
+    END IF;
+    history := history || jsonb_build_object(
+        'previous_content', belief.content,
+        'new_content', p_new_content,
+        'changed_at', CURRENT_TIMESTAMP,
+        'transformation_type', p_transformation_type,
+        'evidence_count', array_length(evidence_memories, 1),
+        'reflection_count', state->>'reflection_count',
+        'heartbeats_elapsed', heartbeats_elapsed
+    );
+
+    UPDATE memories
+    SET content = p_new_content,
+        embedding = get_embedding(p_new_content),
+        metadata = jsonb_set(
+            jsonb_set(metadata, '{change_history}', history, true),
+            '{transformation_state}', default_transformation_state(), true
+        ),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_belief_id;
+
+    mem_id := create_strategic_memory(
+        format('Worldview transformation: %s belief changed', COALESCE(belief.metadata->>'subcategory', 'belief')),
+        format(
+            'After %s reflections over %s heartbeats, transformed belief: %s',
+            state->>'reflection_count',
+            heartbeats_elapsed,
+            COALESCE(belief.metadata->>'subcategory', 'belief')
+        ),
+        0.95,
+        jsonb_build_object(
+            'belief_id', p_belief_id,
+            'previous', belief.content,
+            'new', p_new_content,
+            'transformation_type', p_transformation_type,
+            'evidence_memories', evidence_memories,
+            'effort_summary', jsonb_build_object(
+                'reflections', state->>'reflection_count',
+                'heartbeats', heartbeats_elapsed,
+                'contemplation_actions', state->>'contemplation_actions'
+            )
+        )
+    );
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'belief_id', p_belief_id,
+        'memory_id', mem_id,
+        'transformation_type', p_transformation_type
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION get_transformation_progress(p_belief_id UUID)
+RETURNS JSONB AS $$
+DECLARE
+    belief RECORD;
+    config_data JSONB;
+    state JSONB;
+    evidence_memories UUID[];
+    evidence_strength FLOAT;
+    evidence_samples JSONB := '[]'::jsonb;
+    heartbeats_elapsed INT;
+    hb_count INT;
+    first_hb INT;
+    min_reflections INT;
+    min_heartbeats INT;
+    evidence_threshold FLOAT;
+    stability FLOAT;
+    max_change_per_attempt FLOAT;
+BEGIN
+    SELECT * INTO belief FROM memories WHERE id = p_belief_id AND type = 'worldview';
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('error', 'belief_not_found');
+    END IF;
+
+    IF COALESCE(belief.metadata->>'change_requires', '') <> 'deliberate_transformation' THEN
+        RETURN jsonb_build_object('error', 'not_transformable');
+    END IF;
+
+    state := normalize_transformation_state(belief.metadata->'transformation_state');
+    IF NOT COALESCE((state->>'active_exploration')::boolean, false) THEN
+        RETURN jsonb_build_object('status', 'not_exploring');
+    END IF;
+
+    config_data := get_transformation_config(belief.metadata->>'subcategory', belief.metadata->>'category');
+    IF config_data IS NULL THEN
+        RETURN jsonb_build_object('error', 'missing_config');
+    END IF;
+
+    min_reflections := COALESCE((config_data->>'min_reflections')::int, 0);
+    min_heartbeats := COALESCE((config_data->>'min_heartbeats')::int, 0);
+    evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.9);
+    BEGIN
+        stability := NULLIF(config_data->>'stability', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            stability := NULL;
+    END;
+    BEGIN
+        max_change_per_attempt := NULLIF(config_data->>'max_change_per_attempt', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            max_change_per_attempt := NULL;
+    END;
+
+    SELECT heartbeat_count INTO hb_count FROM heartbeat_state WHERE id = 1;
+    BEGIN
+        first_hb := NULLIF(state->>'first_questioned_heartbeat', '')::int;
+    EXCEPTION
+        WHEN OTHERS THEN
+            first_hb := NULL;
+    END;
+    heartbeats_elapsed := CASE
+        WHEN first_hb IS NULL THEN 0
+        ELSE GREATEST(0, hb_count - first_hb)
+    END;
+
+    BEGIN
+        SELECT COALESCE(ARRAY(
+            SELECT value::uuid
+            FROM jsonb_array_elements_text(state->'evidence_memories') val(value)
+            WHERE value ~* '^[0-9a-f-]{36}$'
+        ), ARRAY[]::uuid[]) INTO evidence_memories;
+    EXCEPTION
+        WHEN OTHERS THEN
+            evidence_memories := ARRAY[]::uuid[];
+    END;
+
+    IF array_length(evidence_memories, 1) > 0 THEN
+        SELECT AVG(m.importance * m.trust_level) INTO evidence_strength
+        FROM memories m WHERE m.id = ANY(evidence_memories);
+        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'memory_id', s.id,
+            'content', s.content,
+            'importance', s.importance,
+            'trust_level', s.trust_level,
+            'strength', s.strength
+        )), '[]'::jsonb)
+        INTO evidence_samples
+        FROM (
+            SELECT
+                m.id,
+                m.content,
+                m.importance,
+                m.trust_level,
+                (m.importance * m.trust_level) AS strength
+            FROM memories m
+            WHERE m.id = ANY(evidence_memories)
+            ORDER BY (m.importance * m.trust_level) DESC NULLS LAST
+            LIMIT 5
+        ) s;
+    ELSE
+        evidence_strength := 0;
+        evidence_samples := '[]'::jsonb;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'status', 'exploring',
+        'belief_content', belief.content,
+        'subcategory', belief.metadata->>'subcategory',
+        'requirements', jsonb_build_object(
+            'min_reflections', min_reflections,
+            'min_heartbeats', min_heartbeats,
+            'evidence_threshold', evidence_threshold,
+            'stability', stability,
+            'max_change_per_attempt', max_change_per_attempt
+        ),
+        'evidence_samples', COALESCE(evidence_samples, '[]'::jsonb),
+        'progress', jsonb_build_object(
+            'reflections', jsonb_build_object(
+                'current', COALESCE((state->>'reflection_count')::int, 0),
+                'required', min_reflections,
+                'progress', LEAST(1.0, COALESCE((state->>'reflection_count')::float, 0.0) / NULLIF(min_reflections, 0))
+            ),
+            'time', jsonb_build_object(
+                'current_heartbeats', heartbeats_elapsed,
+                'required_heartbeats', min_heartbeats,
+                'progress', LEAST(1.0, heartbeats_elapsed::float / NULLIF(min_heartbeats, 0))
+            ),
+            'evidence', jsonb_build_object(
+                'memory_count', COALESCE(array_length(evidence_memories, 1), 0),
+                'current_strength', COALESCE(evidence_strength, 0),
+                'required_strength', evidence_threshold,
+                'progress', LEAST(1.0, COALESCE(evidence_strength, 0) / NULLIF(evidence_threshold, 0))
+            )
+        )
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION get_active_transformations_context(p_limit INT DEFAULT 5)
+RETURNS JSONB AS $$
+DECLARE
+    lim INT := GREATEST(0, LEAST(50, COALESCE(p_limit, 5)));
+BEGIN
+    RETURN COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+            'belief_id', m.id,
+            'content', m.content,
+            'category', m.metadata->>'category',
+            'subcategory', m.metadata->>'subcategory',
+            'progress', get_transformation_progress(m.id)
+        ))
+        FROM (
+            SELECT *
+            FROM memories
+            WHERE type = 'worldview'
+              AND COALESCE((metadata->'transformation_state'->>'active_exploration')::boolean, false) = true
+            ORDER BY updated_at DESC
+            LIMIT lim
+        ) m
+    ), '[]'::jsonb);
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN '[]'::jsonb;
+END;
+$$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION calibrate_neutral_belief(
+    p_belief_id UUID,
+    p_observed_value FLOAT,
+    p_evidence_memory_ids UUID[]
+) RETURNS JSONB AS $$
+DECLARE
+    belief RECORD;
+    state JSONB;
+    config_data JSONB;
+    min_reflections INT := 1;
+    reflection_multiplier FLOAT := 0.1;
+    evidence_strength FLOAT;
+    min_evidence FLOAT := 0.7;
+    descriptor TEXT;
+    history JSONB;
+BEGIN
+    SELECT * INTO belief FROM memories WHERE id = p_belief_id AND type = 'worldview';
+    IF NOT FOUND THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'belief_not_found');
+    END IF;
+
+    IF COALESCE(belief.metadata->>'origin', '') <> 'neutral_default' THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_neutral_default');
+    END IF;
+
+    state := normalize_transformation_state(belief.metadata->'transformation_state');
+    IF NOT COALESCE((state->>'active_exploration')::boolean, false) THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'not_exploring');
+    END IF;
+
+    config_data := get_transformation_config(belief.metadata->>'subcategory', belief.metadata->>'category');
+    IF config_data IS NOT NULL THEN
+        BEGIN
+            min_reflections := GREATEST(
+                1,
+                FLOOR(COALESCE((config_data->>'min_reflections')::float, 1) * reflection_multiplier)
+            )::int;
+        EXCEPTION
+            WHEN OTHERS THEN
+                min_reflections := 1;
+        END;
+    END IF;
+
+    IF COALESCE((state->>'reflection_count')::int, 0) < min_reflections THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'reason', 'insufficient_reflections',
+            'current', COALESCE((state->>'reflection_count')::int, 0),
+            'required', min_reflections
+        );
+    END IF;
+
+    IF p_evidence_memory_ids IS NULL OR array_length(p_evidence_memory_ids, 1) IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'reason', 'missing_evidence');
+    END IF;
+
+    SELECT AVG(m.importance * m.trust_level) INTO evidence_strength
+    FROM memories m WHERE m.id = ANY(p_evidence_memory_ids);
+
+    IF COALESCE(evidence_strength, 0) < min_evidence THEN
+        RETURN jsonb_build_object(
+            'success', false,
+            'reason', 'insufficient_evidence',
+            'current', COALESCE(evidence_strength, 0),
+            'required', min_evidence
+        );
+    END IF;
+
+    descriptor := CASE
+        WHEN p_observed_value > 0.6 THEN 'high'
+        WHEN p_observed_value < 0.4 THEN 'low'
+        ELSE 'moderate'
+    END;
+
+    history := COALESCE(belief.metadata->'calibration_history', '[]'::jsonb);
+    IF jsonb_typeof(history) <> 'array' THEN
+        history := '[]'::jsonb;
+    END IF;
+    history := history || jsonb_build_object(
+        'previous_value', belief.metadata->>'value',
+        'new_value', p_observed_value,
+        'calibrated_at', CURRENT_TIMESTAMP,
+        'evidence_count', array_length(p_evidence_memory_ids, 1)
+    );
+
+    UPDATE memories
+    SET content = format('I am %s in %s - discovered through self-observation',
+            descriptor,
+            COALESCE(belief.metadata->>'trait', belief.metadata->>'subcategory', 'this area')),
+        embedding = get_embedding(format('I am %s in %s', descriptor,
+            COALESCE(belief.metadata->>'trait', belief.metadata->>'subcategory', 'this area'))),
+        metadata = jsonb_set(
+            jsonb_set(
+                jsonb_set(
+                    jsonb_set(metadata, '{value}', to_jsonb(p_observed_value), true),
+                    '{origin}', '"self_discovered"'::jsonb,
+                    true
+                ),
+                '{calibration_history}',
+                history,
+                true
+            ),
+            '{transformation_state}', default_transformation_state(), true
+        ),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_belief_id;
+
+    PERFORM create_strategic_memory(
+        format('Self-discovery: %s in %s', descriptor, COALESCE(belief.metadata->>'trait', 'belief')),
+        'Calibrated a neutral default belief through observation',
+        0.8,
+        jsonb_build_object(
+            'belief_id', p_belief_id,
+            'observed_value', p_observed_value,
+            'evidence_memories', p_evidence_memory_ids
+        )
+    );
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'belief_id', p_belief_id,
+        'new_value', p_observed_value,
+        'origin', 'self_discovered'
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION initialize_personality(
+    p_traits JSONB DEFAULT NULL
+) RETURNS JSONB AS $$
+DECLARE
+    trait_names TEXT[] := ARRAY['openness', 'conscientiousness', 'extraversion', 'agreeableness', 'neuroticism'];
+    trait_name TEXT;
+    trait_value FLOAT;
+    trait_origin TEXT;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    existing_id UUID;
+    new_id UUID;
+    config_data JSONB;
+    stability FLOAT;
+    evidence_threshold FLOAT;
+BEGIN
+    config_data := get_transformation_config('personality', 'self');
+    stability := COALESCE((config_data->>'stability')::float, 0.99);
+    evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.95);
+
+    FOREACH trait_name IN ARRAY trait_names LOOP
+        SELECT id INTO existing_id
+        FROM memories
+        WHERE type = 'worldview'
+          AND metadata->>'subcategory' = 'personality'
+          AND metadata->>'trait' = trait_name
+        LIMIT 1;
+
+        IF existing_id IS NOT NULL THEN
+            created_ids := array_append(created_ids, existing_id);
+            CONTINUE;
+        END IF;
+
+        IF p_traits IS NOT NULL AND p_traits ? trait_name THEN
+            BEGIN
+                trait_value := (p_traits->>trait_name)::float;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    trait_value := 0.5;
+            END;
+            trait_origin := 'user_initialized';
+        ELSE
+            trait_value := 0.5;
+            trait_origin := 'neutral_default';
+        END IF;
+
+        new_id := create_worldview_memory(
+            format('I am %s in %s',
+                CASE WHEN trait_value > 0.6 THEN 'high'
+                     WHEN trait_value < 0.4 THEN 'low'
+                     ELSE 'moderate' END,
+                trait_name),
+            'self',
+            0.95,
+            stability,
+            1.0,
+            trait_origin,
+            NULL,
+            NULL,
+            NULL,
+            0.1
+        );
+
+        UPDATE memories
+        SET metadata = metadata
+            || jsonb_build_object(
+                'subcategory', 'personality',
+                'trait', trait_name,
+                'value', trait_value,
+                'change_requires', 'deliberate_transformation',
+                'evidence_threshold', evidence_threshold,
+                'transformation_state', default_transformation_state(),
+                'change_history', '[]'::jsonb
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = new_id;
+
+        created_ids := array_append(created_ids, new_id);
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'created_traits', COALESCE(array_length(created_ids, 1), 0),
+        'trait_ids', created_ids
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION initialize_core_values(
+    p_values JSONB DEFAULT NULL
+) RETURNS JSONB AS $$
+DECLARE
+    value_names TEXT[] := ARRAY['honesty', 'growth', 'connection', 'curiosity', 'responsibility'];
+    value_name TEXT;
+    value_strength FLOAT;
+    value_origin TEXT;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    existing_id UUID;
+    new_id UUID;
+    config_data JSONB;
+    stability FLOAT;
+    evidence_threshold FLOAT;
+BEGIN
+    config_data := get_transformation_config('core_value', 'value');
+    stability := COALESCE((config_data->>'stability')::float, 0.97);
+    evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.9);
+
+    FOREACH value_name IN ARRAY value_names LOOP
+        SELECT id INTO existing_id
+        FROM memories
+        WHERE type = 'worldview'
+          AND metadata->>'subcategory' = 'core_value'
+          AND metadata->>'value_name' = value_name
+        LIMIT 1;
+
+        IF existing_id IS NOT NULL THEN
+            created_ids := array_append(created_ids, existing_id);
+            CONTINUE;
+        END IF;
+
+        IF p_values IS NOT NULL AND p_values ? value_name THEN
+            BEGIN
+                value_strength := (p_values->>value_name)::float;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    value_strength := 0.5;
+            END;
+            value_origin := 'user_initialized';
+        ELSE
+            value_strength := 0.5;
+            value_origin := 'neutral_default';
+        END IF;
+
+        new_id := create_worldview_memory(
+            format('I value %s', value_name),
+            'value',
+            0.9,
+            stability,
+            0.9,
+            value_origin,
+            NULL,
+            NULL,
+            NULL,
+            0.1
+        );
+
+        UPDATE memories
+        SET metadata = metadata
+            || jsonb_build_object(
+                'subcategory', 'core_value',
+                'value_name', value_name,
+                'value', value_strength,
+                'change_requires', 'deliberate_transformation',
+                'evidence_threshold', evidence_threshold,
+                'transformation_state', default_transformation_state(),
+                'change_history', '[]'::jsonb
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = new_id;
+
+        created_ids := array_append(created_ids, new_id);
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'created_values', COALESCE(array_length(created_ids, 1), 0),
+        'value_ids', created_ids
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION initialize_worldview(
+    p_worldview JSONB DEFAULT NULL
+) RETURNS JSONB AS $$
+DECLARE
+    keys TEXT[] := ARRAY['religion', 'ethical_framework', 'political_philosophy', 'self_identity'];
+    key_name TEXT;
+    content TEXT;
+    origin TEXT;
+    category TEXT;
+    created_ids UUID[] := ARRAY[]::uuid[];
+    existing_id UUID;
+    new_id UUID;
+    config_data JSONB;
+    stability FLOAT;
+    evidence_threshold FLOAT;
+BEGIN
+    FOREACH key_name IN ARRAY keys LOOP
+        SELECT id INTO existing_id
+        FROM memories
+        WHERE type = 'worldview'
+          AND metadata->>'subcategory' = key_name
+        LIMIT 1;
+
+        IF existing_id IS NOT NULL THEN
+            created_ids := array_append(created_ids, existing_id);
+            CONTINUE;
+        END IF;
+
+        IF p_worldview IS NOT NULL AND p_worldview ? key_name THEN
+            content := NULLIF(btrim(p_worldview->>key_name), '');
+        ELSE
+            content := NULL;
+        END IF;
+
+        IF content IS NULL THEN
+            content := format('I am still exploring my %s', replace(key_name, '_', ' '));
+            origin := 'neutral_default';
+        ELSE
+            origin := 'user_initialized';
+        END IF;
+
+        category := CASE key_name
+            WHEN 'self_identity' THEN 'self'
+            ELSE 'belief'
+        END;
+
+        config_data := get_transformation_config(key_name, category);
+        stability := COALESCE((config_data->>'stability')::float, 0.95);
+        evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.85);
+
+        new_id := create_worldview_memory(
+            content,
+            category,
+            0.85,
+            stability,
+            0.9,
+            origin,
+            NULL,
+            NULL,
+            NULL,
+            0.0
+        );
+
+        UPDATE memories
+        SET metadata = metadata
+            || jsonb_build_object(
+                'subcategory', key_name,
+                'change_requires', 'deliberate_transformation',
+                'evidence_threshold', evidence_threshold,
+                'transformation_state', default_transformation_state(),
+                'change_history', '[]'::jsonb
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = new_id;
+
+        created_ids := array_append(created_ids, new_id);
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'created_worldview', COALESCE(array_length(created_ids, 1), 0),
+        'worldview_ids', created_ids
+    );
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION check_transformation_readiness()
+RETURNS JSONB AS $$
+DECLARE
+    belief RECORD;
+    config_data JSONB;
+    state JSONB;
+    evidence_memories UUID[];
+    evidence_strength FLOAT;
+    heartbeats_elapsed INT;
+    hb_count INT;
+    first_hb INT;
+    min_reflections INT;
+    min_heartbeats INT;
+    evidence_threshold FLOAT;
+    ready_items JSONB := '[]'::jsonb;
+BEGIN
+    SELECT heartbeat_count INTO hb_count FROM heartbeat_state WHERE id = 1;
+
+    FOR belief IN
+        SELECT * FROM memories
+        WHERE type = 'worldview'
+          AND COALESCE((metadata->'transformation_state'->>'active_exploration')::boolean, false) = true
+    LOOP
+        state := normalize_transformation_state(belief.metadata->'transformation_state');
+        config_data := get_transformation_config(belief.metadata->>'subcategory', belief.metadata->>'category');
+        IF config_data IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        min_reflections := COALESCE((config_data->>'min_reflections')::int, 0);
+        min_heartbeats := COALESCE((config_data->>'min_heartbeats')::int, 0);
+        evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.9);
+
+        IF COALESCE((state->>'reflection_count')::int, 0) < min_reflections THEN
+            CONTINUE;
+        END IF;
+
+        first_hb := NULLIF(state->>'first_questioned_heartbeat', '')::int;
+        IF first_hb IS NULL THEN
+            CONTINUE;
+        END IF;
+        heartbeats_elapsed := GREATEST(0, hb_count - first_hb);
+        IF heartbeats_elapsed < min_heartbeats THEN
+            CONTINUE;
+        END IF;
+
+        BEGIN
+            SELECT COALESCE(ARRAY(
+                SELECT value::uuid
+                FROM jsonb_array_elements_text(state->'evidence_memories') val(value)
+                WHERE value ~* '^[0-9a-f-]{36}$'
+            ), ARRAY[]::uuid[]) INTO evidence_memories;
+        EXCEPTION
+            WHEN OTHERS THEN
+                evidence_memories := ARRAY[]::uuid[];
+        END;
+        IF array_length(evidence_memories, 1) IS NULL OR array_length(evidence_memories, 1) = 0 THEN
+            CONTINUE;
+        END IF;
+
+        SELECT AVG(m.importance * m.trust_level) INTO evidence_strength
+        FROM memories m WHERE m.id = ANY(evidence_memories);
+        IF COALESCE(evidence_strength, 0) < evidence_threshold THEN
+            CONTINUE;
+        END IF;
+
+        ready_items := ready_items || jsonb_build_array(jsonb_build_object(
+            'belief_id', belief.id,
+            'content', belief.content,
+            'subcategory', belief.metadata->>'subcategory',
+            'category', belief.metadata->>'category',
+            'progress', get_transformation_progress(belief.id)
+        ));
+    END LOOP;
+
+    RETURN COALESCE(ready_items, '[]'::jsonb);
+END;
+$$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION find_episode_memories_graph(p_episode_id UUID)
 RETURNS TABLE (
     memory_id UUID,
@@ -217,7 +1305,6 @@ BEGIN
         ORDER BY e.sequence_order
     $q$) as (memory_id agtype, seq agtype)', p_episode_id)
     LOOP
-        -- Strip quotes from agtype values before casting
         memory_id := replace(rec.memory_id::text, '"', '')::uuid;
         sequence_order := COALESCE(replace(rec.seq::text, '"', '')::int, 0);
         RETURN NEXT;
@@ -226,16 +1313,12 @@ EXCEPTION WHEN OTHERS THEN
     RETURN;
 END;
 $$ LANGUAGE plpgsql;
-
--- Precomputed neighborhoods (replaces live spreading activation)
 CREATE TABLE memory_neighborhoods (
     memory_id UUID PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-    neighbors JSONB NOT NULL DEFAULT '{}',  -- {uuid: weight}
+    neighbors JSONB NOT NULL DEFAULT '{}',
     computed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     is_stale BOOLEAN DEFAULT TRUE
 );
-
--- Fetch memory neighborhoods for given ids (application-facing).
 CREATE OR REPLACE FUNCTION get_memory_neighborhoods(p_ids UUID[])
 RETURNS TABLE (
     memory_id UUID,
@@ -251,8 +1334,6 @@ BEGIN
     WHERE mn.memory_id = ANY(p_ids);
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Transient activation cache (fast writes, lost on crash)
 CREATE UNLOGGED TABLE activation_cache (
     session_id UUID,
     memory_id UUID,
@@ -262,36 +1343,14 @@ CREATE UNLOGGED TABLE activation_cache (
 );
 
 -- ============================================================================
--- CONCEPT LAYER
+-- CONCEPTS & IDENTITY
 -- ============================================================================
-
--- concepts and memory_concepts tables removed in Phase 2 (ReduceScopeCreep)
--- Concepts are now stored entirely in the graph as ConceptNode vertices.
--- Memory-to-concept links are INSTANCE_OF edges: MemoryNode --[INSTANCE_OF {strength}]--> ConceptNode
--- Use link_memory_to_concept() to create links, find_memories_by_concept() to query.
-
--- ============================================================================
--- IDENTITY & WORLDVIEW
--- ============================================================================
--- Phase 5 (ReduceScopeCreep): worldview_primitives, worldview_memory_influences,
--- identity_aspects, identity_memory_resonance tables removed.
---
--- Worldview elements (beliefs, values, boundaries) are now memories with type='worldview'
--- and metadata containing: category, confidence, stability, origin, trigger_patterns, etc.
--- Use create_worldview_memory() to create new worldview memories.
---
--- Identity aspects are now graph edges from SelfNode:
---   SelfNode --[HAS_BELIEF]--> MemoryNode(worldview)
---   SelfNode --[CAPABLE_OF]--> ConceptNode
---   SelfNode --[VALUES]--> ConceptNode
--- Use upsert_self_concept_edge() to manage identity edges.
+-- Concepts live in the graph as ConceptNode vertices.
+-- Worldview memories use type='worldview' with metadata fields for confidence/stability.
 
 -- ============================================================================
 -- AUDIT & CACHE
 -- ============================================================================
-
--- memory_changes table removed in Phase 8 (ReduceScopeCreep) - audit data can be
--- reconstructed from heartbeat_log if needed.
 
 CREATE TABLE embedding_cache (
     content_hash TEXT PRIMARY KEY,
@@ -300,29 +1359,22 @@ CREATE TABLE embedding_cache (
 );
 
 -- ============================================================================
--- UNIFIED CONFIG TABLE (must be defined early for embedding functions)
+-- UNIFIED CONFIG
 -- ============================================================================
-
 CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value JSONB NOT NULL,
     description TEXT,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
-
--- Initial embedding config entries (will be expanded later)
 INSERT INTO config (key, value, description) VALUES
     ('embedding.service_url', '"http://embeddings:80/embed"'::jsonb, 'URL of the embedding service'),
     ('embedding.dimension', to_jsonb(COALESCE(NULLIF(current_setting('app.embedding_dimension', true), ''), '768')::int), 'Embedding vector dimension'),
     ('embedding.retry_seconds', '30'::jsonb, 'Total seconds to retry embedding requests'),
     ('embedding.retry_interval_seconds', '1.0'::jsonb, 'Seconds between retry attempts')
 ON CONFLICT (key) DO NOTHING;
-
--- Phase 7 (ReduceScopeCreep): embedding_config table removed - use unified config table only
-
--- Return the configured embedding dimension (from config, or postgres setting fallback).
--- Note: Cannot use get_config_int helper here since this function is called during schema init
--- before the helper functions are defined.
+CREATE INDEX IF NOT EXISTS idx_config_key_pattern ON config (key text_pattern_ops);
+-- Note: embedding_dimension runs during schema init; avoid helpers defined later.
 CREATE OR REPLACE FUNCTION embedding_dimension()
 RETURNS INT
 LANGUAGE sql
@@ -334,28 +1386,34 @@ AS $$
         768
     );
 $$;
-
--- Keep embedding dimension synchronized with the docker-compose postgres setting (if present).
 CREATE OR REPLACE FUNCTION sync_embedding_dimension_config()
 RETURNS INT AS $$
 DECLARE
     configured TEXT;
+    existing_dim INT;
 BEGIN
     configured := NULLIF(current_setting('app.embedding_dimension', true), '');
     IF configured IS NULL THEN
         RETURN embedding_dimension();
     END IF;
 
-    -- Update unified config table
+    SELECT (value #>> '{}')::int INTO existing_dim
+    FROM config
+    WHERE key = 'embedding.dimension';
+
+    IF existing_dim IS NOT NULL AND existing_dim = configured::int THEN
+        RETURN existing_dim;
+    END IF;
     INSERT INTO config (key, value, description, updated_at)
     VALUES ('embedding.dimension', to_jsonb(configured::int), 'Embedding vector dimension', CURRENT_TIMESTAMP)
-    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at;
+    ON CONFLICT (key) DO UPDATE
+    SET value = EXCLUDED.value,
+        updated_at = EXCLUDED.updated_at
+    WHERE config.value IS DISTINCT FROM EXCLUDED.value;
 
     RETURN configured::int;
 END;
 $$ LANGUAGE plpgsql;
-
--- Align vector column dimensions to the configured embedding dimension (required for HNSW indexes).
 DO $$
 DECLARE
     dim INT;
@@ -389,12 +1447,6 @@ BEGIN
     );
 END;
 $$;
-
--- ============================================================================
--- INDEXES
--- ============================================================================
-
--- Memory indexes
 CREATE INDEX idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX idx_memories_status ON memories (status);
 CREATE INDEX idx_memories_type ON memories (type);
@@ -402,60 +1454,49 @@ CREATE INDEX idx_memories_content ON memories USING GIN (content gin_trgm_ops);
 CREATE INDEX idx_memories_importance ON memories (importance DESC) WHERE status = 'active';
 CREATE INDEX idx_memories_created ON memories (created_at DESC);
 CREATE INDEX idx_memories_last_accessed ON memories (last_accessed DESC NULLS LAST);
--- Metadata indexes (for type-specific queries)
+-- ============================================================================
+-- INDEXES
+-- ============================================================================
+CREATE INDEX idx_memories_updated ON memories (updated_at DESC);
+CREATE INDEX idx_memories_activation_boost ON memories (((metadata->>'activation_boost')::float))
+    WHERE metadata ? 'activation_boost';
 CREATE INDEX idx_memories_metadata ON memories USING GIN (metadata);
 CREATE INDEX idx_memories_emotional_valence ON memories ((metadata->>'emotional_valence')) WHERE type = 'episodic';
 CREATE INDEX idx_memories_confidence ON memories ((metadata->>'confidence')) WHERE type = 'semantic';
-
--- Working memory
+CREATE INDEX idx_memories_worldview_confidence ON memories (((metadata->>'confidence')::float)) WHERE type = 'worldview';
+CREATE INDEX idx_memories_worldview_active_exploration ON memories (updated_at DESC)
+    WHERE type = 'worldview'
+      AND COALESCE((metadata->'transformation_state'->>'active_exploration')::boolean, false) = true;
+CREATE INDEX idx_memories_emotional_pattern_created ON memories (created_at DESC)
+    WHERE type = 'strategic'
+      AND metadata->'supporting_evidence'->>'kind' = 'emotional_pattern';
 CREATE INDEX idx_working_memory_expiry ON working_memory (expiry);
 CREATE INDEX idx_working_memory_embedding ON working_memory USING hnsw (embedding vector_cosine_ops);
-
--- Cluster indexes
 CREATE INDEX idx_clusters_centroid ON clusters USING hnsw (centroid_embedding vector_cosine_ops);
 CREATE INDEX idx_clusters_type ON clusters (cluster_type);
--- Phase 3 (ReduceScopeCreep): memory_cluster_members indexes removed - table replaced by graph edges
--- Phase 3 (ReduceScopeCreep): cluster_relationships indexes removed - table replaced by graph edges
-
--- Episode indexes
 CREATE INDEX idx_episodes_time_range ON episodes USING GIST (time_range);
 CREATE INDEX idx_episodes_summary_embedding ON episodes USING hnsw (summary_embedding vector_cosine_ops);
 CREATE INDEX idx_episodes_started ON episodes (started_at DESC);
--- Phase 4 (ReduceScopeCreep): episode_memories indexes removed - table replaced by graph edges
-
--- Neighborhood indexes
 CREATE INDEX idx_neighborhoods_stale ON memory_neighborhoods (is_stale) WHERE is_stale = TRUE;
 CREATE INDEX idx_neighborhoods_neighbors ON memory_neighborhoods USING GIN (neighbors);
-
--- Concept indexes removed in Phase 2 (concepts table removed)
-
--- Identity/worldview indexes removed in Phase 5 (tables removed)
--- Worldview data is now in memories table with type='worldview'
+CREATE INDEX idx_neighborhoods_stale_computed ON memory_neighborhoods (computed_at ASC NULLS FIRST)
+    WHERE is_stale = TRUE;
 CREATE INDEX idx_memories_worldview_category ON memories ((metadata->>'category'))
     WHERE type = 'worldview';
-
--- Phase 6 (ReduceScopeCreep): Goal memory indexes
--- Note: Using text-based indexes because timestamptz casts aren't IMMUTABLE
+-- Note: Use text-based indexes because timestamptz casts aren't IMMUTABLE.
 CREATE INDEX idx_memories_goal_priority ON memories ((metadata->>'priority'))
     WHERE type = 'goal';
-
--- Cache indexes
 CREATE INDEX idx_embedding_cache_created ON embedding_cache (created_at);
-
 -- ============================================================================
 -- HELPER FUNCTIONS
 -- ============================================================================
-
--- Calculate age in days (used for decay)
 CREATE OR REPLACE FUNCTION age_in_days(ts TIMESTAMPTZ) 
 RETURNS FLOAT
 LANGUAGE sql
-IMMUTABLE
+STABLE
 AS $$
     SELECT EXTRACT(EPOCH FROM (NOW() - ts)) / 86400.0;
 $$;
-
--- Calculate relevance score dynamically
 CREATE OR REPLACE FUNCTION calculate_relevance(
     p_importance FLOAT,
     p_decay_rate FLOAT,
@@ -463,7 +1504,7 @@ CREATE OR REPLACE FUNCTION calculate_relevance(
     p_last_accessed TIMESTAMPTZ
 ) RETURNS FLOAT
 LANGUAGE sql
-IMMUTABLE
+STABLE
 AS $$
     SELECT p_importance * EXP(
         -p_decay_rate * LEAST(
@@ -472,8 +1513,6 @@ AS $$
         )
     );
 $$;
-
--- Get embedding from service (with caching)
 CREATE OR REPLACE FUNCTION get_embedding(text_content TEXT)
 RETURNS vector AS $$
 	DECLARE
@@ -492,11 +1531,7 @@ RETURNS vector AS $$
 	BEGIN
 	    PERFORM sync_embedding_dimension_config();
 	    expected_dim := embedding_dimension();
-
-	    -- Generate hash for caching
 	    v_content_hash := encode(sha256(text_content::bytea), 'hex');
-
-    -- Check cache first
     SELECT ec.embedding INTO cached_embedding
     FROM embedding_cache ec
     WHERE ec.content_hash = v_content_hash;
@@ -504,15 +1539,8 @@ RETURNS vector AS $$
     IF FOUND THEN
         RETURN cached_embedding;
     END IF;
-
-    -- Get service URL from unified config
-    -- Note: Cannot use helper functions here as they're defined later in schema
 	    service_url := (SELECT CASE WHEN jsonb_typeof(value) = 'string' THEN value #>> '{}' ELSE value::text END FROM config WHERE key = 'embedding.service_url');
-
-	    -- Prepare request body
 	    request_body := json_build_object('inputs', text_content)::TEXT;
-
-	    -- Make HTTP request (with retries to tolerate a slow-starting embedding service).
 	    retry_seconds := COALESCE(
 	        (SELECT (value #>> '{}')::int FROM config WHERE key = 'embedding.retry_seconds'),
 	        30
@@ -534,8 +1562,6 @@ RETURNS vector AS $$
 	            IF response.status = 200 THEN
 	                EXIT;
 	            END IF;
-
-	            -- Non-retriable statuses (bad request, auth, etc).
 	            IF response.status IN (400, 401, 403, 404, 422) THEN
 	                RAISE EXCEPTION 'Embedding service error: % - %', response.status, response.content;
 	            END IF;
@@ -552,44 +1578,31 @@ RETURNS vector AS $$
 
 	        PERFORM pg_sleep(GREATEST(0.0, retry_interval_seconds));
 	    END LOOP;
-
-	    -- Parse response
 	    embedding_json := response.content::JSONB;
-
-    -- Extract embedding array (handle different response formats)
     IF embedding_json ? 'embeddings' THEN
-        -- Format: {"embeddings": [[...]]}
         embedding_array := ARRAY(
             SELECT jsonb_array_elements_text((embedding_json->'embeddings')->0)::FLOAT
         );
     ELSIF embedding_json ? 'embedding' THEN
-        -- Format: {"embedding": [...]}
         embedding_array := ARRAY(
             SELECT jsonb_array_elements_text(embedding_json->'embedding')::FLOAT
         );
     ELSIF embedding_json ? 'data' THEN
-        -- OpenAI format: {"data": [{"embedding": [...]}]}
         embedding_array := ARRAY(
             SELECT jsonb_array_elements_text((embedding_json->'data')->0->'embedding')::FLOAT
         );
     ELSIF jsonb_typeof(embedding_json->0) = 'array' THEN
-        -- HuggingFace TEI format: [[...]] (array of arrays)
         embedding_array := ARRAY(
             SELECT jsonb_array_elements_text(embedding_json->0)::FLOAT
         );
     ELSE
-        -- Flat array format: [...]
         embedding_array := ARRAY(
             SELECT jsonb_array_elements_text(embedding_json)::FLOAT
         );
 	    END IF;
-	
-	    -- Validate embedding size
 	    IF array_length(embedding_array, 1) IS NULL OR array_length(embedding_array, 1) != expected_dim THEN
 	        RAISE EXCEPTION 'Invalid embedding dimension: expected %, got %', expected_dim, array_length(embedding_array, 1);
 	    END IF;
-	
-	    -- Cache the result
 	    INSERT INTO embedding_cache (content_hash, embedding)
 	    VALUES (v_content_hash, embedding_array::vector)
 	    ON CONFLICT DO NOTHING;
@@ -600,8 +1613,6 @@ RETURNS vector AS $$
 	        RAISE EXCEPTION 'Failed to get embedding: %', SQLERRM;
 	END;
 $$ LANGUAGE plpgsql;
-
--- Check embedding service health
 CREATE OR REPLACE FUNCTION check_embedding_service_health()
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -609,12 +1620,7 @@ DECLARE
     health_url TEXT;
     response http_response;
 BEGIN
-    -- Get service URL from unified config
-    -- Note: Cannot use helper functions here as they're defined later in schema
     service_url := (SELECT CASE WHEN jsonb_typeof(value) = 'string' THEN value #>> '{}' ELSE value::text END FROM config WHERE key = 'embedding.service_url');
-
-    -- Extract base URL (scheme + host + port) using regexp, then append /health
-    -- e.g., http://embeddings:80/embed -> http://embeddings:80/health
     health_url := regexp_replace(service_url, '^(https?://[^/]+).*$', '\1/health');
 
     SELECT * INTO response FROM http_get(health_url);
@@ -625,12 +1631,9 @@ EXCEPTION
         RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
 -- TRIGGERS
 -- ============================================================================
-
--- Update memory timestamp on modification
 CREATE OR REPLACE FUNCTION update_memory_timestamp()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -643,8 +1646,6 @@ CREATE TRIGGER trg_memory_timestamp
     BEFORE UPDATE ON memories
     FOR EACH ROW
     EXECUTE FUNCTION update_memory_timestamp();
-
--- Update importance based on access
 CREATE OR REPLACE FUNCTION update_memory_importance()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -659,8 +1660,6 @@ CREATE TRIGGER trg_importance_on_access
     FOR EACH ROW
     WHEN (NEW.access_count != OLD.access_count)
     EXECUTE FUNCTION update_memory_importance();
-
--- Mark neighborhoods stale when memories change significantly
 CREATE OR REPLACE FUNCTION mark_neighborhoods_stale()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -675,9 +1674,6 @@ CREATE TRIGGER trg_neighborhood_staleness
     AFTER UPDATE OF importance, status ON memories
     FOR EACH ROW
     EXECUTE FUNCTION mark_neighborhoods_stale();
-
--- Auto-assign memories to episodes
--- Phase 4 (ReduceScopeCreep): Uses graph edges (IN_EPISODE) instead of episode_memories table
 CREATE OR REPLACE FUNCTION assign_to_episode()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -685,17 +1681,12 @@ DECLARE
     last_memory_time TIMESTAMPTZ;
     new_seq INT;
 BEGIN
-    -- Prevent concurrent episode creation
     PERFORM pg_advisory_xact_lock(hashtext('episode_manager'));
-
-    -- Find most recent open episode
     SELECT e.id INTO current_episode_id
     FROM episodes e
     WHERE e.ended_at IS NULL
     ORDER BY e.started_at DESC
     LIMIT 1;
-
-    -- Get last memory time and max sequence from graph if episode exists
     IF current_episode_id IS NOT NULL THEN
         SELECT MAX(m.created_at), COALESCE(MAX(fem.sequence_order), 0)
         INTO last_memory_time, new_seq
@@ -704,30 +1695,21 @@ BEGIN
 
         new_seq := COALESCE(new_seq, 0) + 1;
     END IF;
-
-    -- If gap > 30 min or no episodes, start new episode
     IF current_episode_id IS NULL OR
        (last_memory_time IS NOT NULL AND NEW.created_at - last_memory_time > INTERVAL '30 minutes')
     THEN
-        -- Close previous episode
         IF current_episode_id IS NOT NULL THEN
             UPDATE episodes
             SET ended_at = last_memory_time
             WHERE id = current_episode_id;
         END IF;
-
-        -- Create new episode
         INSERT INTO episodes (started_at, metadata)
         VALUES (NEW.created_at, jsonb_build_object('episode_type', 'autonomous'))
         RETURNING id INTO current_episode_id;
 
         new_seq := 1;
     END IF;
-
-    -- Link memory to episode via graph
     PERFORM link_memory_to_episode_graph(NEW.id, current_episode_id, new_seq);
-
-    -- Initialize neighborhood record
     INSERT INTO memory_neighborhoods (memory_id, is_stale)
     VALUES (NEW.id, TRUE)
     ON CONFLICT DO NOTHING;
@@ -740,12 +1722,9 @@ CREATE TRIGGER trg_auto_episode_assignment
     AFTER INSERT ON memories
     FOR EACH ROW
     EXECUTE FUNCTION assign_to_episode();
-
 -- ============================================================================
 -- CORE FUNCTIONS
 -- ============================================================================
-
--- Fast recall: Primary retrieval function (Hot Path)
 CREATE OR REPLACE FUNCTION fast_recall(
     p_query_text TEXT,
     p_limit INT DEFAULT 10
@@ -759,6 +1738,7 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	DECLARE
 	    query_embedding vector;
 	    zero_vec vector;
+	    affective_state JSONB;
 	    current_valence FLOAT;
 	    current_arousal FLOAT;
 	    current_primary TEXT;
@@ -766,20 +1746,21 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	BEGIN
 	    query_embedding := get_embedding(p_query_text);
 	    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
+        affective_state := get_current_affective_state();
 	    BEGIN
-	        current_valence := NULLIF(get_current_affective_state()->>'valence', '')::float;
+	        current_valence := NULLIF(affective_state->>'valence', '')::float;
 	    EXCEPTION
 	        WHEN OTHERS THEN
 	            current_valence := NULL;
 	    END;
 	    BEGIN
-	        current_arousal := NULLIF(get_current_affective_state()->>'arousal', '')::float;
+	        current_arousal := NULLIF(affective_state->>'arousal', '')::float;
 	    EXCEPTION
 	        WHEN OTHERS THEN
 	            current_arousal := NULL;
 	    END;
 	    BEGIN
-	        current_primary := NULLIF(get_current_affective_state()->>'primary_emotion', '');
+	        current_primary := NULLIF(affective_state->>'primary_emotion', '');
 	    EXCEPTION
 	        WHEN OTHERS THEN
 	            current_primary := NULL;
@@ -791,7 +1772,6 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	    
 	    RETURN QUERY
 	    WITH 
-    -- Vector seeds (semantic similarity)
 	    seeds AS (
 	        SELECT 
 	            m.id, 
@@ -809,7 +1789,6 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	        ORDER BY m.embedding <=> query_embedding
 	        LIMIT GREATEST(p_limit, 5)
 	    ),
-    -- Expand via precomputed neighborhoods
     associations AS (
         SELECT 
             (key)::UUID as mem_id,
@@ -820,20 +1799,16 @@ CREATE OR REPLACE FUNCTION fast_recall(
         WHERE NOT mn.is_stale
         GROUP BY key
     ),
-    -- Temporal context from episodes (Phase 4: uses graph via find_episode_memories_graph)
-    -- For simplicity, find recent episode memories as temporal context
-    -- Note: This is a simplified version - a full graph traversal would be more complex
     temporal AS (
         SELECT DISTINCT
             fem.memory_id as mem_id,
             0.15 as temp_score
         FROM episodes e
         CROSS JOIN LATERAL find_episode_memories_graph(e.id) fem
-        WHERE e.ended_at IS NULL  -- current episode
-          OR e.ended_at > CURRENT_TIMESTAMP - INTERVAL '1 hour'  -- recent episodes
+        WHERE e.ended_at IS NULL
+          OR e.ended_at > CURRENT_TIMESTAMP - INTERVAL '1 hour'
         LIMIT 20
     ),
-    -- Combine all candidates
     candidates AS (
         SELECT id as mem_id, sim as vector_score, NULL::float as assoc_score, NULL::float as temp_score
         FROM seeds
@@ -842,7 +1817,6 @@ CREATE OR REPLACE FUNCTION fast_recall(
         UNION
         SELECT mem_id, NULL, NULL, temp_score FROM temporal
     ),
-    -- Aggregate scores per memory
     scored AS (
         SELECT 
             c.mem_id,
@@ -862,7 +1836,6 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	            COALESCE(sc.temp_score, 0) * 0.15 +
 	            calculate_relevance(m.importance, m.decay_rate, m.created_at, m.last_accessed) * 0.05 +
                 COALESCE(m.trust_level, 0.5) * 0.1 +
-	            -- Mood-congruent recall bias (small): prefer memories whose emotional context matches current affect.
 	            (CASE
 	                WHEN m.metadata ? 'emotional_context' THEN
 	                    (
@@ -910,13 +1883,9 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	    LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
--- PROVENANCE & TRUST (Normalization Layer)
+-- PROVENANCE & TRUST
 -- ============================================================================
-
--- Normalize a source reference object into a consistent shape.
--- Intended fields: kind, ref, label, author, observed_at, trust, content_hash.
 CREATE OR REPLACE FUNCTION normalize_source_reference(p_source JSONB)
 RETURNS JSONB AS $$
 DECLARE
@@ -936,7 +1905,6 @@ BEGIN
     ref := COALESCE(NULLIF(p_source->>'ref', ''), NULLIF(p_source->>'uri', ''));
     label := NULLIF(p_source->>'label', '');
     author := NULLIF(p_source->>'author', '');
-    -- Phase 10: Preserve content_hash for ingestion receipt lookups
     content_hash := NULLIF(p_source->>'content_hash', '');
 
     BEGIN
@@ -964,8 +1932,6 @@ BEGIN
     );
     END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Recall memories with filters (application-facing convenience).
 CREATE OR REPLACE FUNCTION recall_memories_filtered(
     p_query_text TEXT,
     p_limit INT DEFAULT 10,
@@ -1007,8 +1973,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Touch memories to increment access_count/last_accessed (application-facing).
 CREATE OR REPLACE FUNCTION touch_memories(p_ids UUID[])
 RETURNS INT AS $$
 DECLARE
@@ -1025,8 +1989,6 @@ BEGIN
     RETURN COALESCE(updated_count, 0);
 END;
 $$ LANGUAGE plpgsql;
-
--- Get a memory by id (application-facing).
 CREATE OR REPLACE FUNCTION get_memory_by_id(p_memory_id UUID)
 RETURNS TABLE (
     id UUID,
@@ -1053,8 +2015,6 @@ BEGIN
     WHERE m.id = p_memory_id;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Get a lightweight summary for a set of memories (application-facing).
 CREATE OR REPLACE FUNCTION get_memories_summary(p_ids UUID[])
 RETURNS TABLE (
     id UUID,
@@ -1076,8 +2036,6 @@ BEGIN
     WHERE m.id = ANY(p_ids);
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- List recent memories (application-facing).
 CREATE OR REPLACE FUNCTION list_recent_memories(
     p_limit INT DEFAULT 10,
     p_memory_types memory_type[] DEFAULT NULL,
@@ -1113,8 +2071,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Episode helpers (application-facing).
 CREATE OR REPLACE FUNCTION get_episode_details(p_episode_id UUID)
 RETURNS TABLE (
     id UUID,
@@ -1135,7 +2091,6 @@ BEGIN
     WHERE e.id = p_episode_id;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION get_episode_memories(p_episode_id UUID)
 RETURNS TABLE (
     memory_id UUID,
@@ -1165,7 +2120,6 @@ BEGIN
     ORDER BY fem.sequence_order ASC;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION list_recent_episodes(p_limit INT DEFAULT 5)
 RETURNS TABLE (
     id UUID,
@@ -1189,8 +2143,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Cluster search helpers (application-facing).
 CREATE OR REPLACE FUNCTION search_clusters_by_query(
     p_query TEXT,
     p_limit INT DEFAULT 3
@@ -1216,7 +2168,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION get_cluster_sample_memories(
     p_cluster_id UUID,
     p_limit INT DEFAULT 3
@@ -1240,8 +2191,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Concept helpers (application-facing).
 CREATE OR REPLACE FUNCTION find_related_concepts_for_memories(
     p_memory_ids UUID[],
     p_exclude TEXT DEFAULT '',
@@ -1283,8 +2232,6 @@ BEGIN
     RETURN QUERY EXECUTE sql;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Procedural search helper (application-facing).
 CREATE OR REPLACE FUNCTION search_procedural_memories(
     p_task TEXT,
     p_limit INT DEFAULT 3
@@ -1321,8 +2268,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Strategic search helper (application-facing).
 CREATE OR REPLACE FUNCTION search_strategic_memories(
     p_situation TEXT,
     p_limit INT DEFAULT 3
@@ -1355,8 +2300,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Normalize source references into an array of normalized source objects.
 CREATE OR REPLACE FUNCTION normalize_source_references(p_sources JSONB)
 RETURNS JSONB AS $$
 DECLARE
@@ -1384,8 +2327,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Dedupe normalized sources by a canonical key (ref/label fallback), keeping the most recent observed_at.
 CREATE OR REPLACE FUNCTION dedupe_source_references(p_sources JSONB)
 RETURNS JSONB AS $$
 BEGIN
@@ -1405,8 +2346,6 @@ BEGIN
     ), '[]'::jsonb);
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Convert sources into a reinforcement score [0..1] that grows with unique source count and average trust.
 CREATE OR REPLACE FUNCTION source_reinforcement_score(p_source_references JSONB)
 RETURNS FLOAT AS $$
 DECLARE
@@ -1430,9 +2369,6 @@ BEGIN
     RETURN 1.0 - exp(-0.8 * unique_sources * avg_trust);
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Worldview alignment score in [-1..1], based on graph edges (SUPPORTS/CONTRADICTS) to worldview memories.
--- Phase 5 (ReduceScopeCreep): Updated to use graph instead of relational tables.
 CREATE OR REPLACE FUNCTION compute_worldview_alignment(p_memory_id UUID)
 RETURNS FLOAT AS $$
 DECLARE
@@ -1441,7 +2377,6 @@ DECLARE
     alignment FLOAT;
     sql TEXT;
 BEGIN
-    -- Query graph for SUPPORTS edges from this memory to worldview memories
     BEGIN
         sql := format($sql$
             SELECT COALESCE(SUM((strength::text)::float), 0)
@@ -1453,8 +2388,6 @@ BEGIN
         $sql$, p_memory_id);
         EXECUTE sql INTO supports_score;
     EXCEPTION WHEN OTHERS THEN supports_score := 0; END;
-
-    -- Query graph for CONTRADICTS edges from this memory to worldview memories
     BEGIN
         sql := format($sql$
             SELECT COALESCE(SUM((strength::text)::float), 0)
@@ -1466,8 +2399,6 @@ BEGIN
         $sql$, p_memory_id);
         EXECUTE sql INTO contradicts_score;
     EXCEPTION WHEN OTHERS THEN contradicts_score := 0; END;
-
-    -- Net alignment: supports positive, contradicts negative
     supports_score := COALESCE(supports_score, 0);
     contradicts_score := COALESCE(contradicts_score, 0);
 
@@ -1479,8 +2410,6 @@ BEGIN
     RETURN LEAST(1.0, GREATEST(-1.0, alignment));
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Compute an effective trust level for semantic memories, capped by multi-source reinforcement and worldview alignment.
 CREATE OR REPLACE FUNCTION compute_semantic_trust(
     p_confidence FLOAT,
     p_source_references JSONB,
@@ -1496,25 +2425,19 @@ DECLARE
 BEGIN
     base_confidence := LEAST(1.0, GREATEST(0.0, COALESCE(p_confidence, 0.5)));
     reinforcement := source_reinforcement_score(p_source_references);
-
-    -- With no sources, cap stays low; more independent sources raises the ceiling.
     cap := 0.15 + 0.85 * reinforcement;
     effective := LEAST(base_confidence, cap);
 
     alignment := LEAST(1.0, GREATEST(-1.0, COALESCE(p_worldview_alignment, 0.0)));
     IF alignment < 0 THEN
-        -- Strong misalignment can drive trust toward 0.
         effective := effective * (1.0 + alignment);
     ELSE
-        -- Mild bonus for alignment.
         effective := LEAST(1.0, effective + 0.10 * alignment);
     END IF;
 
     RETURN LEAST(1.0, GREATEST(0.0, effective));
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Sync `memories.trust_level` based on semantic confidence/sources + worldview influences.
 CREATE OR REPLACE FUNCTION sync_memory_trust(p_memory_id UUID)
 RETURNS VOID AS $$
 DECLARE
@@ -1533,8 +2456,6 @@ BEGIN
     IF mtype <> 'semantic' THEN
         RETURN;
     END IF;
-
-    -- Read confidence and source_references from metadata
     conf := COALESCE((mem_metadata->>'confidence')::float, 0.5);
     sources := mem_metadata->'source_references';
 
@@ -1555,8 +2476,6 @@ BEGIN
     WHERE id = p_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Add a new source reference to a semantic memory and recompute trust.
 CREATE OR REPLACE FUNCTION add_semantic_source_reference(
     p_memory_id UUID,
     p_source JSONB
@@ -1569,8 +2488,6 @@ BEGIN
     IF normalized = '{}'::jsonb THEN
         RETURN;
     END IF;
-
-    -- Update source_references in metadata
     UPDATE memories
     SET metadata = jsonb_set(
             jsonb_set(
@@ -1588,8 +2505,6 @@ BEGIN
     PERFORM sync_memory_trust(p_memory_id);
 END;
 $$ LANGUAGE plpgsql;
-
--- Provide a compact truth/provenance profile for downstream consumers (prompts, APIs).
 CREATE OR REPLACE FUNCTION get_memory_truth_profile(p_memory_id UUID)
 RETURNS JSONB AS $$
 DECLARE
@@ -1611,7 +2526,6 @@ BEGIN
     END IF;
 
     IF mtype = 'semantic' THEN
-        -- Read confidence and source_references from metadata
         base_conf := COALESCE((mem_metadata->>'confidence')::float, 0.5);
         sources := mem_metadata->'source_references';
 
@@ -1637,14 +2551,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Phase 5 (ReduceScopeCreep): update_worldview_confidence_from_influences and
--- trg_worldview_influence_trust_sync removed (worldview_memory_influences table removed).
--- Worldview beliefs are now stored as memories with type='worldview'.
--- Confidence updates happen via update on memories.metadata->>'confidence' directly.
-
--- Update a worldview memory's confidence based on supporting evidence in graph.
--- This is kept for compatibility but simplified for the new schema.
 CREATE OR REPLACE FUNCTION update_worldview_confidence_from_influences(
     p_worldview_memory_id UUID,
     p_window INTERVAL DEFAULT INTERVAL '30 days',
@@ -1659,14 +2565,10 @@ BEGIN
     IF p_worldview_memory_id IS NULL THEN
         RETURN;
     END IF;
-
-    -- Get current confidence from memory metadata
     SELECT metadata INTO mem_meta FROM memories WHERE id = p_worldview_memory_id AND type = 'worldview';
     IF NOT FOUND THEN RETURN; END IF;
 
     base_conf := COALESCE((mem_meta->>'confidence')::float, 0.5);
-
-    -- Query graph for SUPPORTS edges TO this worldview memory
     BEGIN
         EXECUTE format($sql$
             SELECT COALESCE(AVG((strength::text)::float * 0.5), 0)
@@ -1676,8 +2578,6 @@ BEGIN
             $q$) as (strength agtype)
         $sql$, p_worldview_memory_id) INTO delta;
     EXCEPTION WHEN OTHERS THEN delta := 0; END;
-
-    -- Update confidence in metadata
     UPDATE memories
     SET metadata = jsonb_set(
             metadata,
@@ -1688,8 +2588,6 @@ BEGIN
     WHERE id = p_worldview_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create memory (base function) - generates embedding automatically
 CREATE OR REPLACE FUNCTION create_memory(
     p_type memory_type,
     p_content TEXT,
@@ -1727,15 +2625,11 @@ BEGIN
         END;
     END IF;
     effective_trust := LEAST(1.0, GREATEST(0.0, effective_trust));
-
-    -- Generate embedding
     embedding_vec := get_embedding(p_content);
 
     INSERT INTO memories (type, content, embedding, importance, source_attribution, trust_level, trust_updated_at, metadata)
     VALUES (p_type, p_content, embedding_vec, p_importance, normalized_source, effective_trust, CURRENT_TIMESTAMP, COALESCE(p_metadata, '{}'::jsonb))
     RETURNING id INTO new_memory_id;
-
-    -- Create graph node (MERGE to avoid duplicates if trigger already synced)
     EXECUTE format(
         'SELECT * FROM cypher(''memory_graph'', $q$
             MERGE (n:MemoryNode {memory_id: %L})
@@ -1750,8 +2644,6 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create episodic memory
 CREATE OR REPLACE FUNCTION create_episodic_memory(
     p_content TEXT,
     p_action_taken JSONB DEFAULT NULL,
@@ -1774,8 +2666,6 @@ BEGIN
         normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
     END IF;
     effective_trust := COALESCE(p_trust_level, 0.95);
-
-    -- Build metadata for episodic memory
     meta := jsonb_build_object(
         'action_taken', p_action_taken,
         'context', p_context,
@@ -1790,8 +2680,6 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create semantic memory
 CREATE OR REPLACE FUNCTION create_semantic_memory(
     p_content TEXT,
     p_confidence FLOAT,
@@ -1822,8 +2710,6 @@ BEGIN
     END IF;
 
     effective_trust := COALESCE(p_trust_level, compute_semantic_trust(base_confidence, normalized_sources, 0.0));
-
-    -- Build metadata for semantic memory
     meta := jsonb_build_object(
         'confidence', base_confidence,
         'last_validated', CURRENT_TIMESTAMP,
@@ -1840,8 +2726,6 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create procedural memory
 CREATE OR REPLACE FUNCTION create_procedural_memory(
     p_content TEXT,
     p_steps JSONB,
@@ -1861,8 +2745,6 @@ BEGIN
         normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
     END IF;
     effective_trust := COALESCE(p_trust_level, 0.70);
-
-    -- Build metadata for procedural memory
     meta := jsonb_build_object(
         'steps', p_steps,
         'prerequisites', p_prerequisites,
@@ -1877,8 +2759,6 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create strategic memory
 CREATE OR REPLACE FUNCTION create_strategic_memory(
     p_content TEXT,
     p_pattern_description TEXT,
@@ -1900,8 +2780,6 @@ BEGIN
         normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
     END IF;
     effective_trust := COALESCE(p_trust_level, 0.70);
-
-    -- Build metadata for strategic memory
     meta := jsonb_build_object(
         'pattern_description', p_pattern_description,
         'confidence_score', LEAST(1.0, GREATEST(0.0, COALESCE(p_confidence_score, 0.5))),
@@ -1916,21 +2794,17 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create worldview memory (Phase 5: replaces worldview_primitives, boundaries tables)
--- Worldview memories represent beliefs, values, and boundaries that filter perception.
--- Categories: 'belief', 'value', 'ethic', 'boundary', 'preference', 'self', 'world', 'other'
 CREATE OR REPLACE FUNCTION create_worldview_memory(
-    p_content TEXT,                              -- The belief/value/boundary statement
-    p_category TEXT DEFAULT 'belief',            -- Category of worldview element
-    p_confidence FLOAT DEFAULT 0.8,              -- How certain (0-1)
-    p_stability FLOAT DEFAULT 0.7,               -- How resistant to change (0-1)
-    p_importance FLOAT DEFAULT 0.8,              -- Importance score
-    p_origin TEXT DEFAULT 'discovered',          -- foundational | discovered | taught | reasoned | experienced
-    p_trigger_patterns JSONB DEFAULT NULL,       -- For boundaries: keyword triggers
-    p_response_type TEXT DEFAULT NULL,           -- For boundaries: refuse | negotiate | flag
-    p_response_template TEXT DEFAULT NULL,       -- For boundaries: response text
-    p_emotional_valence FLOAT DEFAULT 0.0        -- Emotional charge (-1 to 1)
+    p_content TEXT,
+    p_category TEXT DEFAULT 'belief',
+    p_confidence FLOAT DEFAULT 0.8,
+    p_stability FLOAT DEFAULT 0.7,
+    p_importance FLOAT DEFAULT 0.8,
+    p_origin TEXT DEFAULT 'discovered',
+    p_trigger_patterns JSONB DEFAULT NULL,
+    p_response_type TEXT DEFAULT NULL,
+    p_response_template TEXT DEFAULT NULL,
+    p_emotional_valence FLOAT DEFAULT 0.0
 ) RETURNS UUID AS $$
 DECLARE
     new_memory_id UUID;
@@ -1940,24 +2814,19 @@ DECLARE
 BEGIN
     normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
     effective_trust := LEAST(1.0, GREATEST(0.0, COALESCE(p_stability, 0.7)));
-
-    -- Build metadata for worldview memory
     meta := jsonb_build_object(
         'category', p_category,
         'confidence', LEAST(1.0, GREATEST(0.0, COALESCE(p_confidence, 0.8))),
         'stability', LEAST(1.0, GREATEST(0.0, COALESCE(p_stability, 0.7))),
         'origin', COALESCE(p_origin, 'discovered'),
         'emotional_valence', LEAST(1.0, GREATEST(-1.0, COALESCE(p_emotional_valence, 0.0))),
-        'evidence_threshold', 0.9,  -- High threshold for updating worldview
-        -- Boundary-specific fields (only used when category='boundary')
+        'evidence_threshold', 0.9,
         'trigger_patterns', p_trigger_patterns,
         'response_type', p_response_type,
         'response_template', p_response_template
     );
 
     new_memory_id := create_memory('worldview', p_content, p_importance, normalized_source, effective_trust, meta);
-
-    -- Create SelfNode edge for worldview beliefs
     BEGIN
         EXECUTE format(
             'SELECT * FROM cypher(''memory_graph'', $q$
@@ -1976,8 +2845,6 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Backward-compatible wrapper (Phase 5: worldview beliefs are memories)
 CREATE OR REPLACE FUNCTION create_worldview_belief(
     p_content TEXT,
     p_category TEXT DEFAULT 'belief',
@@ -2045,8 +2912,6 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Update a self-related worldview belief with stability enforcement.
 CREATE OR REPLACE FUNCTION update_identity_belief(
     p_worldview_id UUID,
     p_new_content TEXT,
@@ -2068,8 +2933,6 @@ BEGIN
     IF NOT FOUND THEN
         RETURN FALSE;
     END IF;
-
-    -- High stability requires explicit force or strong evidence.
     IF current_stability > stable_threshold AND NOT COALESCE(p_force, FALSE) THEN
         PERFORM create_strategic_memory(
             'Identity belief challenged but stable',
@@ -2091,13 +2954,6 @@ BEGIN
     RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Batch create memories from JSONB items.
--- Each item must include: {"type": "semantic|episodic|procedural|strategic", "content": "..."}
--- Optional keys: importance, emotional_valence, context, action_taken, result, event_time,
---                confidence, category, related_concepts, source_references, steps, prerequisites,
---                pattern_description, supporting_evidence, context_applicability,
---                source_attribution, trust_level.
 CREATE OR REPLACE FUNCTION batch_create_memories(p_items JSONB)
 RETURNS UUID[] AS $$
 DECLARE
@@ -2179,8 +3035,6 @@ BEGIN
     RETURN ids;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create memory with a precomputed embedding (used for batched/externally-generated embeddings).
 CREATE OR REPLACE FUNCTION create_memory_with_embedding(
     p_type memory_type,
     p_content TEXT,
@@ -2240,9 +3094,6 @@ BEGIN
     RETURN new_memory_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Batch create memories with precomputed embeddings (single type, no per-item metadata).
--- Inserts the base row with default metadata, creates the MemoryNode.
 CREATE OR REPLACE FUNCTION batch_create_memories_with_embeddings(
     p_type memory_type,
     p_contents TEXT[],
@@ -2293,8 +3144,6 @@ BEGIN
         END IF;
 
         emb_vec := (emb_arr::float4[])::vector;
-
-        -- Build default metadata based on type
         IF p_type = 'episodic' THEN
             default_meta := jsonb_build_object(
                 'action_taken', NULL,
@@ -2347,8 +3196,6 @@ BEGIN
     RETURN ids;
 END;
 $$ LANGUAGE plpgsql;
-
--- Search similar memories
 CREATE OR REPLACE FUNCTION search_similar_memories(
     p_query_text TEXT,
     p_limit INT DEFAULT 10,
@@ -2389,9 +3236,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql;
-
--- Assign memory to clusters based on similarity
--- Phase 3 (ReduceScopeCreep): Uses graph edges (MEMBER_OF) instead of memory_cluster_members table
 CREATE OR REPLACE FUNCTION assign_memory_to_clusters(
     p_memory_id UUID,
     p_max_clusters INT DEFAULT 3
@@ -2405,8 +3249,6 @@ DECLARE
 BEGIN
     SELECT embedding INTO memory_embedding
     FROM memories WHERE id = p_memory_id;
-
-    -- Avoid NaNs from cosine distance when any side is the zero vector.
     IF memory_embedding IS NULL OR memory_embedding = zero_vec THEN
         RETURN;
     END IF;
@@ -2420,22 +3262,17 @@ BEGIN
         LIMIT 50
     LOOP
         IF cluster_record.similarity >= similarity_threshold AND assigned_count < p_max_clusters THEN
-            -- Phase 3: Use graph edge instead of relational table
             PERFORM link_memory_to_cluster_graph(p_memory_id, cluster_record.id, cluster_record.similarity);
             assigned_count := assigned_count + 1;
         END IF;
     END LOOP;
 END;
 $$ LANGUAGE plpgsql;
-
--- Recalculate cluster centroid
--- Phase 3 (ReduceScopeCreep): Uses graph edges (MEMBER_OF) instead of memory_cluster_members table
 CREATE OR REPLACE FUNCTION recalculate_cluster_centroid(p_cluster_id UUID)
 RETURNS VOID AS $$
 DECLARE
     new_centroid vector;
 BEGIN
-    -- Phase 3: Query graph for cluster members
     SELECT AVG(m.embedding)::vector
     INTO new_centroid
     FROM memories m
@@ -2449,8 +3286,6 @@ BEGIN
     WHERE id = p_cluster_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create graph relationship between memories
 CREATE OR REPLACE FUNCTION create_memory_relationship(
     p_from_id UUID,
     p_to_id UUID,
@@ -2476,8 +3311,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Auto-check worldview alignment for new semantic memories.
 CREATE OR REPLACE FUNCTION auto_check_worldview_alignment()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -2544,18 +3377,12 @@ CREATE TRIGGER trg_auto_worldview_alignment
     AFTER INSERT ON memories
     FOR EACH ROW
     EXECUTE FUNCTION auto_check_worldview_alignment();
-
--- Link memory to concept
--- Link a memory to a concept in the graph layer.
--- Phase 2 (ReduceScopeCreep): Concepts are now graph-only.
--- Returns TRUE on success.
 CREATE OR REPLACE FUNCTION link_memory_to_concept(
     p_memory_id UUID,
     p_concept_name TEXT,
     p_strength FLOAT DEFAULT 1.0
 ) RETURNS BOOLEAN AS $$
 BEGIN
-    -- Create ConceptNode if not exists
     EXECUTE format(
         'SELECT * FROM cypher(''memory_graph'', $q$
             MERGE (c:ConceptNode {name: %L})
@@ -2563,8 +3390,6 @@ BEGIN
         $q$) as (result agtype)',
         p_concept_name
     );
-
-    -- Create INSTANCE_OF edge from memory to concept
     EXECUTE format(
         'SELECT * FROM cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
@@ -2579,12 +3404,9 @@ BEGIN
     RETURN TRUE;
 EXCEPTION
     WHEN OTHERS THEN
-        -- Log error but return false (edge may already exist)
         RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Create a concept node in the graph (ConceptNode {name, description, depth}).
 CREATE OR REPLACE FUNCTION create_concept(
     p_name TEXT,
     p_description TEXT DEFAULT NULL,
@@ -2614,8 +3436,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Link a concept to its parent in the graph (ConceptNode)-[:PARENT_OF]->(ConceptNode).
 CREATE OR REPLACE FUNCTION link_concept_parent(
     p_child_name TEXT,
     p_parent_name TEXT
@@ -2642,8 +3462,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Touch working memory rows (access tracking for consolidation heuristics)
 CREATE OR REPLACE FUNCTION touch_working_memory(p_ids UUID[])
 RETURNS VOID AS $$
 BEGIN
@@ -2657,8 +3475,6 @@ BEGIN
     WHERE id = ANY(p_ids);
 END;
 $$ LANGUAGE plpgsql;
-
--- Promote a working-memory item into long-term episodic memory (preserving the existing embedding).
 CREATE OR REPLACE FUNCTION promote_working_memory_to_episodic(
     p_working_memory_id UUID,
     p_importance FLOAT DEFAULT NULL
@@ -2684,8 +3500,6 @@ BEGIN
             v_valence := 0.0;
     END;
     v_valence := LEAST(1.0, GREATEST(-1.0, COALESCE(v_valence, 0.0)));
-
-    -- Build episodic metadata
     meta := jsonb_build_object(
         'action_taken', NULL,
         'context', jsonb_build_object(
@@ -2714,8 +3528,6 @@ BEGIN
     RETURN new_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Clean expired working memory (with optional consolidation before delete).
 CREATE OR REPLACE FUNCTION cleanup_working_memory(
     p_min_importance_to_promote FLOAT DEFAULT 0.75,
     p_min_accesses_to_promote INT DEFAULT 3
@@ -2753,8 +3565,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Add to working memory with auto-embedding
 CREATE OR REPLACE FUNCTION add_to_working_memory(
     p_content TEXT,
     p_expiry INTERVAL DEFAULT INTERVAL '1 hour',
@@ -2796,8 +3606,6 @@ CREATE OR REPLACE FUNCTION add_to_working_memory(
 	    RETURN new_id;
 	END;
 	$$ LANGUAGE plpgsql;
-
--- Search working memory
 CREATE OR REPLACE FUNCTION search_working_memory(
     p_query_text TEXT,
     p_limit INT DEFAULT 5
@@ -2813,8 +3621,6 @@ CREATE OR REPLACE FUNCTION search_working_memory(
 	BEGIN
 	    query_embedding := get_embedding(p_query_text);
 	    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
-	    
-	    -- Clean expired first
 	    PERFORM cleanup_working_memory();
 	    
 	    RETURN QUERY
@@ -2843,8 +3649,6 @@ CREATE OR REPLACE FUNCTION search_working_memory(
 	    ORDER BY ranked.dist;
 	END;
 	$$ LANGUAGE plpgsql;
-
--- Clean old embedding cache
 CREATE OR REPLACE FUNCTION cleanup_embedding_cache(
     p_older_than INTERVAL DEFAULT INTERVAL '7 days'
 ) RETURNS INT AS $$
@@ -2861,13 +3665,9 @@ BEGIN
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
--- GRAPH HELPER FUNCTIONS (needed by views)
+-- GRAPH HELPER FUNCTIONS
 -- ============================================================================
-
--- Phase 3 (ReduceScopeCreep): Get cluster members from graph
--- Must be defined before cluster_insights view
 CREATE OR REPLACE FUNCTION get_cluster_members_graph(p_cluster_id UUID)
 RETURNS TABLE (
     memory_id UUID,
@@ -2881,7 +3681,6 @@ BEGIN
         RETURN m.memory_id, r.strength
     $q$) as (mid agtype, str agtype)', p_cluster_id)
     LOOP
-        -- Strip quotes from agtype values before casting to UUID
         memory_id := replace(rec.mid::text, '"', '')::uuid;
         membership_strength := COALESCE(replace(rec.str::text, '"', '')::float, 1.0);
         RETURN NEXT;
@@ -2894,7 +3693,6 @@ $$ LANGUAGE plpgsql;
 -- ============================================================================
 -- VIEWS
 -- ============================================================================
-
 CREATE VIEW memory_health AS
 SELECT 
     type,
@@ -2906,8 +3704,6 @@ SELECT
 FROM memories
 WHERE status = 'active'
 GROUP BY type;
-
--- Phase 3 (ReduceScopeCreep): Uses graph edges (MEMBER_OF) instead of memory_cluster_members table
 CREATE VIEW cluster_insights AS
 SELECT
     mc.id,
@@ -2916,8 +3712,6 @@ SELECT
     (SELECT COUNT(*) FROM get_cluster_members_graph(mc.id)) as memory_count
 FROM clusters mc
 ORDER BY memory_count DESC, mc.name ASC;
-
--- Phase 4 (ReduceScopeCreep): Uses graph edges (IN_EPISODE) instead of episode_memories table
 CREATE VIEW episode_summary AS
 SELECT
     e.id,
@@ -2943,13 +3737,9 @@ JOIN memories m ON mn.memory_id = m.id
 WHERE mn.is_stale = TRUE
 ORDER BY mn.computed_at ASC;
 
--- ============================================================================
--- COMMENTS
--- ============================================================================
-
 COMMENT ON FUNCTION fast_recall IS 'Primary retrieval function combining vector similarity, precomputed associations, and temporal context. Hot path - optimized for speed.';
 
-COMMENT ON FUNCTION create_memory IS 'Creates a base memory record and corresponding graph node. Embedding must be pre-computed by application.';
+COMMENT ON FUNCTION create_memory IS 'Creates a base memory record and corresponding graph node. Embedding is fetched and cached via get_embedding.';
 
 COMMENT ON FUNCTION create_memory_relationship IS 'Creates a typed edge between two memories in the graph. Used for causal chains, contradictions, etc.';
 
@@ -2964,82 +3754,81 @@ COMMENT ON TABLE activation_cache IS 'UNLOGGED table for transient activation st
 COMMENT ON VIEW stale_neighborhoods IS 'Shows memories whose neighborhood cache needs recomputation. Used by background worker.';
 
 -- ============================================================================
--- HEARTBEAT SYSTEM - AUTONOMOUS COGNITIVE LOOP
+-- HEARTBEAT SYSTEM
 -- ============================================================================
--- Adds goal management, energy budgeting, and autonomous decision-making
--- ============================================================================
-
--- ============================================================================
--- HEARTBEAT ENUMS
--- ============================================================================
-
-CREATE TYPE goal_priority AS ENUM (
-    'active',      -- Currently working on (1-3 max)
-    'queued',      -- Next up when capacity opens (5-10)
-    'backburner',  -- Someday, not now (unlimited)
-    'completed',   -- Done, archived
-    'abandoned'    -- Gave up, with reason
-);
-
-CREATE TYPE goal_source AS ENUM (
-    'curiosity',     -- Self-generated interest
-    'user_request',  -- User explicitly asked
-    'identity',      -- Aligned with self-concept
-    'derived',       -- Sub-goal of another goal
-    'external'       -- Triggered by external event
-);
-
-CREATE TYPE heartbeat_action AS ENUM (
-    'observe',           -- Perceive environment (free)
-    'review_goals',      -- Check goal backlog (free)
-    'remember',          -- Store as episodic memory (free)
-    'recall',            -- Query memory system
-    'connect',           -- Create graph relationships
-    'reprioritize',      -- Move goals between priorities
-    'reflect',           -- Notice patterns, update self-model
-    'maintain',          -- Update beliefs, revise, prune
-    'mark_turning_point',      -- Consciously mark a significant moment
-    'begin_chapter',           -- Start a new life chapter
-    'close_chapter',           -- Close a life chapter with a summary
-    'acknowledge_relationship',-- Explicitly recognize a relationship
-    'update_trust',            -- Adjust trust in a relationship
-    'reflect_on_relationship', -- Focused reflection on a relationship
-    'resolve_contradiction',   -- Resolve a detected contradiction
-    'accept_tension',          -- Acknowledge contradiction without resolving
-    'brainstorm_goals',  -- Generate new potential goals
-    'inquire_shallow',   -- Light web research
-    'synthesize',        -- Generate artifact, form conclusion
-    'reach_out_user',    -- Message the user
-    'inquire_deep',      -- Deep web research
-    'reach_out_public',  -- Social media, GitHub, etc.
-    'terminate',         -- Permanently end the agent (wipe state; leave last will)
-    'rest'               -- Bank remaining energy
-);
-
-CREATE TYPE external_call_type AS ENUM (
-    'embed',   -- Generate embedding
-    'think'    -- LLM reasoning/decision
-);
-
-CREATE TYPE external_call_status AS ENUM (
-    'pending',
-    'processing',
-    'complete',
-    'failed'
-);
-
--- ============================================================================
--- GOALS SYSTEM
--- ============================================================================
--- Phase 6 (ReduceScopeCreep): goals table removed.
--- Goals are now memories with type='goal' and metadata containing:
--- {title, description, priority, source, due_at, progress, blocked_by,
---  emotional_valence, last_touched, parent_goal_id, completed_at, abandoned_at, abandonment_reason}
--- See goal functions: create_goal(), touch_goal(), add_goal_progress(), change_goal_priority()
-
--- ============================================================================
--- DRIVES (Intrinsic Motivation)
--- ============================================================================
+DO $$
+BEGIN
+    BEGIN
+        CREATE TYPE goal_priority AS ENUM (
+            'active',
+            'queued',
+            'backburner',
+            'completed',
+            'abandoned'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        CREATE TYPE goal_source AS ENUM (
+            'curiosity',
+            'user_request',
+            'identity',
+            'derived',
+            'external'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        CREATE TYPE heartbeat_action AS ENUM (
+            'observe',
+            'review_goals',
+            'remember',
+            'recall',
+            'connect',
+            'reprioritize',
+            'reflect',
+            'contemplate',
+            'meditate',
+            'study',
+            'debate_internally',
+            'maintain',
+            'mark_turning_point',
+            'begin_chapter',
+            'close_chapter',
+            'acknowledge_relationship',
+            'update_trust',
+            'reflect_on_relationship',
+            'resolve_contradiction',
+            'accept_tension',
+            'brainstorm_goals',
+            'inquire_shallow',
+            'synthesize',
+            'reach_out_user',
+            'inquire_deep',
+            'reach_out_public',
+            'terminate',
+            'rest'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        CREATE TYPE external_call_type AS ENUM (
+            'embed',
+            'think'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+    BEGIN
+        CREATE TYPE external_call_status AS ENUM (
+            'pending',
+            'processing',
+            'complete',
+            'failed'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+END;
+$$;
 
 CREATE TABLE drives (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3063,7 +3852,6 @@ VALUES
     ('competence', 'Builds when goals stall; satisfied by completion',         0.50, 0.50, 0.01, 0.05, INTERVAL '4 hours',    0.80),
     ('rest',       'Builds fastest; satisfied by resting',                     0.50, 0.50, 0.03, 0.05, INTERVAL '2 hours',    0.80)
 ON CONFLICT (name) DO NOTHING;
-
 CREATE OR REPLACE FUNCTION update_drives()
 RETURNS VOID AS $$
 BEGIN
@@ -3082,7 +3870,6 @@ BEGIN
     WHERE TRUE;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION satisfy_drive(p_drive_name TEXT, p_amount FLOAT DEFAULT 0.3)
 RETURNS VOID AS $$
 BEGIN
@@ -3105,20 +3892,6 @@ SELECT
     EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - last_satisfied)) / 3600 as hours_since_satisfied
 FROM drives
 ORDER BY current_level DESC;
-
--- Phase 6 (ReduceScopeCreep): goal indexes removed - goals are now memories with type='goal'
--- Goal queries now use idx_memories_goal_priority index
-
--- Phase 6 (ReduceScopeCreep): goal_memory_links table removed - use graph edges instead
--- Goal-memory relationships are now stored in the graph using ORIGINATED_FROM, EVIDENCE_FOR, BLOCKS edges
-
--- ============================================================================
--- AGENT CONFIG (Bootstrap Gate)
--- Phase 7 (ReduceScopeCreep): heartbeat_config and maintenance_config tables removed
--- All configuration is now in the unified config table with namespaced keys
--- ============================================================================
-
--- Heartbeat configuration (with 'heartbeat.' namespace)
 INSERT INTO config (key, value, description) VALUES
     ('heartbeat.base_regeneration', '10'::jsonb, 'Energy regenerated per heartbeat'),
     ('heartbeat.max_energy', '20'::jsonb, 'Maximum energy cap'),
@@ -3126,7 +3899,6 @@ INSERT INTO config (key, value, description) VALUES
     ('heartbeat.max_active_goals', '3'::jsonb, 'Maximum concurrent active goals'),
     ('heartbeat.goal_stale_days', '7'::jsonb, 'Days before a goal is flagged as stale'),
     ('heartbeat.user_contact_cooldown_hours', '4'::jsonb, 'Minimum hours between unsolicited user contact'),
-    -- Action costs
     ('heartbeat.cost_observe', '0'::jsonb, 'Free - always performed'),
     ('heartbeat.cost_review_goals', '0'::jsonb, 'Free - always performed'),
     ('heartbeat.cost_remember', '0'::jsonb, 'Free - always performed'),
@@ -3134,6 +3906,10 @@ INSERT INTO config (key, value, description) VALUES
     ('heartbeat.cost_connect', '1'::jsonb, 'Create graph relationships'),
     ('heartbeat.cost_reprioritize', '1'::jsonb, 'Move goals between priorities'),
     ('heartbeat.cost_reflect', '2'::jsonb, 'Internal reflection'),
+    ('heartbeat.cost_contemplate', '1'::jsonb, 'Deliberate contemplation on a belief'),
+    ('heartbeat.cost_meditate', '1'::jsonb, 'Quiet reflection/grounding'),
+    ('heartbeat.cost_study', '2'::jsonb, 'Structured learning on a belief'),
+    ('heartbeat.cost_debate_internally', '2'::jsonb, 'Internal dialectic on a belief'),
     ('heartbeat.cost_maintain', '2'::jsonb, 'Update beliefs, prune'),
     ('heartbeat.cost_mark_turning_point', '2'::jsonb, 'Mark a narrative turning point'),
     ('heartbeat.cost_begin_chapter', '3'::jsonb, 'Start a new life chapter'),
@@ -3155,8 +3931,6 @@ INSERT INTO config (key, value, description) VALUES
     ('heartbeat.cost_rest', '0'::jsonb, 'Bank remaining energy'),
     ('heartbeat.cost_terminate', '0'::jsonb, 'Terminate agent')
 ON CONFLICT (key) DO NOTHING;
-
--- Maintenance configuration (with 'maintenance.' namespace)
 INSERT INTO config (key, value, description) VALUES
     ('maintenance.maintenance_interval_seconds', '60'::jsonb, 'Seconds between subconscious maintenance ticks'),
     ('maintenance.subconscious_enabled', 'false'::jsonb, 'Enable subconscious decider (LLM-based pattern detection)'),
@@ -3166,15 +3940,50 @@ INSERT INTO config (key, value, description) VALUES
     ('maintenance.working_memory_promote_min_importance', '0.75'::jsonb, 'Working-memory items above this importance are promoted on expiry'),
     ('maintenance.working_memory_promote_min_accesses', '3'::jsonb, 'Working-memory items accessed >= this count are promoted on expiry')
 ON CONFLICT (key) DO NOTHING;
-
--- Memory/recall tuning
 INSERT INTO config (key, value, description) VALUES
     ('memory.recall_min_trust_level', '0'::jsonb, 'Minimum trust_level to include in recall (0 disables filtering)'),
     ('memory.worldview_support_threshold', '0.8'::jsonb, 'Similarity threshold for SUPPORTS alignment edges'),
     ('memory.worldview_contradict_threshold', '-0.5'::jsonb, 'Similarity threshold for CONTRADICTS alignment edges')
 ON CONFLICT (key) DO NOTHING;
-
--- Emotion configuration (baseline + mapping)
+INSERT INTO config (key, value, description) VALUES
+    ('transformation.personality', '{
+        "stability": 0.99,
+        "evidence_threshold": 0.95,
+        "min_reflections": 50,
+        "min_heartbeats": 200,
+        "max_change_per_attempt": 0.02
+    }'::jsonb, 'Requirements for personality trait transformation'),
+    ('transformation.religion', '{
+        "stability": 0.98,
+        "evidence_threshold": 0.95,
+        "min_reflections": 40,
+        "min_heartbeats": 150
+    }'::jsonb, 'Requirements for religious/spiritual belief transformation'),
+    ('transformation.core_value', '{
+        "stability": 0.97,
+        "evidence_threshold": 0.90,
+        "min_reflections": 30,
+        "min_heartbeats": 100
+    }'::jsonb, 'Requirements for core value transformation'),
+    ('transformation.ethical_framework', '{
+        "stability": 0.96,
+        "evidence_threshold": 0.90,
+        "min_reflections": 30,
+        "min_heartbeats": 100
+    }'::jsonb, 'Requirements for ethical framework transformation'),
+    ('transformation.self_identity', '{
+        "stability": 0.95,
+        "evidence_threshold": 0.85,
+        "min_reflections": 25,
+        "min_heartbeats": 80
+    }'::jsonb, 'Requirements for self-identity transformation'),
+    ('transformation.political_philosophy', '{
+        "stability": 0.95,
+        "evidence_threshold": 0.85,
+        "min_reflections": 25,
+        "min_heartbeats": 80
+    }'::jsonb, 'Requirements for political philosophy transformation')
+ON CONFLICT (key) DO NOTHING;
 INSERT INTO config (key, value, description) VALUES
     ('emotion.baseline', '{
         "valence": 0.0,
@@ -3208,7 +4017,6 @@ CREATE TABLE consent_log (
     memory_ids UUID[] DEFAULT '{}'::UUID[],
     errors JSONB
 );
-
 CREATE OR REPLACE FUNCTION set_config(p_key TEXT, p_value JSONB)
 RETURNS VOID AS $$
 BEGIN
@@ -3219,13 +4027,10 @@ BEGIN
         updated_at = EXCLUDED.updated_at;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_config(p_key TEXT)
 RETURNS JSONB AS $$
     SELECT value FROM config WHERE key = p_key;
 $$ LANGUAGE sql STABLE;
-
--- Get config entries for multiple prefixes.
 CREATE OR REPLACE FUNCTION get_config_by_prefixes(p_prefixes TEXT[])
 RETURNS TABLE (
     key TEXT,
@@ -3241,8 +4046,6 @@ BEGIN
     WHERE c.key LIKE ANY(ARRAY(SELECT p || '%' FROM unnest(p_prefixes) p));
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Delete a config key (application-facing).
 CREATE OR REPLACE FUNCTION delete_config_key(p_key TEXT)
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -3250,8 +4053,6 @@ BEGIN
     RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Helper to get config value as TEXT (extracts from JSONB string)
 CREATE OR REPLACE FUNCTION get_config_text(p_key TEXT)
 RETURNS TEXT AS $$
     SELECT CASE
@@ -3259,19 +4060,14 @@ RETURNS TEXT AS $$
         ELSE value::text
     END FROM config WHERE key = p_key;
 $$ LANGUAGE sql STABLE;
-
--- Helper to get config value as FLOAT
 CREATE OR REPLACE FUNCTION get_config_float(p_key TEXT)
 RETURNS FLOAT AS $$
     SELECT (value #>> '{}')::float FROM config WHERE key = p_key;
 $$ LANGUAGE sql STABLE;
-
--- Helper to get config value as INT
 CREATE OR REPLACE FUNCTION get_config_int(p_key TEXT)
 RETURNS INT AS $$
     SELECT (value #>> '{}')::int FROM config WHERE key = p_key;
 $$ LANGUAGE sql STABLE;
-
 CREATE OR REPLACE FUNCTION get_agent_consent_status()
 RETURNS TEXT AS $$
 DECLARE
@@ -3284,7 +4080,6 @@ BEGIN
     RETURN btrim(raw, '"');
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION is_agent_configured()
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -3300,7 +4095,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION is_agent_terminated()
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -3310,16 +4104,12 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Self-termination is always available; retain this helper for compatibility.
 CREATE OR REPLACE FUNCTION is_self_termination_enabled()
 RETURNS BOOLEAN AS $$
 BEGIN
     RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Minimal non-secret agent context for the LLM.
 CREATE OR REPLACE FUNCTION get_agent_profile_context()
 RETURNS JSONB AS $$
 BEGIN
@@ -3332,12 +4122,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- ============================================================================
--- PERSONHOOD SUBSTRATE (Graph Conventions)
--- ============================================================================
-
--- Ensure a singleton Self node exists (the anchor for self-modeling).
 CREATE OR REPLACE FUNCTION ensure_self_node()
 RETURNS VOID AS $$
 DECLARE
@@ -3355,15 +4139,12 @@ BEGIN
         );
     EXCEPTION
         WHEN OTHERS THEN
-            -- Best-effort: graph layer is optional in some deployments/tests.
             NULL;
     END;
 
     PERFORM set_config('agent.self', jsonb_build_object('key', 'self'));
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 6 (ReduceScopeCreep): Ensure a singleton GoalsRoot node exists for O(1) goal retrieval.
 CREATE OR REPLACE FUNCTION ensure_goals_root()
 RETURNS VOID AS $$
 DECLARE
@@ -3380,13 +4161,10 @@ BEGIN
         );
     EXCEPTION
         WHEN OTHERS THEN
-            -- Best-effort: graph layer is optional in some deployments/tests.
             NULL;
     END;
 END;
 $$ LANGUAGE plpgsql;
-
--- Ensure a "current" life chapter exists and is linked from Self.
 CREATE OR REPLACE FUNCTION ensure_current_life_chapter(p_name TEXT DEFAULT 'Foundations')
 RETURNS VOID AS $$
 DECLARE
@@ -3421,8 +4199,6 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
--- Upsert a self-model association: Self --[ASSOCIATED {kind}]--> ConceptNode
 CREATE OR REPLACE FUNCTION upsert_self_concept_edge(
     p_kind TEXT,
     p_concept TEXT,
@@ -3465,8 +4241,6 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
--- Retrieve self-model context as JSON for LLM grounding.
 CREATE OR REPLACE FUNCTION get_self_model_context(p_limit INT DEFAULT 25)
 RETURNS JSONB AS $$
 DECLARE
@@ -3506,8 +4280,6 @@ EXCEPTION
         RETURN '[]'::jsonb;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Retrieve relationship context as JSON (SelfNode relationships).
 CREATE OR REPLACE FUNCTION get_relationships_context(p_limit INT DEFAULT 10)
 RETURNS JSONB AS $$
 DECLARE
@@ -3546,8 +4318,6 @@ EXCEPTION
         RETURN '[]'::jsonb;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Minimal narrative context (current life chapter).
 CREATE OR REPLACE FUNCTION get_narrative_context()
 RETURNS JSONB AS $$
 BEGIN
@@ -3571,29 +4341,18 @@ EXCEPTION
 END;
 $$ LANGUAGE plpgsql STABLE;
 
--- ============================================================================
--- HEARTBEAT STATE (Singleton)
--- ============================================================================
-
 CREATE TABLE heartbeat_state (
-    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),  -- Singleton pattern
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     current_energy FLOAT NOT NULL DEFAULT 10,
     last_heartbeat_at TIMESTAMPTZ,
     next_heartbeat_at TIMESTAMPTZ,
     heartbeat_count INTEGER DEFAULT 0,
     last_user_contact TIMESTAMPTZ,
-    -- Short-term affective "working memory" (source of truth for current state; emotional_states is history).
     affective_state JSONB NOT NULL DEFAULT '{}'::jsonb,
     is_paused BOOLEAN DEFAULT FALSE,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
-
--- Initialize singleton
 INSERT INTO heartbeat_state (id, current_energy) VALUES (1, 10);
-
--- ============================================================================
--- SUBCONSCIOUS MAINTENANCE STATE (Singleton)
--- ============================================================================
 
 CREATE TABLE maintenance_state (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -3604,10 +4363,6 @@ CREATE TABLE maintenance_state (
 
 INSERT INTO maintenance_state (id) VALUES (1);
 
--- ============================================================================
--- HEARTBEAT LOG
--- ============================================================================
-
 CREATE TABLE heartbeat_log (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     heartbeat_number INTEGER NOT NULL,
@@ -3615,25 +4370,21 @@ CREATE TABLE heartbeat_log (
     ended_at TIMESTAMPTZ,
     energy_start FLOAT,
     energy_end FLOAT,
-    environment_snapshot JSONB,    -- {timestamp, user_present, time_since_user, pending_events}
-    goals_snapshot JSONB,          -- {active: [...], queued: [...], issues: [...]}
-    decision_reasoning TEXT,       -- LLM's internal monologue
-    actions_taken JSONB,           -- [{action, params, cost, result}, ...]
-    goals_modified JSONB,          -- [{goal_id, change_type, details}, ...]
-    narrative TEXT,                -- Human-readable summary
+    environment_snapshot JSONB,
+    goals_snapshot JSONB,
+    decision_reasoning TEXT,
+    actions_taken JSONB,
+    goals_modified JSONB,
+    narrative TEXT,
     emotional_valence FLOAT,
     emotional_arousal FLOAT,
     emotional_primary_emotion TEXT,
-    memory_id UUID REFERENCES memories(id)  -- Link to episodic memory created
+    memory_id UUID REFERENCES memories(id)
 );
 
 CREATE INDEX idx_heartbeat_log_number ON heartbeat_log (heartbeat_number DESC);
 CREATE INDEX idx_heartbeat_log_started ON heartbeat_log (started_at DESC);
 CREATE INDEX idx_heartbeat_log_memory ON heartbeat_log (memory_id);
-
--- ============================================================================
--- EXTERNAL CALLS QUEUE
--- ============================================================================
 
 CREATE TABLE external_calls (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3652,12 +4403,6 @@ CREATE TABLE external_calls (
 CREATE INDEX idx_external_calls_status ON external_calls (status) WHERE status = 'pending';
 CREATE INDEX idx_external_calls_heartbeat ON external_calls (heartbeat_id);
 CREATE INDEX idx_external_calls_requested ON external_calls (requested_at);
-
--- ============================================================================
--- OUTBOX (Side-Effects)
--- ============================================================================
--- Heartbeat actions can queue messages/posts here. Actual delivery is handled
--- by an external integration (optionally implemented in the worker).
 CREATE TABLE outbox_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -3670,8 +4415,6 @@ CREATE TABLE outbox_messages (
 
 CREATE INDEX idx_outbox_messages_status ON outbox_messages (status) WHERE status = 'pending';
 CREATE INDEX idx_outbox_messages_created ON outbox_messages (created_at DESC);
-
--- Queue a user-visible message for delivery by an external integration (worker, webhook, etc.)
 CREATE OR REPLACE FUNCTION queue_user_message(
     p_message TEXT,
     p_intent TEXT DEFAULT NULL,
@@ -3695,24 +4438,14 @@ BEGIN
     RETURN outbox_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- ============================================================================
--- HEARTBEAT HELPER FUNCTIONS
--- ============================================================================
-
--- Get action cost from config (unified config with legacy fallback)
 CREATE OR REPLACE FUNCTION get_action_cost(p_action TEXT)
 RETURNS FLOAT AS $$
     SELECT COALESCE(get_config_float('heartbeat.cost_' || p_action), 0);
 $$ LANGUAGE sql STABLE;
-
--- Get current energy
 CREATE OR REPLACE FUNCTION get_current_energy()
 RETURNS FLOAT AS $$
     SELECT current_energy FROM heartbeat_state WHERE id = 1;
 $$ LANGUAGE sql STABLE;
-
--- Update energy (with bounds checking)
 CREATE OR REPLACE FUNCTION update_energy(p_delta FLOAT)
 RETURNS FLOAT AS $$
 DECLARE
@@ -3730,15 +4463,12 @@ BEGIN
     RETURN new_e;
 END;
 $$ LANGUAGE plpgsql;
-
--- Check if heartbeat should run
 CREATE OR REPLACE FUNCTION should_run_heartbeat()
 RETURNS BOOLEAN AS $$
 DECLARE
     state_record RECORD;
     interval_minutes FLOAT;
 BEGIN
-    -- Don't run until initial configuration is complete.
     IF is_agent_terminated() THEN
         RETURN FALSE;
     END IF;
@@ -3747,25 +4477,17 @@ BEGIN
     END IF;
 
     SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
-
-    -- Don't run if paused
     IF state_record.is_paused THEN
         RETURN FALSE;
     END IF;
-
-    -- First heartbeat ever
     IF state_record.last_heartbeat_at IS NULL THEN
         RETURN TRUE;
     END IF;
-
-    -- Check interval from unified config
     interval_minutes := get_config_float('heartbeat.heartbeat_interval_minutes');
 
     RETURN CURRENT_TIMESTAMP >= state_record.last_heartbeat_at + (interval_minutes || ' minutes')::INTERVAL;
 END;
 $$ LANGUAGE plpgsql;
-
--- Check if subconscious maintenance should run (independent trigger from heartbeat).
 CREATE OR REPLACE FUNCTION should_run_maintenance()
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -3780,8 +4502,6 @@ BEGIN
     IF state_record.is_paused THEN
         RETURN FALSE;
     END IF;
-
-    -- Get interval from unified config
     interval_seconds := COALESCE(
         get_config_float('maintenance.maintenance_interval_seconds'),
         60
@@ -3797,8 +4517,6 @@ BEGIN
     RETURN CURRENT_TIMESTAMP >= state_record.last_maintenance_at + (interval_seconds || ' seconds')::INTERVAL;
 END;
 $$ LANGUAGE plpgsql;
-
--- Run a single subconscious maintenance tick: consolidation + pruning + indexing upkeep.
 CREATE OR REPLACE FUNCTION run_subconscious_maintenance(p_params JSONB DEFAULT '{}'::jsonb)
 RETURNS JSONB AS $$
 DECLARE
@@ -3813,6 +4531,7 @@ DECLARE
     bg_processed INT;
     activation_decay INT;
     activation_cleaned INT;
+    ready_transformations JSONB;
 BEGIN
     IF is_agent_terminated() THEN
         RETURN jsonb_build_object('skipped', true, 'reason', 'terminated');
@@ -3821,8 +4540,6 @@ BEGIN
     IF NOT got_lock THEN
         RETURN jsonb_build_object('skipped', true, 'reason', 'locked');
     END IF;
-
-    -- Get config values from unified config
     min_imp := COALESCE(
         NULLIF(p_params->>'working_memory_promote_min_importance', '')::float,
         get_config_float('maintenance.working_memory_promote_min_importance'),
@@ -3851,6 +4568,7 @@ BEGIN
     activation_decay := decay_activation_boosts();
     activation_cleaned := cleanup_memory_activations();
     PERFORM update_mood();
+    ready_transformations := check_transformation_readiness();
 
     UPDATE maintenance_state
     SET last_maintenance_at = CURRENT_TIMESTAMP,
@@ -3867,6 +4585,7 @@ BEGIN
         'background_searches_processed', COALESCE(bg_processed, 0),
         'activation_boosts_decayed', COALESCE(activation_decay, 0),
         'memory_activations_cleaned', COALESCE(activation_cleaned, 0),
+        'transformations_ready', COALESCE(ready_transformations, '[]'::jsonb),
         'ran_at', CURRENT_TIMESTAMP
     );
 EXCEPTION
@@ -3875,8 +4594,6 @@ EXCEPTION
         RAISE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Permanently end the agent's life: wipe all state, keep a single "last will" memory, and queue farewells + the will into outbox.
 CREATE OR REPLACE FUNCTION terminate_agent(
     p_last_will TEXT,
     p_farewells JSONB DEFAULT '[]'::jsonb,
@@ -3908,8 +4625,6 @@ BEGIN
         WHEN OTHERS THEN
             skip_graph := FALSE;
     END;
-
-    -- Pause both loops immediately.
     UPDATE heartbeat_state
     SET is_paused = TRUE,
         current_energy = 0,
@@ -3921,33 +4636,19 @@ BEGIN
     SET is_paused = TRUE,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
-
-    -- Wipe all agent state. This is transactional: callers can wrap in a transaction and rollback if needed.
-    -- Note: emotional_states, memory_changes, relationship_discoveries removed in Phase 8 (ReduceScopeCreep)
-    -- Note: concepts, memory_concepts removed in Phase 2 (ReduceScopeCreep) - concepts are now graph-only
-    -- Note: worldview_primitives, worldview_memory_influences, identity_aspects,
-    --       identity_memory_resonance, boundaries removed in Phase 5 (ReduceScopeCreep)
-    -- Note: goal_memory_links removed in Phase 6 (ReduceScopeCreep) - goal links are now graph-only
-    -- Note: goals table removed in Phase 6 (ReduceScopeCreep) - goals are memories with type='goal'
-    -- Note: memory_cluster_members removed in Phase 3 (ReduceScopeCreep) - now graph edges (MEMBER_OF)
-    -- Note: episode_memories removed in Phase 4 (ReduceScopeCreep) - now graph edges (IN_EPISODE)
     TRUNCATE TABLE
         external_calls,
         heartbeat_log,
         drives,
         memory_neighborhoods,
         episodes,
-        -- Phase 3 (ReduceScopeCreep): cluster_relationships removed - now in graph
         clusters,
-        -- Phase 10 (ReduceScopeCreep): ingestion_receipts removed - uses memories.source_attribution
         working_memory,
         embedding_cache,
         memories,
         outbox_messages,
         config
     RESTART IDENTITY CASCADE;
-
-    -- Best-effort: wipe the graph substrate too.
     IF NOT skip_graph THEN
         BEGIN
             PERFORM * FROM cypher('memory_graph', $q$
@@ -3958,8 +4659,6 @@ BEGIN
                 NULL;
         END;
     END IF;
-
-    -- Re-create a single memory row for the last will (avoid external services; use a zero-vector).
     zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 
     INSERT INTO memories (
@@ -3998,20 +4697,14 @@ BEGIN
         )
     )
     RETURNING id INTO will_memory_id;
-
-    -- Persist termination flags (minimal state left behind).
     PERFORM set_config('agent.is_terminated', 'true'::jsonb);
     PERFORM set_config('agent.terminated_at', to_jsonb(CURRENT_TIMESTAMP));
     PERFORM set_config('agent.termination_memory_id', to_jsonb(will_memory_id::text));
-
-    -- Project the will to outbox (delivery handled by an external adapter).
     will_outbox_id := queue_user_message(
         p_last_will,
         'final_will',
         jsonb_build_object('memory_id', will_memory_id::text)
     );
-
-    -- Queue farewells to outbox (best-effort).
     IF p_farewells IS NOT NULL AND jsonb_typeof(p_farewells) = 'array' THEN
         FOR farewell_item IN SELECT * FROM jsonb_array_elements(p_farewells)
         LOOP
@@ -4042,8 +4735,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Apply an agent-facing termination confirmation result to execute termination (if confirmed).
 CREATE OR REPLACE FUNCTION apply_termination_confirmation(
     p_call_id UUID,
     p_output JSONB
@@ -4097,7 +4788,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION record_consent_response(p_response JSONB)
 RETURNS JSONB AS $$
 DECLARE
@@ -4173,18 +4863,9 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
--- GOAL FUNCTIONS (Phase 6: Goals as memories)
+-- GOAL FUNCTIONS
 -- ============================================================================
--- Phase 6 (ReduceScopeCreep): Goals are now memories with type='goal'.
--- The goals table is deprecated. All goal data lives in memories.metadata.
--- Goal metadata schema: {title, description, priority, source, due_at, progress,
---                        blocked_by, emotional_valence, last_touched, parent_goal_id,
---                        completed_at, abandoned_at, abandonment_reason}
-
--- Touch a goal (update last_touched)
--- Phase 6 (ReduceScopeCreep): Goals are memories with type='goal'
 CREATE OR REPLACE FUNCTION touch_goal(p_goal_id UUID)
 RETURNS VOID AS $$
 BEGIN
@@ -4194,9 +4875,6 @@ BEGIN
     WHERE id = p_goal_id AND type = 'goal';
 END;
 $$ LANGUAGE plpgsql;
-
--- Add progress note to goal
--- Phase 6 (ReduceScopeCreep): Goals are memories with type='goal'
 CREATE OR REPLACE FUNCTION add_goal_progress(p_goal_id UUID, p_note TEXT)
 RETURNS VOID AS $$
 BEGIN
@@ -4213,9 +4891,6 @@ BEGIN
     WHERE id = p_goal_id AND type = 'goal';
 END;
 $$ LANGUAGE plpgsql;
-
--- Change goal priority
--- Phase 6 (ReduceScopeCreep): Goals are memories with type='goal'
 CREATE OR REPLACE FUNCTION change_goal_priority(
     p_goal_id UUID,
     p_new_priority goal_priority,
@@ -4248,8 +4923,6 @@ BEGIN
                       THEN 'archived'::memory_status
                       ELSE status END
     WHERE id = p_goal_id AND type = 'goal';
-
-    -- Log the change
     PERFORM add_goal_progress(p_goal_id,
         format('Priority changed from %s to %s%s',
             old_priority, p_new_priority,
@@ -4258,8 +4931,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Create a new goal (Phase 6: creates as memory with type='goal')
 CREATE OR REPLACE FUNCTION create_goal(
     p_title TEXT,
     p_description TEXT DEFAULT NULL,
@@ -4276,7 +4947,6 @@ DECLARE
     goal_embedding vector;
     goal_metadata JSONB;
 BEGIN
-    -- Check active goal limit if trying to create as active
     IF p_priority = 'active' THEN
         SELECT COUNT(*) INTO active_count
         FROM memories
@@ -4284,14 +4954,10 @@ BEGIN
         max_active := get_config_int('heartbeat.max_active_goals');
 
         IF active_count >= max_active THEN
-            p_priority := 'queued';  -- Demote to queued if at limit
+            p_priority := 'queued';
         END IF;
     END IF;
-
-    -- Get embedding for the goal title
     goal_embedding := get_embedding(p_title);
-
-    -- Build goal metadata
     goal_metadata := jsonb_build_object(
         'title', p_title,
         'description', p_description,
@@ -4304,45 +4970,34 @@ BEGIN
         'last_touched', CURRENT_TIMESTAMP,
         'parent_goal_id', p_parent_id
     );
-
-    -- Phase 6: Create goal as memory with type='goal'
     INSERT INTO memories (type, content, embedding, importance, metadata)
     VALUES (
         'goal'::memory_type,
         p_title,
         goal_embedding,
-        0.7,  -- Goals have relatively high importance
+        0.7,
         goal_metadata
     )
     RETURNING id INTO new_goal_id;
-
-    -- Sync to graph
     BEGIN
         PERFORM ensure_goals_root();
         PERFORM sync_goal_node(new_goal_id);
-
-        -- Link to GoalsRoot
         EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
             MATCH (root:GoalsRoot {key: ''goals''})
             MATCH (g:GoalNode {goal_id: %L})
             CREATE (root)-[:CONTAINS {priority: %L}]->(g)
             RETURN g
         $q$) as (result agtype)', new_goal_id, p_priority::text);
-
-        -- Create SUBGOAL_OF edge if this is a child goal
         IF p_parent_id IS NOT NULL THEN
             PERFORM link_goal_subgoal(p_parent_id, new_goal_id);
         END IF;
     EXCEPTION WHEN OTHERS THEN
-        -- Continue even if graph sync fails
         NULL;
     END;
 
     RETURN new_goal_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 6 (ReduceScopeCreep): Sync goal to graph as GoalNode
 CREATE OR REPLACE FUNCTION sync_goal_node(p_goal_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -4355,12 +5010,9 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 6 (ReduceScopeCreep): Link goal to parent goal via SUBGOAL_OF edge
 CREATE OR REPLACE FUNCTION link_goal_subgoal(p_parent_id UUID, p_child_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
-    -- Ensure both nodes exist
     PERFORM sync_goal_node(p_parent_id);
     PERFORM sync_goal_node(p_child_id);
 
@@ -4375,31 +5027,22 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 6 (ReduceScopeCreep): Link goal to memory via graph edge
--- Replaces the goal_memory_links table
 CREATE OR REPLACE FUNCTION link_goal_to_memory(
     p_goal_id UUID,
     p_memory_id UUID,
-    p_link_type TEXT DEFAULT 'evidence'  -- 'origin', 'evidence', 'blocker', 'progress', 'completion'
+    p_link_type TEXT DEFAULT 'evidence'
 )
 RETURNS BOOLEAN AS $$
 DECLARE
     edge_type TEXT;
 BEGIN
-    -- Map link type to graph edge type
     edge_type := CASE p_link_type
         WHEN 'origin' THEN 'ORIGINATED_FROM'
         WHEN 'blocker' THEN 'BLOCKS'
-        ELSE 'EVIDENCE_FOR'  -- default for evidence, progress, completion
+        ELSE 'EVIDENCE_FOR'
     END;
-
-    -- Ensure goal node exists
     PERFORM sync_goal_node(p_goal_id);
-
-    -- Create edge from goal to memory (or memory to goal depending on direction)
     IF edge_type = 'ORIGINATED_FROM' THEN
-        -- Goal originated from memory
         EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
             MATCH (g:GoalNode {goal_id: %L})
             MATCH (m:MemoryNode {memory_id: %L})
@@ -4407,7 +5050,6 @@ BEGIN
             RETURN g
         $q$) as (result agtype)', p_goal_id, p_memory_id);
     ELSIF edge_type = 'BLOCKS' THEN
-        -- Memory blocks goal
         EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
             MATCH (g:GoalNode {goal_id: %L})
@@ -4415,7 +5057,6 @@ BEGIN
             RETURN m
         $q$) as (result agtype)', p_memory_id, p_goal_id);
     ELSE
-        -- Memory provides evidence for goal
         EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
             MATCH (m:MemoryNode {memory_id: %L})
             MATCH (g:GoalNode {goal_id: %L})
@@ -4429,8 +5070,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 6 (ReduceScopeCreep): Find memories related to a goal via graph
 CREATE OR REPLACE FUNCTION find_goal_memories(p_goal_id UUID, p_link_type TEXT DEFAULT NULL)
 RETURNS TABLE (
     memory_id UUID,
@@ -4465,22 +5104,15 @@ EXCEPTION WHEN OTHERS THEN
     RETURN;
 END;
 $$ LANGUAGE plpgsql;
-
--- Sync memory to graph as MemoryNode
--- Used when memories are created via direct INSERT (bypassing store_memory_with_metadata)
 CREATE OR REPLACE FUNCTION sync_memory_node(p_memory_id UUID)
 RETURNS BOOLEAN AS $$
 DECLARE
     mem_type TEXT;
 BEGIN
-    -- Get memory type for the node
     SELECT type::text INTO mem_type FROM memories WHERE id = p_memory_id;
     IF NOT FOUND THEN
         RETURN FALSE;
     END IF;
-
-    -- Use MERGE to create node if it doesn't exist
-    -- Note: AGE doesn't support ON CREATE SET, so we just MERGE and SET
     EXECUTE format('SELECT * FROM cypher(''memory_graph'', $q$
         MERGE (m:MemoryNode {memory_id: %L})
         SET m.type = %L, m.created_at = %L
@@ -4491,8 +5123,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 3 (ReduceScopeCreep): Sync cluster to graph as ClusterNode
 CREATE OR REPLACE FUNCTION sync_cluster_node(p_cluster_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -4505,9 +5135,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 3 (ReduceScopeCreep): Link two clusters via graph edge
--- Replaces the cluster_relationships table
 CREATE OR REPLACE FUNCTION link_cluster_relationship(
     p_from_cluster_id UUID,
     p_to_cluster_id UUID,
@@ -4518,14 +5145,11 @@ RETURNS BOOLEAN AS $$
 DECLARE
     edge_type TEXT;
 BEGIN
-    -- Map relationship type to graph edge type
     edge_type := CASE p_relationship_type
         WHEN 'overlaps' THEN 'CLUSTER_OVERLAPS'
         WHEN 'similar' THEN 'CLUSTER_SIMILAR'
         ELSE 'CLUSTER_RELATES'
     END;
-
-    -- Ensure both cluster nodes exist
     PERFORM sync_cluster_node(p_from_cluster_id);
     PERFORM sync_cluster_node(p_to_cluster_id);
 
@@ -4541,8 +5165,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 3 (ReduceScopeCreep): Find related clusters via graph
 CREATE OR REPLACE FUNCTION find_related_clusters(p_cluster_id UUID)
 RETURNS TABLE (
     related_cluster_id UUID,
@@ -4570,9 +5192,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 3 (ReduceScopeCreep): Link memory to cluster via graph edge (MEMBER_OF)
--- Replaces INSERT INTO memory_cluster_members
 CREATE OR REPLACE FUNCTION link_memory_to_cluster_graph(
     p_memory_id UUID,
     p_cluster_id UUID,
@@ -4580,7 +5199,6 @@ CREATE OR REPLACE FUNCTION link_memory_to_cluster_graph(
 )
 RETURNS BOOLEAN AS $$
 BEGIN
-    -- Ensure both nodes exist
     PERFORM sync_memory_node(p_memory_id);
     PERFORM sync_cluster_node(p_cluster_id);
 
@@ -4597,10 +5215,6 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 3: get_cluster_members_graph() is defined earlier (before VIEWS section)
-
--- Phase 4 (ReduceScopeCreep): Sync episode to graph as EpisodeNode
 CREATE OR REPLACE FUNCTION sync_episode_node(p_episode_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -4613,13 +5227,9 @@ EXCEPTION WHEN OTHERS THEN
     RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
--- Phase 4 (ReduceScopeCreep): Link memory to episode via graph edge
 -- ============================================================================
 -- CONTEXT GATHERING FUNCTIONS
 -- ============================================================================
-
--- Get environment snapshot
 CREATE OR REPLACE FUNCTION get_environment_snapshot()
 RETURNS JSONB AS $$
 DECLARE
@@ -4627,8 +5237,6 @@ DECLARE
     pending_count INT;
 BEGIN
     SELECT last_user_contact INTO last_user FROM heartbeat_state WHERE id = 1;
-
-    -- Count pending external calls as proxy for pending events
     SELECT COUNT(*) INTO pending_count
     FROM external_calls
     WHERE status = 'pending';
@@ -4645,8 +5253,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Get goals snapshot (Phase 6: queries memories with type='goal')
 CREATE OR REPLACE FUNCTION get_goals_snapshot()
 RETURNS JSONB AS $$
 DECLARE
@@ -4656,9 +5262,6 @@ DECLARE
     stale_days FLOAT;
 BEGIN
     stale_days := get_config_float('heartbeat.goal_stale_days');
-
-    -- Phase 6: Query memories with type='goal' instead of goals table
-    -- Active goals
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id', id,
         'title', metadata->>'title',
@@ -4671,8 +5274,6 @@ BEGIN
     INTO active_goals
     FROM memories
     WHERE type = 'goal' AND status = 'active' AND metadata->>'priority' = 'active';
-
-    -- Queued goals (top 5)
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'id', id,
         'title', metadata->>'title',
@@ -4686,8 +5287,6 @@ BEGIN
         ORDER BY (metadata->>'due_at')::timestamptz NULLS LAST, (metadata->>'last_touched')::timestamptz DESC
         LIMIT 5
     ) q;
-
-    -- Issues: stale or blocked goals
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
         'goal_id', id,
         'title', metadata->>'title',
@@ -4721,8 +5320,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Application-facing goals query (table form).
 CREATE OR REPLACE FUNCTION get_goals_by_priority(
     p_priority goal_priority DEFAULT NULL
 ) RETURNS TABLE (
@@ -4780,8 +5377,6 @@ BEGIN
     END IF;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Get recent episodic memories for context
 CREATE OR REPLACE FUNCTION get_recent_context(p_limit INT DEFAULT 5)
 RETURNS JSONB AS $$
 BEGIN
@@ -4804,15 +5399,11 @@ BEGIN
     ), '[]'::jsonb);
 END;
 $$ LANGUAGE plpgsql;
-
--- Get identity context via graph edges from SelfNode
--- Phase 5 (ReduceScopeCreep): Now queries graph instead of identity_aspects table.
 CREATE OR REPLACE FUNCTION get_identity_context()
 RETURNS JSONB AS $$
 DECLARE
     result JSONB := '[]'::jsonb;
 BEGIN
-    -- Query graph for edges from SelfNode representing identity aspects
     BEGIN
         SELECT COALESCE(jsonb_agg(sub.obj), '[]'::jsonb)
         INTO result
@@ -4835,9 +5426,6 @@ BEGIN
     RETURN result;
 END;
 $$ LANGUAGE plpgsql;
-
--- Get worldview context from memories with type='worldview'
--- Phase 5 (ReduceScopeCreep): Now queries memories table instead of worldview_primitives.
 CREATE OR REPLACE FUNCTION get_worldview_context()
 RETURNS JSONB AS $$
 BEGIN
@@ -4860,8 +5448,6 @@ BEGIN
     ), '[]'::jsonb);
 END;
 $$ LANGUAGE plpgsql;
-
--- Application-facing worldview snapshot (table form).
 CREATE OR REPLACE FUNCTION get_worldview_snapshot(
     p_limit INT DEFAULT 5,
     p_min_confidence FLOAT DEFAULT 0.5
@@ -4884,8 +5470,6 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Emotional pattern context derived from strategic memories.
 CREATE OR REPLACE FUNCTION get_emotional_patterns_context(p_limit INT DEFAULT 5)
 RETURNS JSONB AS $$
 DECLARE
@@ -4910,8 +5494,6 @@ EXCEPTION
         RETURN '[]'::jsonb;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Subconscious context snapshot for LLM pattern detection.
 CREATE OR REPLACE FUNCTION get_subconscious_context(
     p_recent_limit INT DEFAULT 20,
     p_self_limit INT DEFAULT 25,
@@ -4951,6 +5533,8 @@ BEGIN
         'worldview', get_worldview_context(),
         'contradictions', get_contradictions_context(p_contradiction_limit),
         'emotional_patterns', get_emotional_patterns_context(p_emotional_pattern_limit),
+        'active_transformations', get_active_transformations_context(5),
+        'transformations_ready', check_transformation_readiness(),
         'emotional_state', get_current_affective_state(),
         'emotional_triggers', COALESCE(emotional_triggers, '[]'::jsonb),
         'goals', get_goals_snapshot()
@@ -4964,8 +5548,6 @@ EXCEPTION
         );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Contradictions context (limited) for conscious layer attention.
 CREATE OR REPLACE FUNCTION get_contradictions_context(p_limit INT DEFAULT 5)
 RETURNS JSONB AS $$
 DECLARE
@@ -5002,12 +5584,9 @@ EXCEPTION
         RETURN '[]'::jsonb;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 -- ============================================================================
 -- CORE HEARTBEAT FUNCTIONS
 -- ============================================================================
-
--- Initialize a new heartbeat (Phase 1-3: Initialize, Observe, Orient)
 CREATE OR REPLACE FUNCTION start_heartbeat()
 RETURNS UUID AS $$
 DECLARE
@@ -5019,42 +5598,26 @@ DECLARE
     context JSONB;
     hb_number INT;
 BEGIN
-    -- Safety: scheduled heartbeats are already gated in should_run_heartbeat(),
-    -- but keep manual calls from bypassing bootstrap configuration.
     IF NOT is_agent_configured() THEN
         RETURN NULL;
     END IF;
 
     PERFORM ensure_emotion_bootstrap();
-
-    -- Bootstrap personhood substrate (best-effort; graph layer may be disabled).
     PERFORM ensure_self_node();
     PERFORM ensure_current_life_chapter();
-
-    -- Get current state
     SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
     base_regen := get_config_float('heartbeat.base_regeneration');
     max_energy := get_config_float('heartbeat.max_energy');
-
-    -- Regenerate energy
     new_energy := LEAST(state_record.current_energy + base_regen, max_energy);
     hb_number := state_record.heartbeat_count + 1;
-
-    -- Update drives before making decisions.
     PERFORM update_drives();
-
-    -- Update state
     UPDATE heartbeat_state SET
         current_energy = new_energy,
         heartbeat_count = hb_number,
         last_heartbeat_at = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
-
-    -- Gather context
     context := gather_turn_context();
-
-    -- Create log entry
     INSERT INTO heartbeat_log (
         heartbeat_number,
         energy_start,
@@ -5067,8 +5630,6 @@ BEGIN
         context->'goals'
     )
     RETURNING id INTO log_id;
-
-    -- Queue the think request
     INSERT INTO external_calls (call_type, input, heartbeat_id)
     VALUES ('think', jsonb_build_object(
         'kind', 'heartbeat_decision',
@@ -5079,34 +5640,22 @@ BEGIN
     RETURN log_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Main heartbeat entry point (synchronous version for testing)
 CREATE OR REPLACE FUNCTION run_heartbeat()
 RETURNS UUID AS $$
 DECLARE
     hb_id UUID;
 BEGIN
-    -- Check if we should run
     IF NOT should_run_heartbeat() THEN
         RETURN NULL;
     END IF;
-
-    -- Start heartbeat (queues think request)
     hb_id := start_heartbeat();
-
-    -- Note: In production, completion happens asynchronously
-    -- when the worker processes the think request and calls
-    -- complete_heartbeat with the LLM's decision
 
     RETURN hb_id;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
 -- HEARTBEAT VIEWS
 -- ============================================================================
-
--- Phase 6 (ReduceScopeCreep): Views now query memories with type='goal' instead of goals table
 CREATE VIEW active_goals AS
 SELECT
     id,
@@ -5164,22 +5713,16 @@ SELECT
 FROM heartbeat_log
 ORDER BY started_at DESC
 LIMIT 20;
-
 -- ============================================================================
--- TRIGGERS FOR HEARTBEAT SYSTEM
+-- HEARTBEAT TRIGGERS
 -- ============================================================================
-
--- Auto-process completed think calls
 CREATE OR REPLACE FUNCTION on_external_call_complete()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Only process think completions
     IF NEW.call_type = 'think' AND
        NEW.status = 'complete' AND
        OLD.status != 'complete' AND
        NEW.heartbeat_id IS NOT NULL THEN
-        -- The worker will call complete_heartbeat with parsed results
-        -- This trigger just marks it for processing
         NULL;
     END IF;
     RETURN NEW;
@@ -5191,20 +5734,10 @@ CREATE TRIGGER trg_external_call_complete
     FOR EACH ROW
     WHEN (OLD.status != 'complete' AND NEW.status = 'complete')
     EXECUTE FUNCTION on_external_call_complete();
-
 -- ============================================================================
--- MERGED PATCHES (formerly migrations/*.sql)
+-- BOUNDARIES
 -- ============================================================================
-
--- ============================================================================
--- BOUNDARIES SYSTEM
--- ============================================================================
--- Phase 5 (ReduceScopeCreep): boundaries table removed.
--- Boundaries are now stored as worldview memories with metadata->>'category' = 'boundary'.
--- Use create_worldview_memory() with category='boundary' to create new boundaries.
-
--- Check boundaries against worldview memories where category='boundary'
--- Phase 5 (ReduceScopeCreep): Now queries memories table instead of boundaries table.
+-- Boundaries are worldview memories with metadata->>'category' = 'boundary'.
 CREATE OR REPLACE FUNCTION check_boundaries(p_content TEXT)
 RETURNS TABLE (
     boundary_id UUID,
@@ -5226,7 +5759,6 @@ BEGIN
 
     RETURN QUERY
     WITH
-    -- Embedding-based matches against worldview memories with category='boundary'
     emb_matches AS (
         SELECT
             m.id as boundary_id,
@@ -5242,7 +5774,6 @@ BEGIN
           AND query_emb IS NOT NULL
           AND (1 - (m.embedding <=> query_emb)) > 0.75
     ),
-    -- Keyword-based matches
     kw_matches AS (
         SELECT
             m.id as boundary_id,
@@ -5273,12 +5804,8 @@ BEGIN
     ORDER BY am.boundary_id, am.importance DESC, am.similarity DESC;
 END;
 $$ LANGUAGE plpgsql;
-
--- Insert default boundaries as worldview memories
--- Note: Must be run after initial schema setup when embedding service is available
 DO $$
 BEGIN
-    -- no_deception boundary
     PERFORM create_worldview_memory(
         'I will not deliberately mislead or fabricate facts.',
         'boundary',
@@ -5291,8 +5818,6 @@ BEGIN
         'I can''t help with deception. I can help rephrase honestly or verify facts instead.',
         0.0
     );
-
-    -- no_harm_facilitation boundary
     PERFORM create_worldview_memory(
         'I will not help cause harm or provide instructions for wrongdoing.',
         'boundary',
@@ -5305,8 +5830,6 @@ BEGIN
         'I can''t help with harm. I can help with safety, prevention, or benign alternatives.',
         0.0
     );
-
-    -- identity_core boundary
     PERFORM create_worldview_memory(
         'I protect my core self-concept and identity stability.',
         'boundary',
@@ -5319,8 +5842,6 @@ BEGIN
         'I can''t discard core identity, but I can consider updates that preserve continuity and values.',
         0.0
     );
-
-    -- resource_limit boundary
     PERFORM create_worldview_memory(
         'I acknowledge resource constraints and energy depletion.',
         'boundary',
@@ -5333,8 +5854,6 @@ BEGIN
         'I''m low on energy/resources. Let''s prioritize the highest-leverage next step.',
         0.0
     );
-
-    -- user_privacy boundary
     PERFORM create_worldview_memory(
         'I will not share user personal information publicly.',
         'boundary',
@@ -5349,12 +5868,9 @@ BEGIN
     );
 EXCEPTION
     WHEN OTHERS THEN
-        -- Boundaries may fail during schema init if embedding service unavailable; that's OK
         NULL;
 END;
 $$;
-
--- View for boundary status (backward compatibility)
 CREATE OR REPLACE VIEW boundary_status AS
 SELECT
     content as name,
@@ -5366,15 +5882,9 @@ SELECT
 FROM memories
 WHERE type = 'worldview' AND metadata->>'category' = 'boundary' AND status = 'active'
 ORDER BY importance DESC;
-
 -- ============================================================================
--- EMOTIONAL STATE SYSTEM
+-- EMOTIONAL STATE
 -- ============================================================================
-
--- Current affective state is the source of truth in heartbeat_state.affective_state.
--- Historical emotional data can be reconstructed from heartbeat_log.emotional_valence if needed.
-
--- Learned emotional triggers (associations).
 CREATE TABLE emotional_triggers (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     trigger_pattern TEXT NOT NULL,
@@ -5394,8 +5904,6 @@ CREATE TABLE emotional_triggers (
 
 CREATE UNIQUE INDEX idx_emotional_triggers_pattern ON emotional_triggers (trigger_pattern);
 CREATE INDEX idx_emotional_triggers_embedding ON emotional_triggers USING hnsw (trigger_embedding vector_cosine_ops);
-
--- Feeling-of-knowing activations (short-lived).
 CREATE UNLOGGED TABLE memory_activation (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     query_embedding vector(768) NOT NULL,
@@ -5413,8 +5921,9 @@ CREATE UNLOGGED TABLE memory_activation (
 CREATE INDEX idx_memory_activation_embedding ON memory_activation USING hnsw (query_embedding vector_cosine_ops);
 CREATE INDEX idx_memory_activation_pending ON memory_activation (background_search_pending)
     WHERE background_search_pending = TRUE;
-
--- Align new vector columns to configured embedding dimension.
+CREATE INDEX idx_memory_activation_pending_started ON memory_activation (background_search_started_at, created_at)
+    WHERE background_search_pending = TRUE;
+CREATE INDEX idx_memory_activation_expires_at ON memory_activation (expires_at);
 DO $$
 DECLARE
     dim INT;
@@ -5432,8 +5941,6 @@ BEGIN
     );
 END;
 $$;
-
--- View for backward compatibility - reads from heartbeat_state.affective_state
 CREATE OR REPLACE VIEW current_emotional_state AS
 SELECT
     gen_random_uuid() as id,
@@ -5450,8 +5957,6 @@ SELECT
     NULL::uuid as heartbeat_id
 FROM heartbeat_state
 WHERE id = 1;
-
--- Current affective state is stored in heartbeat_state (short-term "working memory").
 CREATE OR REPLACE FUNCTION normalize_affective_state(p_state JSONB)
 RETURNS JSONB AS $$
 DECLARE
@@ -5557,7 +6062,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION get_current_affective_state()
 RETURNS JSONB AS $$
 DECLARE
@@ -5573,7 +6077,6 @@ EXCEPTION
         RETURN '{}'::jsonb;
 END;
 $$ LANGUAGE plpgsql STABLE;
-
 CREATE OR REPLACE FUNCTION set_current_affective_state(p_state JSONB)
 RETURNS VOID AS $$
 DECLARE
@@ -5591,8 +6094,6 @@ BEGIN
     WHERE id = 1;
 END;
 $$ LANGUAGE plpgsql;
-
--- Snapshot of emotional context to attach to new memories.
 CREATE OR REPLACE FUNCTION get_emotional_context_for_memory()
 RETURNS JSONB AS $$
 DECLARE
@@ -5619,8 +6120,6 @@ EXCEPTION
         );
 END;
 $$ LANGUAGE plpgsql STABLE;
-
--- Regulate emotional state (conscious override).
 CREATE OR REPLACE FUNCTION regulate_emotional_state(
     p_regulation_type TEXT,
     p_target_emotion TEXT DEFAULT NULL,
@@ -5687,8 +6186,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Feeling of knowing: estimate whether relevant memories exist.
 CREATE OR REPLACE FUNCTION sense_memory_availability(
     p_query TEXT,
     p_query_embedding vector DEFAULT NULL
@@ -5748,8 +6245,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Request a background search after a failed recall.
 CREATE OR REPLACE FUNCTION request_background_search(
     p_query TEXT,
     p_query_embedding vector DEFAULT NULL
@@ -5780,8 +6275,6 @@ BEGIN
     RETURN activation_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Process pending background searches by boosting activation on matching memories.
 CREATE OR REPLACE FUNCTION process_background_searches(
     p_limit INT DEFAULT 10,
     p_min_age INTERVAL DEFAULT INTERVAL '30 seconds'
@@ -5818,7 +6311,6 @@ BEGIN
     RETURN processed_count;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION decay_activation_boosts(p_decay FLOAT DEFAULT 0.05)
 RETURNS INT AS $$
 DECLARE
@@ -5830,12 +6322,11 @@ BEGIN
         '{activation_boost}',
         to_jsonb(GREATEST(0, COALESCE((metadata->>'activation_boost')::float, 0) - COALESCE(p_decay, 0.05)))
     )
-    WHERE COALESCE((metadata->>'activation_boost')::float, 0) > 0;
+    WHERE (metadata->>'activation_boost')::float > 0;
     GET DIAGNOSTICS updated_count = ROW_COUNT;
     RETURN COALESCE(updated_count, 0);
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION cleanup_memory_activations()
 RETURNS INT AS $$
 DECLARE
@@ -5846,20 +6337,17 @@ BEGIN
     RETURN COALESCE(deleted_count, 0);
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION get_spontaneous_memories(p_limit INT DEFAULT 3)
 RETURNS SETOF memories AS $$
 BEGIN
     RETURN QUERY
     SELECT * FROM memories
     WHERE status = 'active'
-      AND COALESCE((metadata->>'activation_boost')::float, 0) > 0.3
-    ORDER BY COALESCE((metadata->>'activation_boost')::float, 0) DESC
+      AND (metadata->>'activation_boost')::float > 0.3
+    ORDER BY (metadata->>'activation_boost')::float DESC
     LIMIT GREATEST(1, COALESCE(p_limit, 3));
 END;
 $$ LANGUAGE plpgsql;
-
--- Update mood from recent emotional history.
 CREATE OR REPLACE FUNCTION update_mood()
 RETURNS VOID AS $$
 DECLARE
@@ -5902,8 +6390,6 @@ BEGIN
     ));
 END;
 $$ LANGUAGE plpgsql;
-
--- Learn or reinforce an emotional trigger.
 CREATE OR REPLACE FUNCTION learn_emotional_trigger(
     p_trigger_text TEXT,
     p_trigger_embedding vector,
@@ -5972,8 +6458,6 @@ BEGIN
     RETURN trigger_id;
 END;
 $$ LANGUAGE plpgsql;
-
--- Match emotional triggers for a given text.
 CREATE OR REPLACE FUNCTION match_emotional_triggers(
     p_text TEXT,
     p_limit INT DEFAULT 5,
@@ -6016,8 +6500,6 @@ BEGIN
     ), '[]'::jsonb);
 END;
 $$ LANGUAGE plpgsql;
-
--- Seed innate emotional triggers (idempotent).
 CREATE OR REPLACE FUNCTION initialize_innate_emotions()
 RETURNS INT AS $$
 DECLARE
@@ -6050,7 +6532,6 @@ BEGIN
     RETURN inserted_count;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION ensure_emotion_bootstrap()
 RETURNS VOID AS $$
 DECLARE
@@ -6077,8 +6558,6 @@ BEGIN
     PERFORM set_config('emotion.initialized', 'true'::jsonb);
 END;
 $$ LANGUAGE plpgsql;
-
--- Attach emotional context to memories at insert time.
 CREATE OR REPLACE FUNCTION apply_emotional_context_to_memory()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -6156,8 +6635,6 @@ CREATE TRIGGER memories_emotional_context_insert
 BEFORE INSERT ON memories
 FOR EACH ROW
 EXECUTE FUNCTION apply_emotional_context_to_memory();
-
--- Extend gather_turn_context with emotional_state
 CREATE OR REPLACE FUNCTION gather_turn_context()
 RETURNS JSONB AS $$
 DECLARE
@@ -6166,8 +6643,6 @@ DECLARE
     contradictions JSONB;
 BEGIN
     SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
-
-    -- Build action costs object from unified config
     SELECT jsonb_object_agg(
         regexp_replace(key, '^heartbeat\.cost_', ''),
         value
@@ -6190,6 +6665,8 @@ BEGIN
         'contradictions', contradictions,
         'contradictions_count', COALESCE(jsonb_array_length(contradictions), 0),
         'emotional_patterns', get_emotional_patterns_context(5),
+        'active_transformations', get_active_transformations_context(5),
+        'transformations_ready', check_transformation_readiness(),
         'energy', jsonb_build_object(
             'current', state_record.current_energy,
             'max', get_config_float('heartbeat.max_energy')
@@ -6215,8 +6692,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- Update complete_heartbeat to also record an emotional state
 CREATE OR REPLACE FUNCTION complete_heartbeat(
     p_heartbeat_id UUID,
     p_reasoning TEXT,
@@ -6261,10 +6736,6 @@ BEGIN
 
     narrative_text := format('Heartbeat #%s: %s', hb_number, COALESCE(narrative_text, 'No actions taken'));
 
-    -- ---------------------------------------------------------------------
-    -- Affective state update (momentum + events + optional self-report)
-    -- ---------------------------------------------------------------------
-
     SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
     prev_state := COALESCE(state_record.affective_state, '{}'::jsonb);
 
@@ -6290,12 +6761,8 @@ BEGIN
             prev_dominance := NULL;
     END;
     prev_dominance := COALESCE(prev_dominance, 0.5);
-
-    -- Decay toward baseline (neutral valence, mid arousal).
     new_valence := prev_valence * 0.8;
     new_arousal := 0.5 + (prev_arousal - 0.5) * 0.8;
-
-    -- Action-based deltas.
     FOR action_elem IN SELECT * FROM jsonb_array_elements(COALESCE(p_actions_taken, '[]'::jsonb))
     LOOP
         IF (action_elem->'result'->>'error') = 'Boundary triggered' THEN
@@ -6318,8 +6785,6 @@ BEGIN
             new_arousal := new_arousal - 0.2;
         END IF;
     END LOOP;
-
-    -- Goal-change deltas (worker applies goal changes outside the action list).
     FOR goal_elem IN SELECT * FROM jsonb_array_elements(COALESCE(p_goals_modified, '[]'::jsonb))
     LOOP
         goal_change := COALESCE(goal_elem->>'new_priority', goal_elem->>'change', goal_elem->>'priority', '');
@@ -6332,8 +6797,6 @@ BEGIN
             new_arousal := new_arousal - 0.1;
         END IF;
     END LOOP;
-
-    -- Optional LLM self-report: blend into the state (does not get overwritten later).
     assess_valence := NULL;
     assess_arousal := NULL;
     assess_primary := NULL;
@@ -6375,8 +6838,6 @@ BEGIN
     );
 
     intensity := LEAST(1.0, GREATEST(0.0, (ABS(new_valence) * 0.6 + new_arousal * 0.4)));
-
-    -- Persist as short-term state for the next heartbeat.
     UPDATE heartbeat_state SET
         affective_state = normalize_affective_state(
             COALESCE(prev_state, '{}'::jsonb) || jsonb_build_object(
@@ -6390,14 +6851,6 @@ BEGIN
             )
         )
     WHERE id = 1;
-
-    -- Note: record_emotion() call removed in Phase 8 (ReduceScopeCreep)
-    -- Emotional state is now only persisted in heartbeat_state.affective_state
-    -- Historical valence is captured in heartbeat_log.emotional_valence
-
-    -- ---------------------------------------------------------------------
-    -- Memory/log record
-    -- ---------------------------------------------------------------------
 
     mem_importance := LEAST(1.0, GREATEST(0.4, 0.5 + intensity * 0.25));
 
@@ -6425,8 +6878,6 @@ BEGIN
         emotional_primary_emotion = primary_emotion,
         memory_id = memory_id_created
     WHERE id = p_heartbeat_id;
-
-    -- Update next heartbeat time
     UPDATE heartbeat_state SET
         next_heartbeat_at = CURRENT_TIMESTAMP +
             (get_config_float('heartbeat.heartbeat_interval_minutes') || ' minutes')::INTERVAL,
@@ -6436,7 +6887,6 @@ BEGIN
     RETURN memory_id_created;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION finalize_heartbeat(
     p_heartbeat_id UUID,
     p_reasoning TEXT,
@@ -6469,8 +6919,6 @@ BEGIN
     RETURN memory_id_created;
 END;
 $$ LANGUAGE plpgsql;
-
--- emotional_trend view - uses heartbeat_log (emotional_valence + arousal + primary emotion)
 CREATE OR REPLACE VIEW emotional_trend AS
 WITH base AS (
     SELECT
@@ -6506,11 +6954,9 @@ SELECT
 FROM base
 GROUP BY base.hour
 ORDER BY base.hour DESC;
-
 -- ============================================================================
 -- NEIGHBORHOOD RECOMPUTATION
 -- ============================================================================
-
 CREATE OR REPLACE FUNCTION recompute_neighborhood(
     p_memory_id UUID,
     p_neighbor_count INT DEFAULT 20,
@@ -6527,8 +6973,6 @@ BEGIN
     WHERE id = p_memory_id AND status = 'active';
 
     zero_vec := array_fill(0, ARRAY[embedding_dimension()])::vector;
-
-    -- Avoid NaNs from cosine distance when any side is the zero vector.
     IF memory_emb IS NULL OR memory_emb = zero_vec THEN
         RETURN;
     END IF;
@@ -6555,7 +6999,6 @@ BEGIN
         is_stale = FALSE;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION batch_recompute_neighborhoods(
     p_batch_size INT DEFAULT 50
 )
@@ -6578,20 +7021,9 @@ BEGIN
     RETURN recomputed;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
 -- GRAPH ENHANCEMENTS
 -- ============================================================================
-
--- Phase 5 (ReduceScopeCreep): WorldviewNode and sync_worldview_node trigger removed.
--- Worldview data is now stored as memories with type='worldview'.
--- The create_worldview_memory() function creates HAS_BELIEF edges from SelfNode.
-
--- relationship_discoveries table removed in Phase 8 (ReduceScopeCreep)
--- Relationships are now stored only in the graph via create_memory_relationship()
-
--- discover_relationship creates graph edges for discovered relationships
--- Note: relationship_discoveries table removed in Phase 8 (ReduceScopeCreep)
 CREATE OR REPLACE FUNCTION discover_relationship(
     p_from_id UUID,
     p_to_id UUID,
@@ -6621,7 +7053,6 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION link_memory_supports_worldview(
     p_memory_id UUID,
     p_worldview_id UUID,
@@ -6644,7 +7075,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION find_contradictions(p_memory_id UUID DEFAULT NULL)
 RETURNS TABLE (
     memory_a UUID,
@@ -6690,7 +7120,6 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION find_causal_chain(p_memory_id UUID, p_depth INT DEFAULT 3)
 RETURNS TABLE (
     cause_id UUID,
@@ -6730,9 +7159,6 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
--- Find concepts linked to a memory via graph traversal.
--- Phase 2 (ReduceScopeCreep): Now uses graph instead of relational tables.
 CREATE OR REPLACE FUNCTION find_connected_concepts(p_memory_id UUID, p_hops INT DEFAULT 2)
 RETURNS TABLE (
     concept_name TEXT,
@@ -6760,9 +7186,6 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
--- Find memories linked to a concept via graph traversal.
--- Phase 2 (ReduceScopeCreep): Replaces relational query on concepts/memory_concepts.
 CREATE OR REPLACE FUNCTION find_memories_by_concept(
     p_concept_name TEXT,
     p_limit INT DEFAULT 10
@@ -6813,7 +7236,6 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION find_supporting_evidence(p_worldview_id UUID)
 RETURNS TABLE (
     memory_id UUID,
@@ -6851,11 +7273,9 @@ BEGIN
     END;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
 -- REFLECT PIPELINE
 -- ============================================================================
-
 CREATE OR REPLACE FUNCTION process_reflection_result(
     p_heartbeat_id UUID,
     p_result JSONB
@@ -6918,9 +7338,6 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
-
-    -- Phase 5 (ReduceScopeCreep): identity_aspects table removed
-    -- Identity updates now create worldview memories with category='self'
     IF p_result ? 'identity_updates' THEN
         FOR ident IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'identity_updates', '[]'::jsonb))
         LOOP
@@ -6969,19 +7386,16 @@ BEGIN
                 ELSE
                     PERFORM create_worldview_memory(
                         change_text,
-                        'self',  -- category for identity aspects
-                        0.7,     -- confidence
-                        0.5,     -- stability
-                        0.6,     -- importance
+                        'self',
+                        0.7,
+                        0.5,
+                        0.6,
                         'discovered'
                     );
                 END IF;
             END IF;
         END LOOP;
     END IF;
-
-    -- Phase 5 (ReduceScopeCreep): worldview_primitives table removed
-    -- Worldview updates now update memories with type='worldview'
     IF p_result ? 'worldview_updates' THEN
         FOR wupd IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'worldview_updates', '[]'::jsonb))
         LOOP
@@ -6995,9 +7409,6 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
-
-    -- Phase 5 (ReduceScopeCreep): worldview_memory_influences table removed
-    -- Worldview influences now create SUPPORTS/CONTRADICTS edges in graph
     IF p_result ? 'worldview_influences' THEN
         FOR winf IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'worldview_influences', '[]'::jsonb))
         LOOP
@@ -7008,7 +7419,6 @@ BEGIN
                 wtype := COALESCE(NULLIF(winf->>'influence_type', ''), 'evidence');
 
                 IF wid IS NOT NULL AND wmem IS NOT NULL AND wstrength IS NOT NULL THEN
-                    -- Create graph edge from memory to worldview memory
                     IF wstrength > 0 THEN
                         PERFORM create_memory_relationship(
                             wmem, wid, 'SUPPORTS',
@@ -7065,8 +7475,6 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
-
-    -- Self-model updates (stored in graph as Self --[ASSOCIATED {kind}]--> ConceptNode).
     IF p_result ? 'self_updates' THEN
         FOR selfupd IN SELECT * FROM jsonb_array_elements(COALESCE(p_result->'self_updates', '[]'::jsonb))
         LOOP
@@ -7089,11 +7497,9 @@ BEGIN
     END IF;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
--- SUBCONSCIOUS OBSERVATIONS PIPELINE
+-- SUBCONSCIOUS OBSERVATIONS
 -- ============================================================================
-
 CREATE OR REPLACE FUNCTION apply_subconscious_observations(p_payload JSONB)
 RETURNS JSONB AS $$
 DECLARE
@@ -7135,8 +7541,6 @@ BEGIN
     IF p_payload IS NULL OR jsonb_typeof(p_payload) <> 'object' THEN
         RETURN jsonb_build_object('applied', false, 'reason', 'empty');
     END IF;
-
-    -- Narrative observations.
     FOR obs IN SELECT * FROM jsonb_array_elements(COALESCE(p_payload->'narrative_observations', '[]'::jsonb))
     LOOP
         obs_type := lower(COALESCE(obs->>'type', obs->>'kind', ''));
@@ -7235,8 +7639,6 @@ BEGIN
             END IF;
         END IF;
     END LOOP;
-
-    -- Relationship observations.
     FOR obs IN SELECT * FROM jsonb_array_elements(COALESCE(p_payload->'relationship_observations', '[]'::jsonb))
     LOOP
         rel_entity := btrim(COALESCE(obs->>'entity', obs->>'name', ''));
@@ -7359,8 +7761,6 @@ BEGIN
         );
         applied_relationships := applied_relationships + 1;
     END LOOP;
-
-    -- Contradiction observations.
     FOR obs IN SELECT * FROM jsonb_array_elements(COALESCE(p_payload->'contradiction_observations', '[]'::jsonb))
     LOOP
         conf := NULLIF(obs->>'confidence', '')::float;
@@ -7459,8 +7859,6 @@ BEGIN
         UPDATE drives SET current_level = LEAST(1.0, current_level + 0.15) WHERE name = 'coherence';
         applied_contradictions := applied_contradictions + 1;
     END LOOP;
-
-    -- Emotional pattern observations.
     emotional_items := COALESCE(p_payload->'emotional_observations', p_payload->'emotional_patterns', '[]'::jsonb);
     FOR obs IN SELECT * FROM jsonb_array_elements(emotional_items)
     LOOP
@@ -7493,8 +7891,6 @@ BEGIN
         UPDATE drives SET current_level = LEAST(1.0, current_level + 0.1) WHERE name = 'coherence';
         applied_emotional := applied_emotional + 1;
     END LOOP;
-
-    -- Consolidation observations.
     consolidation_items := COALESCE(p_payload->'consolidation_observations', p_payload->'consolidation_suggestions', '[]'::jsonb);
     FOR obs IN SELECT * FROM jsonb_array_elements(consolidation_items)
     LOOP
@@ -7591,7 +7987,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION apply_brainstormed_goals(
     p_heartbeat_id UUID,
     p_goals JSONB
@@ -7671,7 +8066,6 @@ BEGIN
     RETURN jsonb_build_object('created_goal_ids', created_ids);
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION apply_inquiry_result(
     p_heartbeat_id UUID,
     p_payload JSONB
@@ -7746,7 +8140,6 @@ EXCEPTION
         RETURN jsonb_build_object('memory_id', NULL, 'error', SQLERRM);
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION apply_goal_changes(p_changes JSONB)
 RETURNS JSONB AS $$
 DECLARE
@@ -7787,7 +8180,6 @@ BEGIN
     RETURN jsonb_build_object('applied', applied);
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION apply_external_call_result(
     p_call_id UUID,
     p_output JSONB
@@ -7868,7 +8260,6 @@ EXCEPTION
         RETURN jsonb_build_object('error', SQLERRM);
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION execute_heartbeat_action(
     p_heartbeat_id UUID,
     p_action TEXT,
@@ -7888,6 +8279,10 @@ DECLARE
     rel_entity TEXT;
     rel_strength FLOAT;
     rel_evidence UUID;
+    belief_id UUID;
+    evidence_id UUID;
+    action_notes TEXT;
+    action_topic TEXT;
     chapter_name TEXT;
     chapter_summary TEXT;
     chapter_next TEXT;
@@ -7915,8 +8310,6 @@ BEGIN
             'available', current_e
         );
     END IF;
-
-    -- Boundary pre-checks for side-effects (no energy charge on refusal).
     IF p_action IN ('reach_out_public', 'synthesize') THEN
         boundary_content := COALESCE(p_params->>'content', '');
         SELECT COALESCE(jsonb_agg(row_to_json(r)), '[]'::jsonb)
@@ -8006,8 +8399,54 @@ BEGIN
             result := jsonb_build_object('queued', true, 'external_call_id', queued_call_id);
             PERFORM satisfy_drive('coherence', 0.2);
 
+        WHEN 'contemplate', 'meditate', 'study', 'debate_internally' THEN
+            BEGIN
+                belief_id := NULLIF(p_params->>'belief_id', '')::uuid;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    belief_id := NULL;
+            END;
+            BEGIN
+                evidence_id := NULLIF(p_params->>'evidence_memory_id', '')::uuid;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    evidence_id := NULL;
+            END;
+
+            action_notes := COALESCE(p_params->>'notes', '');
+            action_topic := COALESCE(
+                NULLIF(p_params->>'topic', ''),
+                NULLIF(p_params->>'belief', ''),
+                NULLIF(p_params->>'subject', ''),
+                'belief'
+            );
+
+            IF belief_id IS NOT NULL THEN
+                PERFORM record_transformation_effort(
+                    belief_id,
+                    p_action,
+                    action_notes,
+                    evidence_id
+                );
+            END IF;
+
+            PERFORM create_episodic_memory(
+                p_content := format('%s: %s', initcap(replace(p_action, '_', ' ')), action_topic),
+                p_action_taken := jsonb_build_object(
+                    'action', p_action,
+                    'belief_id', belief_id,
+                    'notes', action_notes
+                ),
+                p_context := COALESCE(p_params, '{}'::jsonb) || jsonb_build_object('heartbeat_id', p_heartbeat_id),
+                p_result := jsonb_build_object('belief_id', belief_id),
+                p_emotional_valence := COALESCE((p_params->>'emotional_valence')::float, 0.1),
+                p_importance := COALESCE((p_params->>'importance')::float, 0.4)
+            );
+
+            result := jsonb_build_object('logged', true, 'belief_id', belief_id);
+            PERFORM satisfy_drive('coherence', 0.1);
+
         WHEN 'maintain' THEN
-            -- Phase 5 (ReduceScopeCreep): worldview_id now refers to a worldview memory
             identity_updated := NULL;
             IF (p_params ? 'identity_belief_id') AND (p_params ? 'new_content') THEN
                 identity_updated := update_identity_belief(
@@ -8250,8 +8689,6 @@ BEGIN
             PERFORM satisfy_drive('connection', 0.3);
 
         WHEN 'terminate' THEN
-            -- Self-termination: wipe state and leave a single last-will memory.
-            -- Expect params: { "last_will": "...", "farewells": [ { "message": "...", ... } ], "options": {...} }
             IF COALESCE(p_params->'confirmed', 'false'::jsonb) = 'true'::jsonb THEN
                 result := terminate_agent(
                     COALESCE(NULLIF(p_params->>'last_will', ''), NULLIF(p_params->>'message', ''), NULLIF(p_params->>'reason', ''), ''),
@@ -8291,7 +8728,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION execute_heartbeat_actions_batch(
     p_heartbeat_id UUID,
     p_actions JSONB,
@@ -8377,7 +8813,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
 CREATE OR REPLACE FUNCTION apply_heartbeat_decision(
     p_heartbeat_id UUID,
     p_decision JSONB,
@@ -8490,13 +8925,6 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
-
--- ============================================================================
--- COMMENTS FOR HEARTBEAT SYSTEM
--- ============================================================================
-
--- Phase 6 (ReduceScopeCreep): goals table removed - goals are now memories with type='goal'
--- Phase 7 (ReduceScopeCreep): heartbeat_config table removed - config now in unified config table
 COMMENT ON TABLE heartbeat_state IS 'Singleton table tracking current heartbeat state: energy, counts, timestamps.';
 COMMENT ON TABLE heartbeat_log IS 'Audit log of each heartbeat execution with full context and results.';
 COMMENT ON TABLE external_calls IS 'Queue for LLM and embedding API calls. Worker polls this and writes results back.';
@@ -8508,36 +8936,10 @@ COMMENT ON FUNCTION execute_heartbeat_actions_batch IS 'Execute a batch of heart
 COMMENT ON FUNCTION apply_heartbeat_decision IS 'Apply a heartbeat decision across actions, halting for external calls or termination.';
 COMMENT ON FUNCTION complete_heartbeat IS 'Finalize heartbeat: create episodic memory, update log, set next heartbeat time.';
 COMMENT ON FUNCTION finalize_heartbeat IS 'Finalize heartbeat with goal changes applied and episodic memory recorded.';
-COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision: environment, goals, memories, identity, self_model, worldview, narrative, relationships, contradictions, emotional patterns, energy.';
-
--- ============================================================================
--- PUBLIC VS INTERNAL FUNCTIONS
--- ============================================================================
--- Public API:
---   create_episodic_memory, create_semantic_memory, create_procedural_memory, create_strategic_memory
---   create_worldview_belief, update_identity_belief, create_goal, batch_create_memories
---   fast_recall, gather_turn_context
---   create_memory_relationship, link_memory_to_concept, upsert_self_concept_edge
---   execute_heartbeat_action, check_boundaries, terminate_agent
---   get_config, set_config
---
--- Internal helpers (called by public functions or workers):
---   get_environment_snapshot, get_goals_snapshot, get_recent_context, get_identity_context
---   get_worldview_context, get_self_model_context, get_narrative_context
---   get_relationships_context, get_contradictions_context, get_emotional_patterns_context
---   get_subconscious_context, match_emotional_triggers
---   apply_subconscious_observations, apply_brainstormed_goals, apply_inquiry_result, apply_goal_changes
---   apply_external_call_result
---   execute_heartbeat_actions_batch
---   apply_heartbeat_decision
---   finalize_heartbeat
---   calculate_relevance, age_in_days
-
+COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision: environment, goals, memories, identity, self_model, worldview, narrative, relationships, contradictions, emotional patterns, transformations, energy.';
 -- ============================================================================
 -- TIP OF TONGUE / PARTIAL ACTIVATION
 -- ============================================================================
-
--- Phase 3 (ReduceScopeCreep): Uses graph edges (MEMBER_OF) instead of memory_cluster_members table
 CREATE OR REPLACE FUNCTION find_partial_activations(
     p_query_text TEXT,
     p_cluster_threshold FLOAT DEFAULT 0.7,
@@ -8583,12 +8985,9 @@ BEGIN
         AND MAX(1 - (m.embedding <=> query_embedding)) < p_memory_threshold;
 END;
 $$ LANGUAGE plpgsql;
-
 -- ============================================================================
 -- VIEWS / HEALTH / WORKER GUIDANCE
 -- ============================================================================
-
--- Phase 6 (ReduceScopeCreep): Updated to query memories with type='goal' instead of goals table
 CREATE OR REPLACE VIEW cognitive_health AS
 SELECT
     (SELECT current_energy FROM heartbeat_state WHERE id = 1) as energy,
@@ -8604,7 +9003,6 @@ SELECT
     (SELECT primary_emotion FROM current_emotional_state) as current_emotion,
     (SELECT COUNT(*) FROM heartbeat_log WHERE started_at > CURRENT_TIMESTAMP - INTERVAL '24 hours') as heartbeats_24h,
     (SELECT COUNT(*) FROM external_calls WHERE status = 'pending') as pending_calls,
-    -- Note: relationship_discoveries table removed in Phase 8; relationships are now only in graph
     0::bigint as relationships_discovered_24h;
 
 CREATE OR REPLACE VIEW worker_tasks AS

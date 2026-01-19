@@ -38,7 +38,7 @@ async def test_get_agent_profile_context(db_pool):
         assert profile["initial_message"] == "hello"
 
 
-async def test_record_consent_response_creates_log_and_config(db_pool):
+async def test_record_consent_response_creates_log_and_config(db_pool, ensure_embedding_service):
     payload = {
         "decision": "consent",
         "signature": "unit-test",

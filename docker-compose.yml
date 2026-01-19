@@ -66,10 +66,13 @@ services:
       # Centralized embedding config (also used by DB/worker).
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      HF_HOME: /data
+      HUGGINGFACE_HUB_CACHE: /data
     expose:
       - "80"  # internal-only; reachable from Postgres as http://embeddings:80
     volumes:
-      - embeddings_cache:/data
+      # Bind-mount cache to avoid re-downloading models on every volume reset.
+      - ${EMBEDDINGS_CACHE_DIR:-./.cache/huggingface}:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/health"]
       interval: 30s

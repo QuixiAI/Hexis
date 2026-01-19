@@ -362,6 +362,13 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
                 },
             )
 
+            try:
+                await conn.fetchval("SELECT initialize_personality(NULL)")
+                await conn.fetchval("SELECT initialize_core_values(NULL)")
+                await conn.fetchval("SELECT initialize_worldview(NULL)")
+            except Exception as e:
+                _print_err(f"init warning: worldview bootstrap skipped ({e})")
+
             await _set_config(conn, "agent.is_configured", True)
 
             if enable_autonomy:
