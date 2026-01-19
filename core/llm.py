@@ -122,6 +122,7 @@ async def chat_completion(
     tools: list[dict[str, Any]] | None = None,
     temperature: float = 0.7,
     max_tokens: int = 1200,
+    response_format: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider = normalize_provider(provider)
     endpoint = normalize_endpoint(provider, endpoint)
@@ -139,6 +140,8 @@ async def chat_completion(
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if response_format:
+            payload["response_format"] = response_format
         response = await client.chat.completions.create(**payload)
         message = response.choices[0].message
         content = message.content or ""

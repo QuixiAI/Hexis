@@ -25,9 +25,9 @@ dependencies = [
 ]
 
 [project.scripts]
-hexis = "apps.cli.hexis_cli:main"
-hexis-worker = "apps.workers.worker:main"
-hexis-mcp = "apps.mcp.hexis_mcp_server:main"
+hexis = "apps.hexis_cli:main"
+hexis-worker = "apps.worker:main"
+hexis-mcp = "apps.hexis_mcp_server:main"
 
 [project.optional-dependencies]
 anthropic = [
@@ -51,7 +51,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["apps*", "core*"]
+include = ["apps*", "core*", "services*"]
 
 [tool.setuptools.package-data]
-core = ["prompts/*.md"]
+services = ["prompts/*.md"]

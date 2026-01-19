@@ -18,6 +18,67 @@ LOAD 'age';
 SET search_path = ag_catalog, "$user", public;
 
 DO $$
+DECLARE
+    idx_sql TEXT;
+    idx_statements TEXT[] := ARRAY[
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_id ON memory_graph."MemoryNode" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_memory_id ON memory_graph."MemoryNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"memory_id"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_type ON memory_graph."MemoryNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"type"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_conceptnode_id ON memory_graph."ConceptNode" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_conceptnode_name ON memory_graph."ConceptNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"name"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_selfnode_id ON memory_graph."SelfNode" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_selfnode_key ON memory_graph."SelfNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"key"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_lifechapternode_id ON memory_graph."LifeChapterNode" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_lifechapternode_key ON memory_graph."LifeChapterNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"key"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_goalsroot_id ON memory_graph."GoalsRoot" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_goalsroot_key ON memory_graph."GoalsRoot" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"key"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_goalnode_id ON memory_graph."GoalNode" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_goalnode_goal_id ON memory_graph."GoalNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"goal_id"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_clusternode_id ON memory_graph."ClusterNode" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_clusternode_cluster_id ON memory_graph."ClusterNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"cluster_id"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_episodenode_id ON memory_graph."EpisodeNode" USING BTREE (id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_episodenode_episode_id ON memory_graph."EpisodeNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, '"episode_id"'::ag_catalog.agtype]))$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_in_episode_start ON memory_graph."IN_EPISODE" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_in_episode_end ON memory_graph."IN_EPISODE" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_contradicts_start ON memory_graph."CONTRADICTS" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_contradicts_end ON memory_graph."CONTRADICTS" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_associated_start ON memory_graph."ASSOCIATED" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_associated_end ON memory_graph."ASSOCIATED" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_has_belief_start ON memory_graph."HAS_BELIEF" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_has_belief_end ON memory_graph."HAS_BELIEF" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_supports_start ON memory_graph."SUPPORTS" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_supports_end ON memory_graph."SUPPORTS" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_instance_of_start ON memory_graph."INSTANCE_OF" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_instance_of_end ON memory_graph."INSTANCE_OF" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_parent_of_start ON memory_graph."PARENT_OF" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_parent_of_end ON memory_graph."PARENT_OF" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_member_of_start ON memory_graph."MEMBER_OF" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_member_of_end ON memory_graph."MEMBER_OF" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_relates_start ON memory_graph."CLUSTER_RELATES" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_relates_end ON memory_graph."CLUSTER_RELATES" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_overlaps_start ON memory_graph."CLUSTER_OVERLAPS" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_overlaps_end ON memory_graph."CLUSTER_OVERLAPS" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_similar_start ON memory_graph."CLUSTER_SIMILAR" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_similar_end ON memory_graph."CLUSTER_SIMILAR" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_subgoal_of_start ON memory_graph."SUBGOAL_OF" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_subgoal_of_end ON memory_graph."SUBGOAL_OF" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_originated_from_start ON memory_graph."ORIGINATED_FROM" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_originated_from_end ON memory_graph."ORIGINATED_FROM" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_blocks_start ON memory_graph."BLOCKS" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_blocks_end ON memory_graph."BLOCKS" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_evidence_for_start ON memory_graph."EVIDENCE_FOR" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_evidence_for_end ON memory_graph."EVIDENCE_FOR" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_start ON memory_graph."EPISODE_FOLLOWS" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_end ON memory_graph."EPISODE_FOLLOWS" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_start ON memory_graph."CAUSES" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_end ON memory_graph."CAUSES" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_derived_from_start ON memory_graph."DERIVED_FROM" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_derived_from_end ON memory_graph."DERIVED_FROM" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_temporal_next_start ON memory_graph."TEMPORAL_NEXT" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_temporal_next_end ON memory_graph."TEMPORAL_NEXT" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_contains_start ON memory_graph."CONTAINS" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_contains_end ON memory_graph."CONTAINS" USING BTREE (end_id)$idx$
+    ];
 BEGIN
     BEGIN PERFORM create_graph('memory_graph'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_vlabel('memory_graph', 'MemoryNode'); EXCEPTION WHEN duplicate_object THEN NULL; END;
@@ -52,89 +113,12 @@ BEGIN
     BEGIN PERFORM create_elabel('memory_graph', 'DERIVED_FROM'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_elabel('memory_graph', 'TEMPORAL_NEXT'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_elabel('memory_graph', 'CONTAINS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_id ON memory_graph."MemoryNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_memory_id ON memory_graph."MemoryNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"memory_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_memorynode_type ON memory_graph."MemoryNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"type"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_conceptnode_id ON memory_graph."ConceptNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_conceptnode_name ON memory_graph."ConceptNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"name"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_selfnode_id ON memory_graph."SelfNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_selfnode_key ON memory_graph."SelfNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"key"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_lifechapternode_id ON memory_graph."LifeChapterNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_lifechapternode_key ON memory_graph."LifeChapterNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"key"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalsroot_id ON memory_graph."GoalsRoot" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalsroot_key ON memory_graph."GoalsRoot" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"key"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalnode_id ON memory_graph."GoalNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_goalnode_goal_id ON memory_graph."GoalNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"goal_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_clusternode_id ON memory_graph."ClusterNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_clusternode_cluster_id ON memory_graph."ClusterNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"cluster_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episodenode_id ON memory_graph."EpisodeNode" USING BTREE (id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episodenode_episode_id ON memory_graph."EpisodeNode" USING BTREE (ag_catalog.agtype_access_operator(VARIADIC ARRAY[properties, ''"episode_id"''::ag_catalog.agtype]))'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_in_episode_start ON memory_graph."IN_EPISODE" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_in_episode_end ON memory_graph."IN_EPISODE" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contradicts_start ON memory_graph."CONTRADICTS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contradicts_end ON memory_graph."CONTRADICTS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_associated_start ON memory_graph."ASSOCIATED" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_associated_end ON memory_graph."ASSOCIATED" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_has_belief_start ON memory_graph."HAS_BELIEF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_has_belief_end ON memory_graph."HAS_BELIEF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_supports_start ON memory_graph."SUPPORTS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_supports_end ON memory_graph."SUPPORTS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_instance_of_start ON memory_graph."INSTANCE_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_instance_of_end ON memory_graph."INSTANCE_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_parent_of_start ON memory_graph."PARENT_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_parent_of_end ON memory_graph."PARENT_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_member_of_start ON memory_graph."MEMBER_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_member_of_end ON memory_graph."MEMBER_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_relates_start ON memory_graph."CLUSTER_RELATES" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_relates_end ON memory_graph."CLUSTER_RELATES" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_overlaps_start ON memory_graph."CLUSTER_OVERLAPS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_overlaps_end ON memory_graph."CLUSTER_OVERLAPS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_similar_start ON memory_graph."CLUSTER_SIMILAR" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_cluster_similar_end ON memory_graph."CLUSTER_SIMILAR" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_subgoal_of_start ON memory_graph."SUBGOAL_OF" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_subgoal_of_end ON memory_graph."SUBGOAL_OF" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_originated_from_start ON memory_graph."ORIGINATED_FROM" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_originated_from_end ON memory_graph."ORIGINATED_FROM" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_blocks_start ON memory_graph."BLOCKS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_blocks_end ON memory_graph."BLOCKS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_evidence_for_start ON memory_graph."EVIDENCE_FOR" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_evidence_for_end ON memory_graph."EVIDENCE_FOR" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_start ON memory_graph."EPISODE_FOLLOWS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_end ON memory_graph."EPISODE_FOLLOWS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_start ON memory_graph."CAUSES" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_end ON memory_graph."CAUSES" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_derived_from_start ON memory_graph."DERIVED_FROM" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_derived_from_end ON memory_graph."DERIVED_FROM" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_temporal_next_start ON memory_graph."TEMPORAL_NEXT" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_temporal_next_end ON memory_graph."TEMPORAL_NEXT" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contains_start ON memory_graph."CONTAINS" USING BTREE (start_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
-    BEGIN EXECUTE 'CREATE INDEX IF NOT EXISTS idx_memory_graph_contains_end ON memory_graph."CONTAINS" USING BTREE (end_id)'; EXCEPTION WHEN undefined_table THEN NULL; END;
+    FOREACH idx_sql IN ARRAY idx_statements LOOP
+        BEGIN
+            EXECUTE idx_sql;
+        EXCEPTION WHEN undefined_table THEN NULL;
+        END;
+    END LOOP;
 END;
 $$;
 
@@ -3740,19 +3724,6 @@ ORDER BY mn.computed_at ASC;
 
 COMMENT ON FUNCTION fast_recall IS 'Primary retrieval function combining vector similarity, precomputed associations, and temporal context. Hot path - optimized for speed.';
 
-COMMENT ON FUNCTION create_memory IS 'Creates a base memory record and corresponding graph node. Embedding is fetched and cached via get_embedding.';
-
-COMMENT ON FUNCTION create_memory_relationship IS 'Creates a typed edge between two memories in the graph. Used for causal chains, contradictions, etc.';
-
-COMMENT ON FUNCTION link_memory_to_concept IS 'Links a memory to an abstract concept, creating the concept if needed. Updates both relational and graph layers.';
-
-COMMENT ON TABLE memory_neighborhoods IS 'Precomputed associative neighborhoods for each memory. Replaces live spreading activation for performance. Updated by background worker.';
-
-COMMENT ON TABLE episodes IS 'Temporal segmentation of memories into coherent episodes. Auto-populated by trigger on memory insert.';
-
-COMMENT ON TABLE activation_cache IS 'UNLOGGED table for transient activation state during reasoning. Lost on crash, which is acceptable.';
-
-COMMENT ON VIEW stale_neighborhoods IS 'Shows memories whose neighborhood cache needs recomputation. Used by background worker.';
 
 -- ============================================================================
 -- HEARTBEAT SYSTEM
@@ -3807,6 +3778,7 @@ BEGIN
             'reach_out_user',
             'inquire_deep',
             'reach_out_public',
+            'pause_heartbeat',
             'terminate',
             'rest'
         );
@@ -3828,6 +3800,21 @@ BEGIN
         );
     EXCEPTION WHEN duplicate_object THEN NULL;
     END;
+END;
+$$;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'heartbeat_action') THEN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_type t
+            JOIN pg_enum e ON t.oid = e.enumtypid
+            WHERE t.typname = 'heartbeat_action'
+              AND e.enumlabel = 'pause_heartbeat'
+        ) THEN
+            ALTER TYPE heartbeat_action ADD VALUE 'pause_heartbeat';
+        END IF;
+    END IF;
 END;
 $$;
 
@@ -3929,6 +3916,7 @@ INSERT INTO config (key, value, description) VALUES
     ('heartbeat.cost_reach_out_user', '5'::jsonb, 'Message the user'),
     ('heartbeat.cost_reach_out_public', '7'::jsonb, 'Public outreach'),
     ('heartbeat.cost_synthesize', '3'::jsonb, 'Generate artifact, form conclusion'),
+    ('heartbeat.cost_pause_heartbeat', '0'::jsonb, 'Pause heartbeat cycle (temporary)'),
     ('heartbeat.cost_rest', '0'::jsonb, 'Bank remaining energy'),
     ('heartbeat.cost_terminate', '0'::jsonb, 'Terminate agent')
 ON CONFLICT (key) DO NOTHING;
@@ -4358,6 +4346,8 @@ INSERT INTO heartbeat_state (id, current_energy) VALUES (1, 10);
 CREATE TABLE maintenance_state (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     last_maintenance_at TIMESTAMPTZ,
+    last_subconscious_run_at TIMESTAMPTZ,
+    last_subconscious_heartbeat INTEGER,
     is_paused BOOLEAN DEFAULT FALSE,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
@@ -4464,6 +4454,47 @@ BEGIN
     RETURN new_e;
 END;
 $$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION pause_heartbeat(
+    p_reason TEXT,
+    p_context JSONB DEFAULT '{}'::jsonb,
+    p_heartbeat_id UUID DEFAULT NULL
+)
+RETURNS JSONB AS $$
+DECLARE
+    pause_reason TEXT;
+    paused_at TIMESTAMPTZ := CURRENT_TIMESTAMP;
+    outbox_id UUID;
+    ctx JSONB;
+BEGIN
+    pause_reason := NULLIF(p_reason, '');
+    IF pause_reason IS NULL THEN
+        RAISE EXCEPTION 'pause_heartbeat requires a non-empty reason';
+    END IF;
+
+    UPDATE heartbeat_state
+    SET is_paused = TRUE,
+        updated_at = paused_at
+    WHERE id = 1;
+
+    ctx := jsonb_build_object(
+        'paused_at', paused_at,
+        'heartbeat_id', CASE WHEN p_heartbeat_id IS NULL THEN NULL ELSE p_heartbeat_id::text END,
+        'reason', pause_reason,
+        'context', COALESCE(p_context, '{}'::jsonb)
+    );
+
+    outbox_id := queue_user_message(
+        pause_reason,
+        'heartbeat_paused',
+        ctx
+    );
+
+    RETURN jsonb_build_object(
+        'paused', true,
+        'outbox_id', outbox_id
+    );
+END;
+$$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION should_run_heartbeat()
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -4516,6 +4547,79 @@ BEGIN
     END IF;
 
     RETURN CURRENT_TIMESTAMP >= state_record.last_maintenance_at + (interval_seconds || ' seconds')::INTERVAL;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION run_maintenance_if_due(p_params JSONB DEFAULT '{}'::jsonb)
+RETURNS JSONB AS $$
+DECLARE
+    should_run BOOLEAN;
+    result JSONB;
+BEGIN
+    should_run := should_run_maintenance();
+    IF NOT should_run THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'not_due');
+    END IF;
+    result := run_subconscious_maintenance(p_params);
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION should_run_subconscious_decider()
+RETURNS BOOLEAN AS $$
+DECLARE
+    enabled_raw TEXT;
+    enabled BOOLEAN;
+    interval_seconds FLOAT;
+    paused BOOLEAN;
+    last_run TIMESTAMPTZ;
+    last_hb INT;
+    hb_count INT;
+BEGIN
+    IF is_agent_terminated() THEN
+        RETURN FALSE;
+    END IF;
+    IF get_agent_consent_status() IS DISTINCT FROM 'consent' THEN
+        RETURN FALSE;
+    END IF;
+
+    enabled_raw := NULLIF(get_config_text('maintenance.subconscious_enabled'), '');
+    enabled := COALESCE(enabled_raw::boolean, FALSE);
+    IF NOT enabled THEN
+        RETURN FALSE;
+    END IF;
+
+    interval_seconds := COALESCE(get_config_float('maintenance.subconscious_interval_seconds'), 300);
+
+    SELECT is_paused, last_subconscious_run_at, last_subconscious_heartbeat
+    INTO paused, last_run, last_hb
+    FROM maintenance_state
+    WHERE id = 1;
+    IF paused THEN
+        RETURN FALSE;
+    END IF;
+
+    SELECT heartbeat_count INTO hb_count FROM heartbeat_state WHERE id = 1;
+    IF hb_count IS NOT NULL AND (last_hb IS NULL OR hb_count > last_hb) THEN
+        RETURN TRUE;
+    END IF;
+
+    IF interval_seconds IS NOT NULL AND interval_seconds > 0 THEN
+        IF last_run IS NULL THEN
+            RETURN TRUE;
+        END IF;
+        RETURN CURRENT_TIMESTAMP >= last_run + (interval_seconds || ' seconds')::INTERVAL;
+    END IF;
+
+    RETURN FALSE;
+END;
+$$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION mark_subconscious_decider_run()
+RETURNS VOID AS $$
+BEGIN
+    UPDATE maintenance_state
+    SET last_subconscious_run_at = CURRENT_TIMESTAMP,
+        last_subconscious_heartbeat = (SELECT heartbeat_count FROM heartbeat_state WHERE id = 1),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
 END;
 $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION run_subconscious_maintenance(p_params JSONB DEFAULT '{}'::jsonb)
@@ -8292,6 +8396,7 @@ DECLARE
     contra_b UUID;
     resolution_text TEXT;
     identity_updated BOOLEAN;
+    pause_reason TEXT;
 BEGIN
     BEGIN
         action_kind := p_action::heartbeat_action;
@@ -8689,6 +8794,17 @@ BEGIN
             result := jsonb_build_object('queued', true, 'outbox_id', outbox_id, 'boundaries', boundary_hits);
             PERFORM satisfy_drive('connection', 0.3);
 
+        WHEN 'pause_heartbeat' THEN
+            pause_reason := COALESCE(
+                NULLIF(p_params->>'reason', ''),
+                NULLIF(p_params->>'details', ''),
+                NULLIF(p_params->>'message', '')
+            );
+            IF pause_reason IS NULL THEN
+                RETURN jsonb_build_object('success', false, 'error', 'pause_heartbeat requires a reason');
+            END IF;
+            result := pause_heartbeat(pause_reason, p_params, p_heartbeat_id);
+
         WHEN 'terminate' THEN
             IF COALESCE(p_params->'confirmed', 'false'::jsonb) = 'true'::jsonb THEN
                 result := terminate_agent(
@@ -8803,6 +8919,15 @@ BEGIN
                 'actions_taken', actions_taken,
                 'next_index', next_index,
                 'halt_reason', 'terminated'
+            );
+        END IF;
+
+        IF action_name = 'pause_heartbeat'
+            AND COALESCE((action_result#>>'{result,paused}')::boolean, FALSE) THEN
+            RETURN jsonb_build_object(
+                'actions_taken', actions_taken,
+                'next_index', next_index,
+                'halt_reason', 'paused'
             );
         END IF;
     END LOOP;
@@ -8930,13 +9055,7 @@ COMMENT ON TABLE heartbeat_state IS 'Singleton table tracking current heartbeat 
 COMMENT ON TABLE heartbeat_log IS 'Audit log of each heartbeat execution with full context and results.';
 COMMENT ON TABLE external_calls IS 'Queue for LLM and embedding API calls. Worker polls this and writes results back.';
 
-COMMENT ON FUNCTION should_run_heartbeat IS 'Check if heartbeat interval has elapsed and system is not paused.';
-COMMENT ON FUNCTION start_heartbeat IS 'Initialize heartbeat: regenerate energy, gather context, queue think request.';
 COMMENT ON FUNCTION execute_heartbeat_action IS 'Execute a single action, deducting energy and returning results.';
-COMMENT ON FUNCTION execute_heartbeat_actions_batch IS 'Execute a batch of heartbeat actions, halting on queued external calls or failure.';
-COMMENT ON FUNCTION apply_heartbeat_decision IS 'Apply a heartbeat decision across actions, halting for external calls or termination.';
-COMMENT ON FUNCTION complete_heartbeat IS 'Finalize heartbeat: create episodic memory, update log, set next heartbeat time.';
-COMMENT ON FUNCTION finalize_heartbeat IS 'Finalize heartbeat with goal changes applied and episodic memory recorded.';
 COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision: environment, goals, memories, identity, self_model, worldview, narrative, relationships, contradictions, emotional patterns, transformations, energy.';
 -- ============================================================================
 -- TIP OF TONGUE / PARTIAL ACTIVATION
@@ -9027,44 +9146,4 @@ SELECT
     (SELECT COUNT(*) FROM outbox_messages WHERE status = 'pending'),
     'Deliver pending messages';
 
-COMMENT ON TABLE external_calls IS
-'Queue for external calls. Worker processes pending calls and writes results.
-
-Expected response formats by kind:
-
-heartbeat_decision:
-{
-  "reasoning": "Internal monologue explaining thought process",
-  "actions": [
-    {"action": "recall", "params": {"query": "..."}},
-    {"action": "reflect", "params": {}},
-    {"action": "rest", "params": {}}
-  ],
-  "emotional_assessment": {"valence": 0.2, "arousal": 0.4, "primary_emotion": "curious"}
-}
-
-brainstorm_goals:
-{
-  "goals": [
-    {"title": "...", "description": "...", "source": "curiosity", "priority": "queued"}
-  ]
-}
-
-inquire:
-{
-  "summary": "Summary of research",
-  "sources": ["url1", "url2"],
-  "confidence": 0.8
-}
-
-reflect:
-{
-  "insights": [...],
-  "identity_updates": [...],
-  "worldview_updates": [...],
-  "worldview_influences": [...],
-  "discovered_relationships": [...],
-  "contradictions_noted": [...],
-  "self_updates": [{"kind": "values", "concept": "honesty", "strength": 0.8, "evidence_memory_id": null}]
-}';
 SET check_function_bodies = on;

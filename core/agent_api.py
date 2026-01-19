@@ -18,6 +18,12 @@ def db_dsn_from_env() -> str:
     return f"postgresql://{user}:{password}@{host}:{port}/{database}"
 
 
+def _resolve_wait_seconds(wait_seconds: int | None) -> int:
+    if wait_seconds is None:
+        return int(os.getenv("POSTGRES_WAIT_SECONDS", "30"))
+    return int(wait_seconds)
+
+
 async def _connect_with_retry(dsn: str, *, wait_seconds: int = 30) -> asyncpg.Connection:
     deadline = time.monotonic() + wait_seconds
     last_err: Exception | None = None
@@ -50,13 +56,13 @@ async def get_agent_status(dsn: str | None = None) -> dict[str, Any]:
         await conn.close()
 
 
-async def get_init_defaults(dsn: str | None = None) -> dict[str, Any]:
+async def get_init_defaults(dsn: str | None = None, wait_seconds: int | None = None) -> dict[str, Any]:
     """Get default configuration values from unified config table.
 
     Phase 7 (ReduceScopeCreep): Uses unified config table instead of legacy heartbeat_config/maintenance_config.
     """
     dsn = dsn or db_dsn_from_env()
-    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    conn = await _connect_with_retry(dsn, wait_seconds=_resolve_wait_seconds(wait_seconds))
     try:
         # Phase 7: Use unified config table with namespaced keys
         rows = await conn.fetch(
@@ -87,7 +93,38 @@ async def get_init_defaults(dsn: str | None = None) -> dict[str, Any]:
             "base_regeneration": get_float("heartbeat.base_regeneration", 10),
             "max_active_goals": int(get_float("heartbeat.max_active_goals", 3)),
             "maintenance_interval_seconds": int(get_float("maintenance.maintenance_interval_seconds", 60)),
+            "subconscious_interval_seconds": int(get_float("maintenance.subconscious_interval_seconds", 300)),
         }
+    finally:
+        await conn.close()
+
+
+async def ensure_schema_has_config(dsn: str | None = None, wait_seconds: int | None = None) -> None:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=_resolve_wait_seconds(wait_seconds))
+    try:
+        ok = await conn.fetchval("SELECT to_regclass('public.config') IS NOT NULL")
+        if not ok:
+            raise RuntimeError(
+                "Database schema is missing `config` table. "
+                "If you just updated `db/schema.sql`, reset the DB volume and retry: "
+                "`docker compose down -v && docker compose up -d`."
+            )
+    finally:
+        await conn.close()
+
+
+async def bootstrap_identity(dsn: str | None = None, wait_seconds: int | None = None) -> str | None:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=_resolve_wait_seconds(wait_seconds))
+    try:
+        try:
+            await conn.fetchval("SELECT initialize_personality(NULL)")
+            await conn.fetchval("SELECT initialize_core_values(NULL)")
+            await conn.fetchval("SELECT initialize_worldview(NULL)")
+        except Exception as exc:
+            return str(exc)
+        return None
     finally:
         await conn.close()
 
@@ -132,6 +169,7 @@ async def get_agent_profile_context(dsn: str | None = None) -> dict[str, Any]:
 async def apply_agent_config(
     *,
     dsn: str | None = None,
+    wait_seconds: int | None = None,
     heartbeat_interval_minutes: int,
     maintenance_interval_seconds: int,
     subconscious_interval_seconds: int | None = None,
@@ -153,7 +191,7 @@ async def apply_agent_config(
     mark_configured: bool,
 ) -> None:
     dsn = dsn or db_dsn_from_env()
-    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    conn = await _connect_with_retry(dsn, wait_seconds=_resolve_wait_seconds(wait_seconds))
     try:
         async with conn.transaction():
             # Phase 7 (ReduceScopeCreep): Use unified config table with namespaced keys

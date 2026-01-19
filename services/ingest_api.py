@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
-from core.ingest import Config, IngestionPipeline
+from services.ingest import Config, IngestionPipeline
 from core.llm import normalize_llm_config
 
 _INGESTION_CANCEL: dict[str, threading.Event] = {}

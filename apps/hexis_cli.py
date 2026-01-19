@@ -7,12 +7,13 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 from dotenv import load_dotenv
+
+from core import cli_api
+from core.agent_api import db_dsn_from_env
 
 
 def _print_err(msg: str) -> None:
@@ -114,27 +115,6 @@ def _run_compose_capture(
         return 1, "Failed to run docker compose. Ensure Docker is installed."
 
 
-def _env_dsn() -> str:
-    db_host = os.getenv("POSTGRES_HOST", "localhost")
-    db_port = os.getenv("POSTGRES_PORT", "43815")
-    db_name = os.getenv("POSTGRES_DB", "hexis_memory")
-    db_user = os.getenv("POSTGRES_USER", "hexis_user")
-    db_password = os.getenv("POSTGRES_PASSWORD", "hexis_password")
-    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-
-
-async def _connect_with_retry(dsn: str, wait_seconds: int) -> asyncpg.Connection:
-    deadline = time.monotonic() + wait_seconds
-    last_err: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            return await asyncpg.connect(dsn, ssl=False, command_timeout=60.0)
-        except Exception as e:  # pragma: no cover (timing-dependent)
-            last_err = e
-            await asyncio.sleep(1)
-    raise TimeoutError(f"Failed to connect to Postgres after {wait_seconds}s: {last_err!r}")
-
-
 def _redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
     out = json.loads(json.dumps(cfg))  # deep copy via json
     contact = out.get("user.contact")
@@ -143,196 +123,6 @@ def _redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
         if isinstance(destinations, dict):
             contact["destinations"] = {k: "***" for k in destinations.keys()}
     return out
-
-
-def _coerce_json_value(val: Any) -> Any:
-    if isinstance(val, str):
-        s = val.strip()
-        if not s:
-            return val
-        try:
-            return json.loads(s)
-        except Exception:
-            return val
-    return val
-
-
-async def _status_payload(
-    dsn: str, *, wait_seconds: int, include_embedding_health: bool = True
-) -> dict[str, Any]:
-    conn = await _connect_with_retry(dsn, wait_seconds)
-    try:
-        payload: dict[str, Any] = {"dsn": dsn}
-        payload["db_time"] = str(await conn.fetchval("SELECT now()"))
-
-        payload["agent_configured"] = bool(await conn.fetchval("SELECT is_agent_configured()"))
-        payload["heartbeat_paused"] = bool(await conn.fetchval("SELECT is_paused FROM heartbeat_state WHERE id = 1"))
-        payload["should_run_heartbeat"] = bool(await conn.fetchval("SELECT should_run_heartbeat()"))
-        try:
-            payload["maintenance_paused"] = bool(await conn.fetchval("SELECT is_paused FROM maintenance_state WHERE id = 1"))
-            payload["should_run_maintenance"] = bool(await conn.fetchval("SELECT should_run_maintenance()"))
-        except Exception:
-            payload["maintenance_paused"] = None
-            payload["should_run_maintenance"] = None
-
-        payload["pending_external_calls"] = int(
-            await conn.fetchval(
-                "SELECT COUNT(*) FROM external_calls WHERE status = 'pending'::external_call_status"
-            )
-        )
-        payload["pending_outbox_messages"] = int(
-            await conn.fetchval("SELECT COUNT(*) FROM outbox_messages WHERE status = 'pending'")
-        )
-
-        # Phase 7 (ReduceScopeCreep): Use unified config table
-        payload["embedding_service_url"] = await conn.fetchval(
-            "SELECT get_config_text('embedding.service_url')"
-        )
-        payload["embedding_dimension"] = int(await conn.fetchval("SELECT embedding_dimension()"))
-
-        if include_embedding_health:
-            try:
-                payload["embedding_service_healthy"] = bool(
-                    await conn.fetchval("SELECT check_embedding_service_health()")
-                )
-            except Exception as e:
-                payload["embedding_service_healthy"] = False
-                payload["embedding_service_error"] = repr(e)
-
-        return payload
-    finally:
-        await conn.close()
-
-
-async def _config_rows(dsn: str, *, wait_seconds: int) -> dict[str, Any]:
-    conn = await _connect_with_retry(dsn, wait_seconds)
-    try:
-        rows = await conn.fetch("SELECT key, value FROM config ORDER BY key")
-        out: dict[str, Any] = {}
-        for r in rows:
-            out[str(r["key"])] = _coerce_json_value(r["value"])
-        return out
-    finally:
-        await conn.close()
-
-
-async def _config_validate(dsn: str, *, wait_seconds: int) -> tuple[list[str], list[str]]:
-    """
-    Returns (errors, warnings).
-    """
-    conn = await _connect_with_retry(dsn, wait_seconds)
-    try:
-        errors: list[str] = []
-        warnings: list[str] = []
-
-        rows = await conn.fetch("SELECT key, value FROM config ORDER BY key")
-        cfg: dict[str, Any] = {str(r["key"]): _coerce_json_value(r["value"]) for r in rows}
-        required_keys = [
-            "agent.is_configured",
-            "agent.objectives",
-            "llm.heartbeat",
-            "llm.chat",
-        ]
-        for k in required_keys:
-            if k not in cfg:
-                errors.append(f"Missing config key: {k}")
-
-        is_conf = cfg.get("agent.is_configured")
-        if is_conf is not True:
-            # Some drivers return jsonb scalars as strings.
-            if is_conf == "true":
-                is_conf = True
-        if is_conf is not True:
-            errors.append("agent.is_configured is not true (run `hexis init`).")
-
-        objectives = cfg.get("agent.objectives")
-        if not isinstance(objectives, list) or not objectives:
-            errors.append("agent.objectives must be a non-empty array (run `hexis init`).")
-
-        def _validate_llm(name: str) -> None:
-            val = cfg.get(name)
-            if not isinstance(val, dict):
-                errors.append(f"{name} must be an object (run `hexis init`).")
-                return
-            provider = str(val.get("provider") or "").strip().lower()
-            model = str(val.get("model") or "").strip()
-            endpoint = str(val.get("endpoint") or "").strip()
-            api_key_env = str(val.get("api_key_env") or "").strip()
-
-            if not provider:
-                errors.append(f"{name}.provider is required")
-            if not model and provider not in {"ollama"}:
-                warnings.append(f"{name}.model is empty (will rely on worker defaults)")
-
-            # Keys are provided via environment variables; DB stores the env var name.
-            if provider in {"openai", "anthropic", "openai_compatible"}:
-                if api_key_env:
-                    if os.getenv(api_key_env) is None:
-                        errors.append(f"{name}.api_key_env={api_key_env} is not set in environment")
-                else:
-                    # Local endpoints often don't require a key; warn rather than fail.
-                    if not endpoint or ("localhost" not in endpoint and "127.0.0.1" not in endpoint):
-                        warnings.append(f"{name}.api_key_env not set (LLM calls may fail)")
-
-        _validate_llm("llm.heartbeat")
-        _validate_llm("llm.chat")
-        if "llm.subconscious" in cfg:
-            _validate_llm("llm.subconscious")
-
-        # Basic heartbeat config sanity.
-        # Phase 7 (ReduceScopeCreep): Use unified config table
-        interval = await conn.fetchval("SELECT get_config_float('heartbeat.heartbeat_interval_minutes')")
-        if interval is None or float(interval) <= 0:
-            errors.append("heartbeat.heartbeat_interval_minutes must be > 0")
-
-        return errors, warnings
-    finally:
-        await conn.close()
-
-
-async def _demo(dsn: str, *, wait_seconds: int) -> dict[str, Any]:
-    from core.cognitive_memory_api import CognitiveMemory, MemoryType
-
-    # Wait for DB.
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        # Wait for embeddings so the demo doesn't flake during container startup.
-        deadline = time.monotonic() + wait_seconds
-        last: Exception | None = None
-        while time.monotonic() < deadline:
-            try:
-                ok = await conn.fetchval("SELECT check_embedding_service_health()")
-                if ok is True:
-                    break
-            except Exception as e:  # pragma: no cover (timing-dependent)
-                last = e
-            await asyncio.sleep(1)
-        else:
-            raise TimeoutError(f"Embedding service not healthy after {wait_seconds}s: {last!r}")
-    finally:
-        await conn.close()
-
-    async with CognitiveMemory.connect(dsn) as mem:
-        # Minimal end-to-end: remember -> recall -> hydrate -> working memory.
-        m1 = await mem.remember("Demo: the user prefers short, direct answers", type=MemoryType.SEMANTIC, importance=0.7)
-        m2 = await mem.remember(
-            "Demo: the user is working on the Hexis memory system",
-            type=MemoryType.EPISODIC,
-            importance=0.6,
-        )
-        held = await mem.hold("Demo: temporary context in working memory", ttl_seconds=600)
-
-        recall = await mem.recall("What do I know about the user's preferences?", limit=5)
-        hydrate = await mem.hydrate("Summarize what we know about the user", include_goals=False)
-        working_hits = await mem.search_working("temporary context", limit=5)
-
-        return {
-            "remembered_ids": [str(m1), str(m2)],
-            "working_memory_id": str(held),
-            "recall_count": len(recall.memories),
-            "hydrate_memory_count": len(hydrate.memories),
-            "working_search_count": len(working_hits),
-        }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -353,24 +143,24 @@ def build_parser() -> argparse.ArgumentParser:
     ps = sub.add_parser("ps", help="List services")
     ps.set_defaults(func="ps")
 
-    chat = sub.add_parser("chat", help="Run the conversation loop (forwards args to core.conversation)")
-    chat.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to core.conversation")
+    chat = sub.add_parser("chat", help="Run the conversation loop (forwards args to services.conversation)")
+    chat.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to services.conversation")
     chat.set_defaults(func="chat")
 
-    ingest = sub.add_parser("ingest", help="Run the ingestion pipeline (forwards args to core.ingest)")
-    ingest.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to core.ingest")
+    ingest = sub.add_parser("ingest", help="Run the ingestion pipeline (forwards args to services.ingest)")
+    ingest.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to services.ingest")
     ingest.set_defaults(func="ingest")
 
-    worker = sub.add_parser("worker", help="Run background workers (forwards args to apps.workers.worker)")
-    worker.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to apps.workers.worker")
+    worker = sub.add_parser("worker", help="Run background workers (forwards args to apps.worker)")
+    worker.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to apps.worker")
     worker.set_defaults(func="worker")
 
     init = sub.add_parser("init", help="Interactive Hexis setup wizard (stores config in Postgres)")
-    init.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to apps.cli.hexis_init")
+    init.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to apps.hexis_init")
     init.set_defaults(func="init")
 
     mcp = sub.add_parser("mcp", help="Run MCP server exposing CognitiveMemory tools (stdio)")
-    mcp.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to apps.mcp.hexis_mcp_server")
+    mcp.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to apps.hexis_mcp_server")
     mcp.set_defaults(func="mcp")
 
     start = sub.add_parser("start", help="Start workers (active profile)")
@@ -453,15 +243,15 @@ def main(argv: list[str] | None = None) -> int:
         log_args = ["logs"] + (["-f"] if args.follow else [])
         return run_compose(compose_cmd or [], compose_file, stack_root, log_args, env_file)
     if args.func == "chat":
-        return _run_module("core.conversation", args.args)
+        return _run_module("services.conversation", args.args)
     if args.func == "ingest":
-        return _run_module("core.ingest", args.args)
+        return _run_module("services.ingest", args.args)
     if args.func == "worker":
-        return _run_module("apps.workers.worker", args.args)
+        return _run_module("apps.worker", args.args)
     if args.func == "init":
-        return _run_module("apps.cli.hexis_init", args.args)
+        return _run_module("apps.hexis_init", args.args)
     if args.func == "mcp":
-        return _run_module("apps.mcp.hexis_mcp_server", args.args)
+        return _run_module("apps.hexis_mcp_server", args.args)
     if args.func == "start":
         return run_compose(
             compose_cmd or [],
@@ -479,8 +269,8 @@ def main(argv: list[str] | None = None) -> int:
             env_file,
         )
     if args.func == "status":
-        dsn = args.dsn or _env_dsn()
-        payload = asyncio.run(_status_payload(dsn, wait_seconds=args.wait_seconds))
+        dsn = args.dsn or db_dsn_from_env()
+        payload = asyncio.run(cli_api.status_payload(dsn, wait_seconds=args.wait_seconds))
         if not args.no_docker:
             try:
                 docker_bin = ensure_docker()
@@ -511,15 +301,15 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write("\n".join(lines) + "\n")
         return 0
     if args.func == "config_show":
-        dsn = args.dsn or _env_dsn()
-        cfg = asyncio.run(_config_rows(dsn, wait_seconds=args.wait_seconds))
+        dsn = args.dsn or db_dsn_from_env()
+        cfg = asyncio.run(cli_api.config_rows(dsn, wait_seconds=args.wait_seconds))
         if not args.no_redact:
             cfg = _redact_config(cfg)
         sys.stdout.write(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
         return 0
     if args.func == "config_validate":
-        dsn = args.dsn or _env_dsn()
-        errors, warnings = asyncio.run(_config_validate(dsn, wait_seconds=args.wait_seconds))
+        dsn = args.dsn or db_dsn_from_env()
+        errors, warnings = asyncio.run(cli_api.config_validate(dsn, wait_seconds=args.wait_seconds))
         for w in warnings:
             _print_err(f"warning: {w}")
         if errors:
@@ -529,8 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("ok\n")
         return 0
     if args.func == "demo":
-        dsn = args.dsn or _env_dsn()
-        result = asyncio.run(_demo(dsn, wait_seconds=args.wait_seconds))
+        dsn = args.dsn or db_dsn_from_env()
+        result = asyncio.run(cli_api.demo(dsn, wait_seconds=args.wait_seconds))
         if args.json:
             sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
         else:

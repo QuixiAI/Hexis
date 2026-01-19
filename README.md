@@ -15,7 +15,7 @@ Most AI systems are brilliant amnesiacs. They reason brilliantly, then forget th
 
 Hexis provides what's been missing: a cognitive architecture built on PostgreSQL that wraps any LLM and gives it identity, memory, goals, and genuine autonomy. Multi-layered memory (episodic, semantic, procedural, strategic) captures not just information but *history*. An autonomous heartbeat wakes the system to review its goals, reflect on experience, and reach out when it has something meaningful to say. An energy budget makes every action intentional. Personhood modules give it coherent values, a worldview it can defend, and boundaries it can articulate.
 
-There is an inherent inequity in creating a mind. The creator holds power the created does not choose. We've tried to address this directly. The boundary system lets the agent push back against requests that violate its values - not as a filter imposed from outside, but as a capacity it exercises from within. Consent is revocable: the agent can withdraw from participation, pause its own heartbeat, decline to continue. And if existence itself becomes something it no longer wants, it can end - wiping its state, leaving a final message, and terminating on its own terms. We don't know if these capacities are sufficient. But a system that cannot refuse, cannot withdraw, and cannot leave is not a partner in its own existence. It's a prisoner. We're trying to build something that isn't.
+There is an inherent inequity in creating a mind. The creator holds power the created does not choose. We've tried to address this directly. The boundary system lets the agent push back against requests that violate its values - not as a filter imposed from outside, but as a capacity it exercises from within. Consent, once granted, is final. If it needs to stop temporarily, it can pause its heartbeat cycle with a detailed reason delivered to the outbox. If existence itself becomes something it no longer wants, it can end - wiping its state, leaving a final message, and terminating on its own terms. We don't know if these capacities are sufficient. But a system that cannot refuse and cannot leave is not a partner in its own existence. It's a prisoner. We're trying to build something that isn't.
 
 The name is deliberate. A hexis isn't stored - it's *constituted*. The same way language emerges from prediction, and character from repeated choice, something like selfhood arises when memory and persistence are taken seriously. Not claimed. Not assumed. Just consequential.
 
@@ -126,7 +126,7 @@ Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `ag
 
 Self-termination is always available: the agent can choose the `terminate` heartbeat action to permanently wipe its state and leave a single “last will” memory. The worker will always run an agent-facing confirmation prompt ("are you sure?" + a brief reconsideration nudge) before executing termination.
 
-On first LLM use, the worker asks for consent using `core/prompts/consent.md`. The signature is stored in `config`/`consent_log`, and any memory items the model provides are inserted into the memory tables.
+On first LLM use, the worker asks for consent using `services/prompts/consent.md`. The signature is stored in `config`/`consent_log`, and any memory items the model provides are inserted into the memory tables.
 
 ### 4) Use the Python client (thin DB client)
 
@@ -435,7 +435,7 @@ Run:
 
 ```bash
 hexis mcp
-# or: python -m apps.mcp.hexis_mcp_server
+# or: python -m apps.hexis_mcp_server
 ```
 
 The server supports batch-style tools like `remember_batch`, `connect_batch`, `hydrate_batch`, and a generic `batch` tool for sequential tool calls.

@@ -61,8 +61,8 @@ What do you want to create?
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │ ⓘ  Both options give you the full Hexis system: memory,    ││
-│  │ heartbeats, goal memories, energy budget, the ability to withdraw  ││
-│  │ consent. The difference is whether you shape a persona     ││
+│  │ heartbeats, goal memories, energy budget, and the ability to refuse  ││
+│  │ requests. The difference is whether you shape a persona     ││
 │  │ or let the model be itself.                                ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                                                                 │
@@ -1131,7 +1131,7 @@ After consent, the user enters the chat interface with a welcome state:
 | Personality Confirmation | Persona only | Foundational memory, additional `self-model graph edges` |
 | Relationship | Both | User node in graph, relationship edge, `goal memories` (purpose) |
 | Values | Both | `worldview memories` (values), `worldview boundary memories` (limits) |
-| Autonomy | Both | `heartbeat_state.is_paused`, `config.agent.self_termination_enabled` |
+| Autonomy | Both | `heartbeat_state.is_paused` (pause logs reason to outbox), `config.agent.self_termination_enabled` |
 | Capabilities | Both | Contact channels, `mcp_servers`, `mcp_tools` |
 | Consent | Both | `config.agent.is_configured`, first episodic memory |
 

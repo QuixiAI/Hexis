@@ -186,38 +186,7 @@ async def _handle_explore_cluster(args: dict[str, Any], mem_client: CognitiveMem
     limit = min(int(args.get("limit", 3)), 10)
     if not query:
         return {"clusters": [], "count": 0, "query": query}
-    async with mem_client._pool.acquire() as conn:  # noqa: SLF001
-        clusters = await conn.fetch(
-            """
-            SELECT
-                id,
-                name,
-                cluster_type,
-                similarity
-            FROM search_clusters_by_query($1::text, $2::int)
-            """,
-            query,
-            limit,
-        )
-        result_clusters: list[dict[str, Any]] = []
-        for cluster in clusters:
-            sample_memories = await conn.fetch(
-                """
-                SELECT
-                    memory_id,
-                    content,
-                    memory_type,
-                    membership_strength
-                FROM get_cluster_sample_memories($1::uuid, 3)
-                """,
-                cluster["id"],
-            )
-            result_clusters.append(
-                {
-                    **dict(cluster),
-                    "sample_memories": [dict(m) for m in sample_memories],
-                }
-            )
+    result_clusters = await mem_client.explore_clusters(query, limit=limit, sample_size=3)
     return {"clusters": result_clusters, "count": len(result_clusters), "query": query}
 
 

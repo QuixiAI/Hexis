@@ -6493,7 +6493,7 @@ async def test_execute_heartbeat_action_insufficient_energy_no_side_effects(db_p
 
 
 async def test_worker_claim_pending_call_is_concurrency_safe(db_pool, apply_heartbeat_migration):
-    from apps.workers.worker import HeartbeatWorker
+    from services.external_calls import ExternalCallProcessor
 
     async with db_pool.acquire() as conn:
         # Create two pending calls
@@ -6515,21 +6515,22 @@ async def test_worker_claim_pending_call_is_concurrency_safe(db_pool, apply_hear
         )
         assert c1 and c2
 
-    w1 = HeartbeatWorker()
-    w2 = HeartbeatWorker()
-    w1.pool = db_pool
-    w2.pool = db_pool
+    processor = ExternalCallProcessor()
 
-    r1, r2 = await asyncio.gather(w1.claim_pending_call(), w2.claim_pending_call())
+    async def _claim():
+        async with db_pool.acquire() as conn:
+            return await processor.claim_pending_call(conn)
+
+    r1, r2 = await asyncio.gather(_claim(), _claim())
     assert r1 and r2
     assert r1["id"] != r2["id"]
 
 
 async def test_worker_fail_call_retries_then_fails(db_pool, apply_heartbeat_migration):
-    from apps.workers.worker import HeartbeatWorker, MAX_RETRIES
+    from services.external_calls import ExternalCallProcessor
+    from services.worker_service import MAX_RETRIES
 
-    worker = HeartbeatWorker()
-    worker.pool = db_pool
+    processor = ExternalCallProcessor(max_retries=MAX_RETRIES)
 
     async with db_pool.acquire() as conn:
         call_id = await conn.fetchval(
@@ -6544,40 +6545,31 @@ async def test_worker_fail_call_retries_then_fails(db_pool, apply_heartbeat_migr
 
     # Fail it MAX_RETRIES times: should remain pending
     for _ in range(int(MAX_RETRIES)):
-        await worker.fail_call(str(call_id), "boom", retry=True)
+        async with db_pool.acquire() as conn:
+            await processor.fail_call(conn, str(call_id), "boom", retry=True)
 
     async with db_pool.acquire() as conn:
         status = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1::uuid", call_id)
         assert status == "pending"
 
     # One more failure transitions to failed
-    await worker.fail_call(str(call_id), "boom", retry=True)
+    async with db_pool.acquire() as conn:
+        await processor.fail_call(conn, str(call_id), "boom", retry=True)
     async with db_pool.acquire() as conn:
         status2 = await conn.fetchval("SELECT status FROM external_calls WHERE id = $1::uuid", call_id)
         assert status2 == "failed"
 
 
-async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_heartbeat_migration):
+async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_heartbeat_migration, monkeypatch):
     """
     End-to-end worker path (without real LLM):
     - Heartbeat decision includes actions that queue follow-on think calls (brainstorm + inquire)
     - Worker processes those calls and applies side-effects (create goals, create semantic memory)
     - Heartbeat completes with an episodic memory + log row
     """
-    from apps.workers.worker import HeartbeatWorker
-
-    class FakeWorker(HeartbeatWorker):
-        def __init__(self, docs: list[dict]):
-            super().__init__()
-            self._docs = list(docs)
-            self.llm_client = object()  # satisfy _call_llm_json precondition
-
-        def _call_llm_json(self, system_prompt: str, user_prompt: str, max_tokens: int, fallback: dict):
-            if self._docs:
-                doc = self._docs.pop(0)
-            else:
-                doc = fallback
-            return doc, json.dumps(doc)
+    from services.external_calls import ExternalCallProcessor
+    from services.heartbeat_runner import execute_heartbeat_decision
+    import services.external_calls as external_calls_mod
 
     async with db_pool.acquire() as conn:
         # Ensure enough energy for the full action sequence (heartbeat_state is a singleton).
@@ -6614,14 +6606,28 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
     inquire_summary = f"Embeddings are vector representations ({test_id})."
     inquire_doc = {"summary": inquire_summary, "confidence": 0.8, "sources": []}
 
-    worker = FakeWorker([decision_doc, brainstorm_doc, inquire_doc])
-    worker.pool = db_pool
+    docs = [decision_doc, brainstorm_doc, inquire_doc]
 
+    async def fake_chat_json(**_kwargs):
+        doc = docs.pop(0) if docs else {}
+        return doc, json.dumps(doc)
+
+    monkeypatch.setattr(external_calls_mod, "chat_json", fake_chat_json)
+
+    processor = ExternalCallProcessor()
     # Simulate processing the decision call and then executing heartbeat actions.
-    result = await worker.process_think_call(call_input)
+    async with db_pool.acquire() as conn:
+        result = await processor.process_call_payload(conn, "think", call_input)
     assert result.get("kind") == "heartbeat_decision"
-    await worker.execute_heartbeat_actions(str(hb_id), result["decision"])
-    await worker.complete_call(decision_call_id, result)
+    async with db_pool.acquire() as conn:
+        await processor.apply_result(conn, decision_call_id, result)
+    async with db_pool.acquire() as conn:
+        await execute_heartbeat_decision(
+            conn,
+            heartbeat_id=str(hb_id),
+            decision=result["decision"],
+            call_processor=processor,
+        )
 
     async with db_pool.acquire() as conn:
         log_row = await conn.fetchrow(
@@ -7430,14 +7436,10 @@ async def test_recompute_neighborhood_writes_neighbors(db_pool):
 # -----------------------------------------------------------------------------
 
 async def test_worker_run_maintenance_cleans_items(db_pool):
-    from apps.workers.worker import MaintenanceWorker
-
-    worker = MaintenanceWorker()
-    worker.pool = db_pool  # inject test pool
-
     async with db_pool.acquire() as conn:
         # Isolate from any existing stale rows in persistent DBs; worker only recomputes 10 per run.
         await conn.execute("UPDATE memory_neighborhoods SET is_stale = FALSE")
+        await conn.execute("UPDATE maintenance_state SET last_maintenance_at = NULL, is_paused = FALSE WHERE id = 1")
 
         # Expired working memory
         wid = await conn.fetchval(
@@ -7481,7 +7483,9 @@ async def test_worker_run_maintenance_cleans_items(db_pool):
             m1,
         )
 
-    stats = await worker.run_maintenance_tick()
+    async with db_pool.acquire() as conn:
+        raw = await conn.fetchval("SELECT run_maintenance_if_due('{}'::jsonb)")
+    stats = json.loads(raw) if isinstance(raw, str) else dict(raw) if isinstance(raw, dict) else {"result": raw}
     assert isinstance(stats, dict)
 
     async with db_pool.acquire() as conn:
@@ -7492,11 +7496,6 @@ async def test_worker_run_maintenance_cleans_items(db_pool):
 
 
 async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
-    from apps.workers.worker import HeartbeatWorker
-
-    worker = HeartbeatWorker()
-    worker.pool = db_pool
-
     before_interval = None
     before_state = None
     queued_call_row = None
@@ -7511,7 +7510,8 @@ async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
         await conn.execute("UPDATE config SET value = '0'::jsonb WHERE key = 'heartbeat.heartbeat_interval_minutes'")
 
     try:
-        await worker.check_and_run_heartbeat()
+        async with db_pool.acquire() as conn:
+            await conn.fetchval("SELECT run_heartbeat()")
         async with db_pool.acquire() as conn:
             after_calls = await conn.fetchval("SELECT COUNT(*) FROM external_calls")
             assert int(after_calls) == int(before_calls) + 1
@@ -7604,9 +7604,7 @@ async def test_assign_to_episode_trigger_sequences_and_splits_on_gap(db_pool):
 
 
 async def test_subconscious_decider_applies_observations(db_pool, ensure_embedding_service):
-    from apps.workers.worker import SubconsciousDecider
-
-    decider = SubconsciousDecider(init_llm=False)
+    from core.subconscious import apply_subconscious_observations
     async with db_pool.acquire() as conn:
         m1 = await conn.fetchval(
             "SELECT create_semantic_memory($1, 0.8, ARRAY['test'], NULL, '{}'::jsonb, 0.5)",
@@ -7656,7 +7654,7 @@ async def test_subconscious_decider_applies_observations(db_pool, ensure_embeddi
             ],
         }
 
-        applied = await decider._apply_observations(conn, observations)
+        applied = await apply_subconscious_observations(conn, observations)
         assert applied["narrative"] >= 1
         assert applied["relationships"] >= 1
         assert applied["contradictions"] >= 1
@@ -7702,9 +7700,7 @@ async def test_subconscious_decider_applies_observations(db_pool, ensure_embeddi
 
 
 async def test_end_to_end_self_development_flow(db_pool, ensure_embedding_service):
-    from apps.workers.worker import SubconsciousDecider
-
-    decider = SubconsciousDecider(init_llm=False)
+    from core.subconscious import apply_subconscious_observations
     async with db_pool.acquire() as conn:
         hb_id = await conn.fetchval("SELECT start_heartbeat()")
         m1 = await conn.fetchval(
@@ -7744,7 +7740,7 @@ async def test_end_to_end_self_development_flow(db_pool, ensure_embedding_servic
             "emotional_observations": [{"pattern": "steady optimism", "frequency": 2, "unprocessed": False, "confidence": 0.7}],
             "consolidation_observations": [{"memory_ids": [str(m1), str(m2)], "rationale": "shared theme", "confidence": 0.7}],
         }
-        await decider._apply_observations(conn, observations)
+        await apply_subconscious_observations(conn, observations)
 
         ctx = _coerce_json(await conn.fetchval("SELECT gather_turn_context()"))
         assert ctx.get("self_model"), "self_model should populate from reflection"
@@ -8096,7 +8092,7 @@ async def test_self_model_helpers_roundtrip(db_pool):
 
 
 async def test_prompt_resources_load_and_compose():
-    from core.prompt_resources import load_personhood_library, compose_personhood_prompt
+    from services.prompt_resources import load_personhood_library, compose_personhood_prompt
 
     lib = load_personhood_library()
     assert isinstance(lib.raw_markdown, str) and len(lib.raw_markdown) > 100
@@ -8111,9 +8107,15 @@ async def test_prompt_resources_load_and_compose():
 
 
 async def test_worker_heartbeat_system_prompt_includes_personhood_modules():
-    from apps.workers import worker
+    from services.prompt_resources import load_heartbeat_prompt, compose_personhood_prompt
 
-    assert "PERSONHOOD MODULES" in worker.HEARTBEAT_SYSTEM_PROMPT
+    system_prompt = (
+        load_heartbeat_prompt().strip()
+        + "\n\n"
+        + "----- PERSONHOOD MODULES (for grounding; use context fields like self_model/narrative) -----\n\n"
+        + compose_personhood_prompt("heartbeat")
+    )
+    assert "PERSONHOOD MODULES" in system_prompt
 
 
 async def test_find_connected_concepts_returns_concept(db_pool, ensure_embedding_service):
@@ -8257,6 +8259,43 @@ async def test_terminate_agent_wipes_state_and_queues_last_will(db_pool):
             assert await conn.fetchval("SELECT is_agent_terminated()") is True
             assert await conn.fetchval("SELECT should_run_heartbeat()") is False
             assert await conn.fetchval("SELECT should_run_maintenance()") is False
+        finally:
+            await tx.rollback()
+
+
+async def test_pause_heartbeat_queues_reason_and_pauses(db_pool):
+    async with db_pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            hb_id = await conn.fetchval("SELECT start_heartbeat()")
+            assert hb_id is not None
+
+            reason = f"Need to pause for recovery and alignment. {get_test_identifier('pause')}"
+            raw = await conn.fetchval(
+                "SELECT execute_heartbeat_action($1::uuid, 'pause_heartbeat', $2::jsonb)",
+                hb_id,
+                json.dumps({"reason": reason, "details": "Full, detailed justification for pausing."}),
+            )
+            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            assert payload.get("success") is True
+
+            result = payload.get("result") or {}
+            assert result.get("paused") is True
+            outbox_id = result.get("outbox_id")
+            assert outbox_id
+
+            outbox_row = await conn.fetchrow(
+                "SELECT payload FROM outbox_messages WHERE id = $1::uuid",
+                outbox_id,
+            )
+            outbox_payload = _coerce_json(outbox_row["payload"])
+            assert outbox_payload.get("message") == reason
+            assert outbox_payload.get("intent") == "heartbeat_paused"
+            assert (outbox_payload.get("context") or {}).get("heartbeat_id") == str(hb_id)
+
+            paused = await conn.fetchval("SELECT is_paused FROM heartbeat_state WHERE id = 1")
+            assert paused is True
         finally:
             await tx.rollback()
 

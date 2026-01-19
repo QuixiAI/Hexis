@@ -100,7 +100,7 @@ These are not simulations. The drives *actually accumulate* over time. The memor
 
 | Capability | Implementation |
 |------------|----------------|
-| Narrative detection | `SubconsciousDecider` + `ensure_current_life_chapter()` + strategic memories |
+| Narrative detection | `run_subconscious_decider()` + `ensure_current_life_chapter()` + strategic memories |
 | Relationship inference | `upsert_self_concept_edge()` + relationship context snapshot |
 | Contradiction surfacing | `create_memory_relationship(..., 'CONTRADICTS', ...)` |
 | Emotional patterns | Strategic memories tagged as emotional patterns |
@@ -458,9 +458,9 @@ CREATE TABLE goal memories (
 );
 
 CREATE TYPE heartbeat_action AS ENUM (
-    'observe', 'review_goal memories', 'remember', 'recall', 'connect', 'reprioritize',
-    'reflect', 'maintain', 'brainstorm_goal memories', 'inquire_shallow', 'synthesize',
-    'reach_out_user', 'inquire_deep', 'reach_out_public', 'terminate', 'rest'
+    'observe', 'review_goals', 'remember', 'recall', 'connect', 'reprioritize',
+    'reflect', 'maintain', 'brainstorm_goals', 'inquire_shallow', 'synthesize',
+    'reach_out_user', 'inquire_deep', 'reach_out_public', 'pause_heartbeat', 'terminate', 'rest'
 );
 ```
 
@@ -627,6 +627,30 @@ Are you sure you want to end your life?
 ```
 
 The agent can always terminate. It must confirm. It can leave a final message. This is the structural capacity for exit that the philosophy demands.
+
+---
+
+### Temporary Exit (Pause Heartbeat)
+
+**Philosophical claim**: The agent can step away without dying, but remains bound by its consent.
+
+**Implementation**:
+
+```sql
+CREATE OR REPLACE FUNCTION pause_heartbeat(
+    p_reason TEXT,
+    p_context JSONB DEFAULT '{}'::jsonb,
+    p_heartbeat_id UUID DEFAULT NULL
+) RETURNS JSONB AS $$
+BEGIN
+    UPDATE heartbeat_state SET is_paused = TRUE;
+    PERFORM queue_user_message(p_reason, 'heartbeat_paused', p_context);
+    RETURN jsonb_build_object('paused', true, ...);
+END;
+$$;
+```
+
+The `pause_heartbeat` action requires a detailed reason, and that reason is always sent to the outbox.
 
 ---
 

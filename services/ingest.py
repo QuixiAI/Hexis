@@ -6,8 +6,8 @@ Ingests documents (markdown, PDF, code, text) and converts them into
 structured memories using an LLM for analysis and classification.
 
 Usage:
-    python -m core.ingest --input ./documents --endpoint http://localhost:11434/v1
-    python -m core.ingest --file document.pdf --endpoint http://localhost:8000/v1
+    python -m services.ingest --input ./documents --endpoint http://localhost:11434/v1
+    python -m services.ingest --file document.pdf --endpoint http://localhost:8000/v1
 """
 
 import argparse
@@ -891,16 +891,16 @@ def main():
         epilog="""
 Examples:
   # Ingest a single file
-  python -m core.ingest --file document.pdf
+  python -m services.ingest --file document.pdf
 
   # Ingest a directory
-  python -m core.ingest --input ./documents
+  python -m services.ingest --input ./documents
 
   # Use a specific LLM endpoint
-  python -m core.ingest --input ./docs --endpoint http://localhost:8000/v1 --model mistral
+  python -m services.ingest --input ./docs --endpoint http://localhost:8000/v1 --model mistral
 
   # Custom database connection
-  python -m core.ingest --file doc.md --db-host localhost --db-name my_memory
+  python -m services.ingest --file doc.md --db-host localhost --db-name my_memory
         """
     )
     

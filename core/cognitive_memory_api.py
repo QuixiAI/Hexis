@@ -20,7 +20,6 @@ from uuid import UUID
 
 import asyncpg
 
-from core.prompt_resources import compose_personhood_prompt
 
 class MemoryType(str, Enum):
     EPISODIC = "episodic"
@@ -877,6 +876,42 @@ class CognitiveMemory:
             )
         return out
 
+    async def explore_clusters(self, query: str, limit: int = 3, sample_size: int = 3) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            clusters = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    name,
+                    cluster_type,
+                    similarity
+                FROM search_clusters_by_query($1::text, $2::int)
+                """,
+                query,
+                limit,
+            )
+            result_clusters: list[dict[str, Any]] = []
+            for cluster in clusters:
+                sample_memories = await conn.fetch(
+                    """
+                    SELECT
+                        memory_id,
+                        content,
+                        memory_type,
+                        membership_strength
+                    FROM get_cluster_sample_memories($1::uuid, $2::int)
+                    """,
+                    cluster["id"],
+                    sample_size,
+                )
+                result_clusters.append(
+                    {
+                        **dict(cluster),
+                        "sample_memories": [dict(m) for m in sample_memories],
+                    }
+                )
+        return result_clusters
+
     def _row_to_memory(self, row: asyncpg.Record) -> Memory:
         return Memory(
             id=row["id"],
@@ -1025,17 +1060,6 @@ def format_context_for_prompt(context: HydratedContext, *, max_memories: int = 5
                 parts.append(f"- {drive.get('name')}: {float(ratio):.1%} urgent")
 
     return "\n".join(parts)
-
-
-def get_personhood_prompt(kind: str) -> str:
-    """
-    Convenience helper for apps composing LLM prompts.
-
-    `kind` is one of: "conversation", "heartbeat", "reflect".
-    """
-    if kind not in {"conversation", "heartbeat", "reflect"}:
-        raise ValueError("kind must be one of: conversation, heartbeat, reflect")
-    return compose_personhood_prompt(kind)  # type: ignore[arg-type]
 
 
 def _coerce_json(val: Any) -> Any:

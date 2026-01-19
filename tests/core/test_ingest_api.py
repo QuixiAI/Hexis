@@ -1,6 +1,6 @@
 import pytest
 
-from core import ingest_api
+from services import ingest_api
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.core]
 

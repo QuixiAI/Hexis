@@ -1004,6 +1004,8 @@ async def handle_user_session():
 
 **Key principle:** Conversation is *not* a heartbeat. It's synchronous interaction. Heartbeats are autonomous existence between interactions.
 
+**Note:** Agent-initiated pauses use `pause_heartbeat()` in the database, which requires a detailed reason and queues it to the outbox. Scheduler pauses for live user sessions are operational and do not replace that requirement.
+
 ---
 
 ### 6. Background Worker Specification

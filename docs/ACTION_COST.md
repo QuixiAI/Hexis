@@ -62,7 +62,7 @@ Every action is tagged with exactly one intent class:
 | **exploration** | Information gathering, inquiry | inquire_shallow, inquire_deep |
 | **maintenance** | Memory upkeep, structural coherence | maintain, connect |
 | **social** | Direct interaction with user or others | reach_out_user, reach_out_public |
-| **meta** | Rest, self-regulation, termination | rest, terminate |
+| **meta** | Rest, self-regulation, pause, termination | rest, pause_heartbeat, terminate |
 
 Intent classes:
 

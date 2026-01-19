@@ -7,7 +7,7 @@ Install with:
   pip install -e .
 
 Run:
-  python -m apps.mcp.hexis_mcp_server
+  python -m apps.hexis_mcp_server
 """
 
 from __future__ import annotations

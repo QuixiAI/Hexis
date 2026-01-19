@@ -1,7 +1,7 @@
 import pytest
 
 from core.cognitive_memory_api import CognitiveMemory, MemoryType
-from core.tooling import execute_tool
+from services.tooling import execute_tool
 from tests.utils import _db_dsn, get_test_identifier
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.core]

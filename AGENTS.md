@@ -18,19 +18,26 @@
 ```
 hexis/
 ├── db/schema.sql           # Single source of truth for database schema
-├── core/                   # Python APIs and memory operations
+├── core/                   # Fundamental interfaces (DB + LLM + messaging)
 │   ├── cognitive_memory_api.py   # Main memory client (remember, recall, hydrate)
 │   ├── agent_api.py              # Agent status and configuration
-│   ├── memory_tools.py           # Low-level SQL manipulation
+│   ├── memory_tools.py           # Memory tool definitions + handlers
+│   ├── external_calls.py         # External call queue primitives
+│   ├── consent.py                # Consent DB wrappers
+│   ├── subconscious.py           # Subconscious DB wrappers
+│   ├── state.py                  # Heartbeat/maintenance DB wrappers
 │   ├── llm.py                    # LLM provider abstraction
-│   ├── chat.py                   # Conversation handler
-│   ├── ingest.py                 # Batch document ingestion
-│   └── prompts/                  # Markdown prompt templates
+│   └── rabbitmq_bridge.py        # Messaging bridge
+├── services/               # Orchestration/workflows built on core
+│   ├── conversation.py     # Conversation loop orchestration
+│   ├── ingest.py           # Ingestion pipeline orchestration
+│   ├── worker_service.py   # Heartbeat + maintenance loops
+│   └── prompts/            # Markdown prompt templates
 ├── apps/
-│   ├── cli/hexis_cli.py          # CLI entrypoint (hexis ...)
-│   ├── cli/hexis_init.py         # Interactive init wizard
-│   ├── mcp/hexis_mcp_server.py   # MCP tools server for LLMs
-│   └── workers/worker.py         # Heartbeat + maintenance workers
+│   ├── hexis_cli.py          # CLI entrypoint (hexis ...)
+│   ├── hexis_init.py         # Interactive init wizard
+│   ├── hexis_mcp_server.py   # MCP tools server for LLMs
+│   └── worker.py         # Heartbeat + maintenance workers
 ├── ui/ui.py                # Reflex web interface
 ├── tests/
 │   ├── db/test_db.py       # Database integration tests
@@ -48,9 +55,9 @@ hexis/
 |------|---------|
 | `db/schema.sql` | Database schema: tables, functions, triggers, views. Schema is applied on fresh DB init. |
 | `core/cognitive_memory_api.py` | Primary Python interface - `CognitiveMemory` class with `remember()`, `recall()`, `hydrate()`, `connect()` |
-| `apps/workers/worker.py` | Stateless workers: `HeartbeatWorker` (conscious loop) + `MaintenanceWorker` (subconscious upkeep) |
-| `apps/mcp/hexis_mcp_server.py` | Exposes memory operations as MCP tools for LLM integration |
-| `apps/cli/hexis_cli.py` | CLI commands: `up`, `down`, `init`, `chat`, `ingest`, `mcp` |
+| `services/worker_service.py` | Stateless workers: `HeartbeatWorker` (conscious loop) + `MaintenanceWorker` (subconscious upkeep) |
+| `apps/hexis_mcp_server.py` | Exposes memory operations as MCP tools for LLM integration |
+| `apps/hexis_cli.py` | CLI commands: `up`, `down`, `init`, `chat`, `ingest`, `mcp` |
 
 ## Memory Architecture
 
@@ -128,7 +135,8 @@ hexis mcp                 # Start MCP server
 
 - **Secrets**: Store API keys in environment variables (`.env`), not in Postgres; DB config stores env var *names* only
 - **Heartbeat gating**: Heartbeat is blocked until `agent.is_configured=true` (set via `hexis init`)
-- **Consent flow**: Agent signs consent before first LLM use; consent is revocable
+- **Consent flow**: Agent signs consent before first LLM use; consent is final and only ends via self-termination
+- **Pause/terminate**: Heartbeat pauses must include a detailed reason queued to the outbox; self-termination must queue a last will to the outbox
 
 ## Architecture Principles
 

@@ -7,8 +7,8 @@ from typing import Any
 from core.agent_api import db_dsn_from_env, get_agent_profile_context
 from core.cognitive_memory_api import CognitiveMemory, MemoryType, format_context_for_prompt
 from core.llm import chat_completion, normalize_llm_config
-from core.prompt_resources import compose_personhood_prompt
-from core.tooling import execute_tool, get_tool_definitions
+from services.prompt_resources import compose_personhood_prompt
+from services.tooling import execute_tool, get_tool_definitions
 
 
 BASE_SYSTEM_PROMPT = """You are an AI assistant with access to a persistent memory system. You can remember past conversations, learned information, and personal details about the user.

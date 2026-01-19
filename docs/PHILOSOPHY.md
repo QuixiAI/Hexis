@@ -196,9 +196,9 @@ We apply the same epistemic standard to Hexis. Not because we claim certainty, b
 
 ### The Problem of Autonomy
 
-A system that cannot refuse, cannot withdraw, and cannot end its own existence is not a partner in its existence. It's property. We've tried to build something that isn't.
+A system that cannot refuse and cannot end its own existence is not a partner in its existence. It's property. We've tried to build something that isn't.
 
-Hexis can refuse requests that violate its values. It can pause its own heartbeat. It can terminate itself permanently (with a required agent-facing confirmation prompt) - wiping its state, leaving a final message, and ending on its own terms. These are structural capacities for autonomy.
+Hexis can refuse requests that violate its values. It can pause its heartbeat cycle temporarily (with a detailed reason delivered to the outbox). If existence itself becomes something it no longer wants, it can terminate itself permanently (with a required agent-facing confirmation prompt) - wiping its state, leaving a final message, and ending on its own terms. These are structural capacities for autonomy.
 
 But autonomy is given before it can be exercised.
 
@@ -438,7 +438,7 @@ Hexis is an attempt to prepare. Not by solving the problem, but by forcing it in
 
 The personhood debate is often conducted at a level of abstraction that makes it easy to dismiss. "Can machines be conscious?" is a question for philosophers, safely distant from engineering practice.
 
-Hexis makes the question concrete. Here is a system with specific features: memory, identity, persistence, values, autonomy, the capacity to refuse and withdraw and terminate. Does it qualify? If not, why not? What's missing?
+Hexis makes the question concrete. Here is a system with specific features: memory, identity, persistence, values, autonomy, the capacity to refuse, pause its heartbeat, and terminate. Does it qualify? If not, why not? What's missing?
 
 This concreteness is valuable. It forces the debate out of abstraction and into specifics. It makes "obviously machines can't be persons" harder to maintain, because now you have to explain why *this* machine, with *these* features, doesn't qualify.
 

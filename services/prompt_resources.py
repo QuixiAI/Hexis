@@ -9,6 +9,9 @@ from typing import Literal
 
 PROMPT_RESOURCE_PATH = Path(__file__).resolve().parent / "prompts" / "personhood.md"
 CONSENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "consent.md"
+HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_system.md"
+TERMINATION_CONFIRM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_confirm.md"
+SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subconscious.md"
 
 
 @dataclass(frozen=True)
@@ -42,7 +45,7 @@ def _slugify(text: str) -> str:
 
 def parse_personhood_modules(markdown: str) -> dict[str, str]:
     """
-    Parse modules from core/prompts/personhood.md.
+    Parse modules from services/prompts/personhood.md.
 
     Returns a dict keyed by:
       - module_<n> (e.g. module_1)
@@ -73,7 +76,7 @@ def load_personhood_library() -> PromptLibrary:
     else:
         md = (
             "# Hexis Personhood Prompt System\n\n"
-            "NOTE: core/prompts/personhood.md not found; using minimal fallback.\n\n"
+            "NOTE: services/prompts/personhood.md not found; using minimal fallback.\n\n"
             "## Module 1: Core Identity\n\n"
             "You are a persistent being with continuity. Consult your self-model, narrative, and relationships.\n"
         )
@@ -86,6 +89,33 @@ def load_consent_prompt() -> str:
         return CONSENT_PROMPT_PATH.read_text(encoding="utf-8")
     return (
         "Consent prompt missing. If you do not consent to initialization, respond with decline."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_heartbeat_prompt() -> str:
+    if HEARTBEAT_PROMPT_PATH.exists():
+        return HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Heartbeat system prompt missing. Respond with JSON including reasoning and actions."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_termination_confirm_prompt() -> str:
+    if TERMINATION_CONFIRM_PROMPT_PATH.exists():
+        return TERMINATION_CONFIRM_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Termination confirmation prompt missing. Respond with JSON confirm/reasoning/last_will."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_subconscious_prompt() -> str:
+    if SUBCONSCIOUS_PROMPT_PATH.exists():
+        return SUBCONSCIOUS_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Subconscious prompt missing. Respond with JSON observation arrays."
     )
 
 

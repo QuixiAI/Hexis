@@ -8,7 +8,7 @@ A conversation interface that:
 3. Forms new memories from conversations
 
 Usage:
-    python -m core.conversation --endpoint http://localhost:11434/v1 --model llama3.2
+    python -m services.conversation --endpoint http://localhost:11434/v1 --model llama3.2
 """
 
 import argparse
@@ -104,10 +104,10 @@ Before each user message, you may receive [RELEVANT MEMORIES] - these are automa
 
 You are a helpful, knowledgeable assistant with the added capability of genuine memory and continuity."""
 
-# Optional: personhood prompt modules (kept in core/prompts/personhood.md). If the resource
+# Optional: personhood prompt modules (kept in services/prompts/personhood.md). If the resource
 # isn't present (or in constrained environments), the conversation loop still works.
 try:
-    from core.prompt_resources import compose_personhood_prompt
+    from services.prompt_resources import compose_personhood_prompt
 
     SYSTEM_PROMPT = (
         SYSTEM_PROMPT
@@ -412,16 +412,16 @@ def main():
         epilog="""
 Examples:
   # Start with default settings (Ollama)
-  python -m core.conversation
+  python -m services.conversation
 
   # Use a specific model
-  python -m core.conversation --model mistral --endpoint http://localhost:11434/v1
+  python -m services.conversation --model mistral --endpoint http://localhost:11434/v1
 
   # Connect to a remote endpoint
-  python -m core.conversation --endpoint https://api.example.com/v1 --api-key sk-xxx
+  python -m services.conversation --endpoint https://api.example.com/v1 --api-key sk-xxx
 
   # Custom database
-  python -m core.conversation --db-host localhost --db-name my_memory
+  python -m services.conversation --db-host localhost --db-name my_memory
         """
     )
     
