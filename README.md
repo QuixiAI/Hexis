@@ -578,7 +578,7 @@ The Docker stack includes RabbitMQ (management UI + AMQP) as a default “inbox/
 - AMQP: `amqp://localhost:5672`
 - Default credentials: `hexis` / `hexis_password` (override via `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`)
 
-When the maintenance worker is running with `RABBITMQ_ENABLED=1`, it will:
+When the maintenance worker is running, it will:
 - publish pending DB `outbox_messages` to the RabbitMQ queue `hexis.outbox`
 - poll `hexis.inbox` and insert messages into DB working memory (so the agent can “hear” them)
 

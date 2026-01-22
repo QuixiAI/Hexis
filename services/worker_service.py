@@ -8,7 +8,7 @@ import asyncpg
 from dotenv import load_dotenv
 
 from core.agent_api import db_dsn_from_env
-from core.rabbitmq_bridge import RabbitMQBridge, RABBITMQ_ENABLED
+from core.rabbitmq_bridge import RabbitMQBridge
 from core.state import (
     is_agent_terminated,
     mark_subconscious_decider_run,
@@ -45,9 +45,8 @@ class HeartbeatWorker:
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(), min_size=2, max_size=10)
         logger.info("Connected to database")
-        if RABBITMQ_ENABLED:
-            self.bridge = RabbitMQBridge(self.pool)
-            await self.bridge.ensure_ready()
+        self.bridge = RabbitMQBridge(self.pool)
+        await self.bridge.ensure_ready()
 
     async def disconnect(self) -> None:
         if self.pool:
@@ -162,9 +161,8 @@ class MaintenanceWorker:
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(), min_size=1, max_size=5)
         logger.info("Connected to database")
-        if RABBITMQ_ENABLED:
-            self.bridge = RabbitMQBridge(self.pool)
-            await self.bridge.ensure_ready()
+        self.bridge = RabbitMQBridge(self.pool)
+        await self.bridge.ensure_ready()
 
     async def disconnect(self) -> None:
         if self.pool:

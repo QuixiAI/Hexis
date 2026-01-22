@@ -401,7 +401,7 @@ async function executeToolCall(name: string, args: Record<string, any>) {
       const rows = await prisma.$queryRaw<
         { memory_id: string; content: string; memory_type: string; score: number; source: string }[]
       >`
-        SELECT * FROM fast_recall(${query}, ${limit})
+        SELECT * FROM fast_recall(${query}::text, ${limit}::int)
       `;
       const ids = rows.map((row) => row.memory_id).filter(Boolean);
       if (ids.length) {

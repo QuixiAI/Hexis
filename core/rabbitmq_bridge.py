@@ -9,7 +9,6 @@ from typing import Any
 import requests
 
 
-RABBITMQ_ENABLED = os.getenv("RABBITMQ_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
 RABBITMQ_MANAGEMENT_URL = os.getenv("RABBITMQ_MANAGEMENT_URL", "http://rabbitmq:15672").rstrip("/")
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "hexis")
 RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "hexis_password")
@@ -57,9 +56,6 @@ class RabbitMQBridge:
             return
 
     async def publish_outbox_payloads(self, payloads: list[dict[str, Any]]) -> int:
-        if not RABBITMQ_ENABLED:
-            return 0
-
         published = 0
         vhost = self._vhost_path()
         for msg in payloads or []:
@@ -88,7 +84,7 @@ class RabbitMQBridge:
         return published
 
     async def poll_inbox_messages(self, max_messages: int = 10) -> int:
-        if not RABBITMQ_ENABLED or not self.pool:
+        if not self.pool:
             return 0
 
         now = time.monotonic()

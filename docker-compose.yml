@@ -72,7 +72,7 @@ services:
       - "80"  # internal-only; reachable from Postgres as http://embeddings:80
     volumes:
       # Bind-mount cache to avoid re-downloading models on every volume reset.
-      - ${EMBEDDINGS_CACHE_DIR:-./.cache/huggingface}:/data
+      - ${EMBEDDINGS_CACHE_DIR:-/tmp/hexis_embeddings_cache}:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80/health"]
       interval: 30s
@@ -98,7 +98,6 @@ services:
       POSTGRES_PORT: 5432
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
-      RABBITMQ_ENABLED: "0"
     networks:
       - private
       - public
@@ -120,7 +119,6 @@ services:
       POSTGRES_PORT: 5432
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
-      RABBITMQ_ENABLED: "1"
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
