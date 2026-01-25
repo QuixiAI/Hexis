@@ -976,6 +976,9 @@ class CognitiveMemorySync:
     def connect_memories(self, from_id: UUID, to_id: UUID, relationship: RelationshipType, **kwargs: Any) -> None:
         return self._loop.run_until_complete(self._async.connect_memories(from_id, to_id, relationship, **kwargs))
 
+    def link_concept(self, memory_id: UUID, concept: str, *, strength: float = 1.0) -> UUID:
+        return self._loop.run_until_complete(self._async.link_concept(memory_id, concept, strength=strength))
+
     def touch_memories(self, memory_ids: Iterable[UUID]) -> int:
         return self._loop.run_until_complete(self._async.touch_memories(memory_ids))
 

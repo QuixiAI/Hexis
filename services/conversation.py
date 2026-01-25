@@ -33,6 +33,14 @@ from core.memory_tools import (
     MEMORY_TOOLS
 )
 
+# Try to import the new tools system
+try:
+    from core.tools import create_sync_tool_handler
+    HAS_NEW_TOOLS = True
+except ImportError:
+    HAS_NEW_TOOLS = False
+    create_sync_tool_handler = None
+
 
 # ============================================================================
 # CONFIGURATION
@@ -45,19 +53,22 @@ class ConversationConfig:
     llm_endpoint: str = "http://localhost:11434/v1"
     llm_model: str = "llama3.2"
     llm_api_key: str = "not-needed"
-    
+
     # Database Settings
     db_host: str = "localhost"
     db_port: int = 43815
     db_name: str = "hexis_memory"
     db_user: str = "postgres"
     db_password: str = "password"
-    
+
     # Memory Settings
     enrichment_top_k: int = 5
     auto_form_memories: bool = True
     max_tool_iterations: int = 5
-    
+
+    # Tools Settings
+    use_extended_tools: bool = True  # Use web, filesystem, shell tools in addition to memory
+
     # Display Settings
     show_memories: bool = True
     show_tool_calls: bool = True
@@ -178,11 +189,11 @@ class ConversationManager:
     """
     Manages the conversation loop with memory integration.
     """
-    
+
     def __init__(self, config: ConversationConfig):
         self.config = config
         self.llm = LLMClient(config)
-        
+
         # Database config for memory components
         self.db_config = {
             'host': config.db_host,
@@ -191,12 +202,26 @@ class ConversationManager:
             'user': config.db_user,
             'password': config.db_password,
         }
-        
+
         # Initialize memory components
         self.enricher = create_enricher(self.db_config, config.enrichment_top_k)
-        self.tool_handler = create_tool_handler(self.db_config)
         self.memory_formation = create_memory_formation(self.db_config)
-        
+
+        # Initialize tool handler - use extended tools if available and enabled
+        self._use_extended_tools = False
+        if config.use_extended_tools and HAS_NEW_TOOLS and create_sync_tool_handler is not None:
+            try:
+                self.tool_handler = create_sync_tool_handler(self.db_config)
+                self._use_extended_tools = True
+                if config.verbose:
+                    print("[Using extended tools: web, filesystem, shell + memory]")
+            except Exception as e:
+                if config.verbose:
+                    print(f"[Extended tools unavailable: {e}, using memory tools only]")
+                self.tool_handler = create_tool_handler(self.db_config)
+        else:
+            self.tool_handler = create_tool_handler(self.db_config)
+
         # Conversation state
         self.messages = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -252,7 +277,11 @@ class ConversationManager:
         """
         Get response from LLM, handling any tool calls iteratively.
         """
-        tools = get_tool_definitions()
+        # Get tool definitions from the appropriate handler
+        if self._use_extended_tools and hasattr(self.tool_handler, 'get_tool_definitions'):
+            tools = self.tool_handler.get_tool_definitions()
+        else:
+            tools = get_tool_definitions()
         iterations = 0
         
         while iterations < self.config.max_tool_iterations:
@@ -465,7 +494,9 @@ Examples:
                         help='Hide tool call display')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Minimal output')
-    
+    parser.add_argument('--no-extended-tools', action='store_true',
+                        help='Disable extended tools (web, filesystem, shell)')
+
     args = parser.parse_args()
     
     config = ConversationConfig(
@@ -480,6 +511,7 @@ Examples:
         enrichment_top_k=args.top_k,
         auto_form_memories=not args.no_auto_memory,
         max_tool_iterations=args.max_tool_iterations,
+        use_extended_tools=not args.no_extended_tools,
         show_memories=not args.hide_memories,
         show_tool_calls=not args.hide_tool_calls,
         verbose=not args.quiet,

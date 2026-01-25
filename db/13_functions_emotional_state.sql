@@ -259,7 +259,7 @@ DECLARE
     top_similarity FLOAT;
     activation_id UUID;
 BEGIN
-    query_emb := COALESCE(p_query_embedding, get_embedding(p_query));
+    query_emb := COALESCE(p_query_embedding, get_embedding(ensure_embedding_prefix(p_query, 'search_query')));
     zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 
     SELECT
@@ -315,7 +315,7 @@ DECLARE
     query_emb vector;
     activation_id UUID;
 BEGIN
-    query_emb := COALESCE(p_query_embedding, get_embedding(p_query));
+    query_emb := COALESCE(p_query_embedding, get_embedding(ensure_embedding_prefix(p_query, 'search_query')));
 
     INSERT INTO memory_activation (
         query_embedding,
@@ -536,7 +536,7 @@ BEGIN
     END IF;
 
     BEGIN
-        query_emb := get_embedding(p_text);
+        query_emb := get_embedding(ensure_embedding_prefix(p_text, 'search_query'));
     EXCEPTION
         WHEN OTHERS THEN
             RETURN '[]'::jsonb;

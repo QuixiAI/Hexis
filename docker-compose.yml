@@ -6,15 +6,13 @@ services:
     container_name: hexis_brain
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
-      # Important for AGE extension
-      POSTGRES_HOST_AUTH_METHOD: trust 
+      POSTGRES_USER: ${POSTGRES_USER:-hexis_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hexis_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # db/*.sql is baked into the image (see Dockerfile) to avoid bind-mount issues on macOS external drives.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hexis_memory}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hexis_user} -d ${POSTGRES_DB:-hexis_memory}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -35,6 +33,8 @@ services:
   rabbitmq:
     image: rabbitmq:4-management
     container_name: hexis_rabbitmq
+    profiles:
+      - active
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
@@ -84,39 +84,56 @@ services:
       - public  # Needed for initial model download from HuggingFace
 
   heartbeat_worker:
-    profiles: ["active", "heartbeat"]
     build:
       context: .
       dockerfile: ops/Dockerfile.worker
     container_name: hexis_heartbeat_worker
+    profiles:
+      - active
     command: ["hexis-worker", "--mode", "heartbeat"]
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      POSTGRES_HOST: db
-      POSTGRES_PORT: 5432
-      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
-      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
-    networks:
-      - private
-      - public
-
-  maintenance_worker:
-    profiles: ["active", "maintenance"]
-    build:
-      context: .
-      dockerfile: ops/Dockerfile.worker
-    container_name: hexis_maintenance_worker
-    command: ["hexis-worker", "--mode", "maintenance"]
-    depends_on:
-      db:
+      embeddings:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
     environment:
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
+      POSTGRES_USER: ${POSTGRES_USER:-hexis_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hexis_password}
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
+      RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
+    networks:
+      - private
+      - public
+
+  maintenance_worker:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile.worker
+    container_name: hexis_maintenance_worker
+    profiles:
+      - active
+    command: ["hexis-worker", "--mode", "maintenance"]
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      embeddings:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
+      POSTGRES_USER: ${POSTGRES_USER:-hexis_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hexis_password}
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672

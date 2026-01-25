@@ -36,19 +36,47 @@ MAX_RETRIES = int(os.getenv("WORKER_MAX_RETRIES", 3))
 class HeartbeatWorker:
     """Stateless worker that bridges the database and external APIs."""
 
-    def __init__(self):
+    def __init__(self, instance: str | None = None):
+        self.instance = instance or os.getenv("HEXIS_INSTANCE")
         self.pool: asyncpg.Pool | None = None
         self.running = False
         self.bridge: RabbitMQBridge | None = None
         self.call_processor = ExternalCallProcessor(max_retries=MAX_RETRIES)
+        self._tool_registry = None
+        self._mcp_manager = None
 
     async def connect(self) -> None:
-        self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(), min_size=2, max_size=10)
+        self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(self.instance), min_size=2, max_size=10)
         logger.info("Connected to database")
         self.bridge = RabbitMQBridge(self.pool)
         await self.bridge.ensure_ready()
 
+        # Initialize tool registry
+        try:
+            from core.tools import create_default_registry, create_mcp_manager
+
+            self._tool_registry = create_default_registry(self.pool)
+            self.call_processor.set_tool_registry(self._tool_registry)
+            logger.info("Tool registry initialized")
+
+            # Load MCP servers
+            self._mcp_manager = await create_mcp_manager(self._tool_registry)
+            mcp_count = len(self._mcp_manager.list_servers())
+            if mcp_count > 0:
+                logger.info(f"Loaded {mcp_count} MCP server(s)")
+
+        except Exception as e:
+            logger.warning(f"Failed to initialize tool registry: {e}")
+
     async def disconnect(self) -> None:
+        # Shutdown MCP servers
+        if self._mcp_manager:
+            try:
+                await self._mcp_manager.shutdown()
+                logger.info("MCP servers shut down")
+            except Exception as e:
+                logger.warning(f"Error shutting down MCP servers: {e}")
+
         if self.pool:
             await self.pool.close()
             logger.info("Disconnected from database")
@@ -129,6 +157,9 @@ class HeartbeatWorker:
                     if await self._is_agent_terminated():
                         logger.info("Agent is terminated; heartbeat worker exiting.")
                         break
+                    if not await self._is_agent_ready():
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
                     await self._run_heartbeat_if_due()
                 except Exception as exc:
                     logger.error(f"Worker loop error: {exc}")
@@ -149,17 +180,27 @@ class HeartbeatWorker:
         except Exception:
             return False
 
+    async def _is_agent_ready(self) -> bool:
+        if not self.pool:
+            return False
+        try:
+            async with self.pool.acquire() as conn:
+                return bool(await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()"))
+        except Exception:
+            return False
+
 
 class MaintenanceWorker:
     """Subconscious maintenance loop: consolidates/prunes substrate on its own trigger."""
 
-    def __init__(self):
+    def __init__(self, instance: str | None = None):
+        self.instance = instance or os.getenv("HEXIS_INSTANCE")
         self.pool: asyncpg.Pool | None = None
         self.running = False
         self.bridge: RabbitMQBridge | None = None
 
     async def connect(self) -> None:
-        self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(), min_size=1, max_size=5)
+        self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(self.instance), min_size=1, max_size=5)
         logger.info("Connected to database")
         self.bridge = RabbitMQBridge(self.pool)
         await self.bridge.ensure_ready()
@@ -200,6 +241,9 @@ class MaintenanceWorker:
                     if await self._is_agent_terminated():
                         logger.info("Agent is terminated; maintenance worker exiting.")
                         break
+                    if not await self._is_agent_ready():
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
                     if self.bridge:
                         await self.bridge.poll_inbox_messages()
                     await self._run_maintenance_if_due()
@@ -223,10 +267,19 @@ class MaintenanceWorker:
         except Exception:
             return False
 
+    async def _is_agent_ready(self) -> bool:
+        if not self.pool:
+            return False
+        try:
+            async with self.pool.acquire() as conn:
+                return bool(await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()"))
+        except Exception:
+            return False
 
-async def _amain(mode: str) -> None:
-    hb_worker = HeartbeatWorker()
-    maint_worker = MaintenanceWorker()
+
+async def _amain(mode: str, instance: str | None = None) -> None:
+    hb_worker = HeartbeatWorker(instance)
+    maint_worker = MaintenanceWorker(instance)
 
     import signal
 
@@ -238,6 +291,9 @@ async def _amain(mode: str) -> None:
     signal.signal(signal.SIGTERM, shutdown)
 
     mode = (mode or "both").strip().lower()
+    instance_info = f" (instance: {instance})" if instance else ""
+    logger.info(f"Starting worker in {mode} mode{instance_info}")
+
     if mode == "heartbeat":
         await hb_worker.run()
         return
@@ -258,8 +314,13 @@ def main() -> int:
         default=os.getenv("HEXIS_WORKER_MODE", "both"),
         help="Which worker to run.",
     )
+    p.add_argument(
+        "--instance", "-i",
+        default=os.getenv("HEXIS_INSTANCE"),
+        help="Target a specific instance (overrides HEXIS_INSTANCE env var).",
+    )
     args = p.parse_args()
-    asyncio.run(_amain(args.mode))
+    asyncio.run(_amain(args.mode, args.instance))
     return 0
 
 

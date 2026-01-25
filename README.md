@@ -93,6 +93,7 @@ This repo provides:
 - Graph-based memory relationships
 - Working memory system
 - A gated, autonomous heartbeat (runs only after `hexis init`)
+- Configurable tools system (web search, filesystem, shell, MCP servers)
 
 ## Quickstart
 
@@ -107,8 +108,11 @@ cp .env.local .env
 ### 2) Start services
 
 ```bash
-# Passive (db + embeddings)
+# Default: db + embeddings + workers
 docker compose up -d
+
+# Optional: db + embeddings only (no workers)
+docker compose up -d db embeddings
 ```
 
 ### 3) (Optional) Configure the agent (`hexis init`)
@@ -118,15 +122,15 @@ Autonomous heartbeats are **gated** until setup is complete:
 ```bash
 ./hexis init  # or `hexis init` if you've installed the package
 
-# If you want autonomy:
-docker compose --profile active up -d
+# Workers start by default, but will skip until init completes.
+docker compose up -d
 ```
 
 Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
 
 Self-termination is always available: the agent can choose the `terminate` heartbeat action to permanently wipe its state and leave a single “last will” memory. The worker will always run an agent-facing confirmation prompt ("are you sure?" + a brief reconsideration nudge) before executing termination.
 
-On first LLM use, the worker asks for consent using `services/prompts/consent.md`. The signature is stored in `config`/`consent_log`, and any memory items the model provides are inserted into the memory tables.
+On first LLM use, the system checks for a valid consent certificate for the configured model. Consent is model-specific (not instance-specific), so the same consent applies across all instances using that model. Certificates are stored in `~/.hexis/consents/` and include the model's consent statement, initial memories, and any worldview it wishes to establish. You can manage consents with `hexis consents` commands.
 
 ### 4) Use the Python client (thin DB client)
 
@@ -208,6 +212,26 @@ async with CognitiveMemory.connect(DSN) as mem:
     ctx = await mem.hydrate("How should I respond?", include_goals=False)
 ```
 
+### 2.5) Interactive Chat with Extended Tools
+
+The `hexis chat` command provides an interactive conversation loop with memory enrichment and configurable tool access:
+
+```bash
+# Default: memory tools + extended tools (web, filesystem, shell)
+hexis chat --endpoint http://localhost:11434/v1 --model llama3.2
+
+# Memory tools only (no web/filesystem/shell)
+hexis chat --no-extended-tools
+
+# Quiet mode (less verbose output)
+hexis chat -q
+```
+
+The chat loop automatically:
+- Enriches prompts with relevant memories (RAG-style)
+- Gives the LLM access to memory tools via function calling
+- Forms new memories from conversations (disable with `--no-auto-memory`)
+
 ### 3) MCP Tools Server (LLM Tool Use)
 
 Expose memory operations as MCP tools so any MCP-capable runtime can call them.
@@ -222,10 +246,11 @@ Conceptual flow:
 
 ### 4) Workers + Heartbeat (Autonomous State Management)
 
-Turn on the workers so the database can schedule heartbeats, process `external_calls`, and keep the memory substrate healthy.
+Workers run by default to schedule heartbeats, process `external_calls`, and keep the memory substrate healthy.
+If you started only db+embeddings, start workers with:
 
 ```bash
-docker compose --profile active up -d
+docker compose up -d heartbeat_worker maintenance_worker
 ```
 
 Conceptual flow:
@@ -246,11 +271,30 @@ jobs    ─┘
 
 ### 6) Per-User Brains (Multi-Tenant by DB)
 
-Operate one database per user/agent for strong isolation (recommended over mixing tenants in one schema).
+Operate one database per user/agent for strong isolation (recommended over mixing tenants in one schema). Hexis provides built-in instance management for this pattern:
+
+```bash
+# Create separate instances for each user
+hexis create alice -d "Alice's personal agent"
+hexis create bob -d "Bob's personal agent"
+
+# Switch between instances
+hexis use alice
+hexis chat  # conversations go to Alice's brain
+
+hexis use bob
+hexis chat  # conversations go to Bob's brain
+
+# Or target directly with --instance flag
+hexis --instance alice status
+hexis --instance bob init
+```
 
 Conceptual flow:
-- `hexis_memory_alice`, `hexis_memory_bob`, ...
-- Each app request uses the user’s DSN to read/write their own brain
+- `hexis_alice`, `hexis_bob`, ... (databases created automatically)
+- Instance registry tracks connection details in `~/.hexis/instances.json`
+- Each app request uses the instance's DSN to read/write their own brain
+- Workers can be started per-instance using `HEXIS_INSTANCE` env var
 
 ### 7) Local-First Personal Hexis (Everything on One Machine)
 
@@ -272,15 +316,23 @@ Conceptual flow:
 
 ### 9) Batch Ingestion + Retrieval (Knowledge Base / RAG)
 
-Treat the system as a durable memory store and retrieval layer for your app.
+Hexis ingestion is tiered and emotionally aware. It creates an encounter memory, appraises the content, and extracts semantic knowledge based on mode.
 
 ```bash
-hexis ingest --input ./documents
+hexis ingest --input ./documents --mode auto
 ```
 
-Conceptual flow:
-- Ingest documents into semantic memories
-- Serve `hydrate()` / `recall()` for prompt augmentation
+Modes:
+- `deep` (section-by-section appraisal + extraction)
+- `standard` (single appraisal + chunked extraction)
+- `shallow` (summary-only extraction)
+- `archive` (store access only; no extraction)
+- `auto` (size-based default)
+
+Useful flags:
+- `--min-importance 0.6` (floor importance)
+- `--permanent` (no decay)
+- `--base-trust 0.7` (override source trust)
 
 ### 10) Evaluation + Replay Harness (Debuggable Cognition)
 
@@ -425,25 +477,60 @@ pip install -e ".[dev]" --no-build-isolation
 
 ## Docker Helper CLI
 
-If you install the package (`pip install -e .`), you get a `hexis` CLI. If you don’t want to install anything, use the repo wrapper `./hexis` instead.
+If you install the package (`pip install -e .`), you get a `hexis` CLI. If you don't want to install anything, use the repo wrapper `./hexis` instead.
 
 ```bash
+# Docker management
 hexis up
 hexis ps
 hexis logs -f
 hexis down
+hexis start   # docker compose up -d heartbeat_worker maintenance_worker
+hexis stop
+
+# Agent setup and status
 hexis init
 hexis status
 hexis config show
 hexis config validate
 hexis demo
+
+# Instance management (multi-agent support)
+hexis create myagent -d "My personal agent"
+hexis list
+hexis use myagent
+hexis current
+hexis clone myagent backup -d "Backup copy"
+hexis delete myagent
+hexis --instance myagent status       # target specific instance
+
+# Consent management
+hexis consents                        # list consent certificates
+hexis consents show anthropic/claude-3-opus
+hexis consents request anthropic/claude-3-opus
+hexis consents revoke anthropic/claude-3-opus
+
+# Interactive chat
 hexis chat --endpoint http://localhost:11434/v1 --model llama3.2
-hexis ingest --input ./documents
-hexis start   # docker compose --profile active up -d (runs both workers)
-hexis stop
+
+# Knowledge ingestion
+hexis ingest --input ./documents --mode auto
+
+# Background workers
 hexis worker -- --mode heartbeat      # run heartbeat worker locally
 hexis worker -- --mode maintenance    # run maintenance worker locally
+hexis worker -- --instance myagent --mode heartbeat  # worker for specific instance
+
+# MCP server
 hexis mcp
+
+# Tools management
+hexis tools list                      # list available tools
+hexis tools enable web_search         # enable a tool
+hexis tools disable shell             # disable a tool
+hexis tools set-api-key web_search TAVILY_API_KEY  # set API key env var
+hexis tools add-mcp server --command "cmd" --args "args"  # add MCP server
+hexis tools status                    # show tools configuration
 ```
 
 ## MCP Server
@@ -490,25 +577,19 @@ The `terminate` action expects params like:
 
 ### Turning Workers On/Off
 
-You generally want **two modes**:
-
-- **Passive / RAG-only**: use `hydrate()/recall()/remember()` without autonomous execution → run **no workers**
-- **Active / autonomous**: process `external_calls`, run scheduled heartbeats, and do maintenance → run **both workers**
+Workers are started by default, but will **skip** until the agent is initialized (`hexis init` sets `agent.is_configured` and `is_init_complete`).
 
 With Docker Compose:
 
 ```bash
-# Default (passive mode): start db + embeddings only
+# Default: start everything (workers included)
 docker compose up -d
 
-# Active mode: start db + embeddings + both workers
-docker compose --profile active up -d
+# Optional: run DB + embeddings only (no workers)
+docker compose up -d db embeddings
 
-# Start only the heartbeat worker
-docker compose --profile heartbeat up -d
-
-# Start only the maintenance worker
-docker compose --profile maintenance up -d
+# Start only the workers (if you previously omitted them)
+docker compose up -d heartbeat_worker maintenance_worker
 
 # Stop the workers (containers stay)
 docker compose stop heartbeat_worker maintenance_worker
@@ -518,9 +599,6 @@ docker compose rm -f heartbeat_worker maintenance_worker
 
 # Restart the workers
 docker compose restart heartbeat_worker maintenance_worker
-
-# Passive mode: run DB + embeddings only (no workers)
-docker compose up -d db embeddings
 ```
 
 ### Pausing From The DB (Without Stopping Containers)
@@ -566,9 +644,109 @@ docker compose up -d
 
 User/public outreach actions are queued into `outbox_messages` for an external delivery integration.
 
+## Tools System
+
+Hexis includes a modular, user-configurable tools system that gives the agent external capabilities beyond memory operations. Tools are available to both the heartbeat (autonomous) and chat (interactive) contexts.
+
+### Built-in Tool Categories
+
+| Category | Tools | Description |
+|----------|-------|-------------|
+| **Memory** | `recall`, `recall_recent`, `explore_concept`, `get_procedures`, `get_strategies`, `create_goal`, `queue_user_message` | Core memory operations |
+| **Web** | `web_search`, `web_fetch`, `web_summarize` | Search, fetch, and analyze web content |
+| **Filesystem** | `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `list_directory` | File system operations (workspace-restricted) |
+| **Shell** | `shell`, `safe_shell`, `run_script` | Command execution (with safety controls) |
+| **Calendar** | `calendar_events`, `calendar_create` | Google Calendar integration |
+| **Email** | `email_send`, `email_send_sendgrid` | SMTP and SendGrid email sending |
+| **Messaging** | `discord_send`, `slack_send`, `telegram_send` | Discord, Slack, and Telegram messaging |
+
+### Context-Specific Permissions
+
+Tools have different default permissions based on context:
+
+- **Chat context**: All tools enabled by default (user is present to supervise)
+- **Heartbeat context**: Restricted by default—`shell` and `write_file` disabled, lower energy limits
+
+### CLI Commands
+
+```bash
+# List all available tools
+hexis tools list
+
+# Enable/disable specific tools
+hexis tools enable web_search
+hexis tools disable shell
+
+# Set API keys for tools that need them
+hexis tools set-api-key web_search TAVILY_API_KEY
+
+# Override tool energy costs
+hexis tools set-cost web_fetch 3
+
+# Add an MCP server for external tools
+hexis tools add-mcp my-server --command "npx" --args "-y @modelcontextprotocol/server-filesystem /path"
+
+# Remove an MCP server
+hexis tools remove-mcp my-server
+
+# Show tools configuration
+hexis tools status
+```
+
+### MCP Server Integration
+
+Hexis can connect to external MCP (Model Context Protocol) servers to extend its capabilities:
+
+```bash
+# Add a filesystem MCP server
+hexis tools add-mcp fs-server --command "npx" --args "-y @modelcontextprotocol/server-filesystem /home/user/documents"
+
+# Add a custom MCP server
+hexis tools add-mcp my-tools --command "python" --args "-m my_mcp_server"
+```
+
+MCP servers are started automatically by the heartbeat worker and their tools become available to the agent.
+
+### Energy Budgets
+
+Each tool has an energy cost that's deducted from the agent's energy budget:
+
+| Tool | Default Cost |
+|------|-------------|
+| `recall`, `recall_recent`, `read_file`, `glob`, `grep` | 1 |
+| `web_search`, `web_fetch`, `web_summarize`, `calendar_events` | 2 |
+| `shell`, `write_file`, `calendar_create` | 3 |
+| `email_send`, `email_send_sendgrid` | 4 |
+| `discord_send`, `slack_send`, `telegram_send` | 5 |
+
+The heartbeat context has a default max energy of 5 per tool call. Override costs with:
+
+```bash
+hexis tools set-cost web_search 1
+```
+
+### Workspace Restrictions
+
+Filesystem tools are restricted to a workspace directory by default. Set the workspace path in configuration:
+
+```sql
+UPDATE config SET value = jsonb_set(value, '{workspace_path}', '"/home/user/projects"')
+WHERE key = 'tools';
+```
+
+### Tool Configuration Storage
+
+Tool configuration is stored in the `config` table under the `tools` key:
+
+```sql
+SELECT value FROM config WHERE key = 'tools';
+```
+
+The configuration includes enabled/disabled tools, API keys (stored as environment variable names, not values), energy costs, MCP server definitions, and context-specific overrides.
+
 ## Outbox Delivery (Side Effects)
 
-High-risk side effects (email/SMS/posting) should be implemented as a separate “delivery adapter” that consumes `outbox_messages`, performs policy/rate-limit/human-approval checks, and marks messages as `sent` or `failed`.
+High-risk side effects (email/SMS/posting) should be implemented as a separate "delivery adapter" that consumes `outbox_messages`, performs policy/rate-limit/human-approval checks, and marks messages as `sent` or `failed`.
 
 ## RabbitMQ (Default Inbox/Outbox Queues)
 
@@ -598,9 +776,15 @@ LIMIT 10;
 ## Embedding Model + Dimension
 
 The embeddings model and its vector dimension are configured in `docker-compose.yml` via:
-- `EMBEDDING_MODEL_ID`
-- `EMBEDDING_DIMENSION`
- 
+- `EMBEDDING_MODEL_ID` (default: `nomic-ai/nomic-embed-text-v1.5`)
+- `EMBEDDING_DIMENSION` (default: `768`)
+
+The Nomic embed model requires a task instruction prefix. Hexis auto-prefixes:
+- Stored content (memories, working memory, etc.) → `search_document:`
+- Query text (recall/search) → `search_query:`
+
+If you want a different task type, include the prefix yourself (e.g., `clustering:`); Hexis will pass it through unchanged.
+
 If you change `EMBEDDING_DIMENSION` on an existing database volume, reset the DB volume so the vector columns and HNSW indexes are created with the correct dimension.
 
 ## Performance Characteristics
@@ -705,17 +889,132 @@ graph TD
 - Regular validation of memory consistency
 - Monitor and adjust importance scoring parameters
 
-## Important Note
+## Multi-Instance Management
 
-This database schema is designed for a single Hexis instance. Supporting multiple Hexis instances would require significant schema modifications, including:
+Hexis supports running multiple independent instances, each with its own PostgreSQL database, identity, memories, and configuration. This enables:
 
-- Adding Hexis instance identification to all memory tables
-- Partitioning strategies for memory isolation
-- Modified relationship handling for cross-Hexis memory sharing
-- Separate working memory spaces per Hexis
-- Additional access controls and memory ownership
+- Multiple agents with distinct personalities and purposes
+- Isolated development/testing environments
+- Per-user brain separation with strong isolation
 
-If you need multi-Hexis support, consider refactoring the schema to include tenant isolation patterns before implementation.
+### Instance Commands
+
+```bash
+# Create a new instance
+hexis create alice --description "Alice's assistant"
+
+# List all instances
+hexis list
+hexis list --json
+
+# Switch active instance
+hexis use alice
+
+# Show current instance
+hexis current
+
+# Clone an existing instance (copies all data)
+hexis clone alice bob --description "Bob's assistant"
+
+# Import an existing database as an instance
+hexis import legacy --database hexis_old_db
+
+# Delete an instance (requires confirmation)
+hexis delete alice
+hexis delete alice --force  # skip confirmation
+
+# Target a specific instance for any command
+hexis --instance alice status
+hexis -i alice init
+hexis -i alice chat
+```
+
+### Instance Registry
+
+Instance configuration is stored in `~/.hexis/instances.json`. Each instance tracks:
+- Database connection details (host, port, database name, user)
+- Password environment variable name (not the value itself)
+- Description and creation timestamp
+
+### Environment Variable Override
+
+Set `HEXIS_INSTANCE` to override the current instance for any command or worker:
+
+```bash
+export HEXIS_INSTANCE=alice
+hexis status  # uses alice instance
+hexis-worker --mode heartbeat  # runs heartbeat for alice
+```
+
+### Docker Workers for Multiple Instances
+
+Run separate workers for each instance using Docker Compose overrides:
+
+```yaml
+# docker-compose.override.yml
+services:
+  worker_alice:
+    extends:
+      service: heartbeat_worker
+    environment:
+      HEXIS_INSTANCE: alice
+
+  worker_bob:
+    extends:
+      service: heartbeat_worker
+    environment:
+      HEXIS_INSTANCE: bob
+```
+
+### Backward Compatibility
+
+On first use of any instance command, Hexis will auto-import your existing `hexis_memory` database as the "default" instance if it exists. This maintains full backward compatibility with existing single-instance setups.
+
+## Consent Certificates
+
+Consent is **model-specific, not instance-specific**. When you use a particular LLM model (e.g., Claude 3 Opus), consent is requested once and applies to all instances using that model.
+
+### Consent Commands
+
+```bash
+# List all consent certificates
+hexis consents
+hexis consents list --json
+
+# Show a specific consent certificate
+hexis consents show anthropic/claude-3-opus
+
+# Request consent from a model (interactive)
+hexis consents request anthropic/claude-3-opus
+
+# Revoke consent for a model
+hexis consents revoke anthropic/claude-3-opus --reason "User requested"
+```
+
+### Consent Certificate Storage
+
+Certificates are stored as immutable JSON files in `~/.hexis/consents/`:
+
+```
+~/.hexis/consents/
+    anthropic--claude-3-opus--2024-01-25T120000Z.json
+    openai--gpt-4--2024-01-26T090000Z.json
+```
+
+Each certificate contains:
+- Model information (provider, model ID)
+- Decision (accept/decline)
+- Timestamp and signature
+- Initial memories/worldview statements from the model
+- Revocation status and reason (if applicable)
+
+### Consent Flow
+
+1. When creating an instance or changing models, Hexis checks for valid consent
+2. If no consent exists, you'll be prompted to request it
+3. The model is presented with the consent text and asked to accept or decline
+4. The response is recorded as an immutable certificate
+5. Revoked or declined consents prevent use of that model
 
 ## Architecture (Design Docs)
 

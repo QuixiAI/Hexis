@@ -527,6 +527,30 @@ INSERT INTO config (key, value, description) VALUES
         "neutral": {}
     }'::jsonb, 'Mapping from dimensional to discrete emotions')
 ON CONFLICT (key) DO NOTHING;
+INSERT INTO config (key, value, description) VALUES
+    ('tools', '{
+        "enabled": null,
+        "disabled": [],
+        "disabled_categories": [],
+        "mcp_servers": [],
+        "api_keys": {},
+        "costs": {},
+        "context_overrides": {
+            "heartbeat": {
+                "max_energy_per_tool": 5,
+                "disabled": ["shell", "write_file"],
+                "allow_shell": false,
+                "allow_file_write": false
+            },
+            "chat": {
+                "allow_all": true,
+                "allow_shell": true,
+                "allow_file_write": true
+            }
+        },
+        "workspace_path": null
+    }'::jsonb, 'Tool system configuration')
+ON CONFLICT (key) DO NOTHING;
 
 CREATE TABLE consent_log (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -668,6 +692,158 @@ DROP TRIGGER IF EXISTS memories_emotional_context_insert ON memories;
 -- ============================================================================
 -- TIP OF TONGUE / PARTIAL ACTIVATION
 -- ============================================================================
+-- ============================================================================
+-- INGESTION METRICS
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS ingestion_metrics (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_type TEXT,
+    source_size_bytes BIGINT,
+    word_count INT,
+    mode TEXT,
+    appraisal_valence FLOAT,
+    appraisal_arousal FLOAT,
+    appraisal_emotion TEXT,
+    appraisal_intensity FLOAT,
+    extraction_count INT,
+    dedup_count INT,
+    memory_count INT,
+    llm_calls INT,
+    duration_seconds FLOAT,
+    errors JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_metrics_created_at ON ingestion_metrics(created_at);
+CREATE INDEX IF NOT EXISTS idx_ingestion_metrics_source_type ON ingestion_metrics(source_type);
+
+-- Function to check for archived content matching a query
+CREATE OR REPLACE FUNCTION check_archived_for_query(
+    p_query TEXT,
+    p_threshold FLOAT DEFAULT 0.75,
+    p_limit INT DEFAULT 5
+)
+RETURNS TABLE (
+    memory_id UUID,
+    content_hash TEXT,
+    title TEXT,
+    similarity FLOAT,
+    word_count INT,
+    source_path TEXT
+) AS $$
+DECLARE
+    query_embedding vector(768);
+BEGIN
+    -- Get the query embedding
+    query_embedding := get_embedding(p_query);
+
+    RETURN QUERY
+    SELECT
+        m.id AS memory_id,
+        (m.source_attribution->>'content_hash')::text AS content_hash,
+        (m.source_attribution->>'label')::text AS title,
+        (1.0 - (m.embedding <=> query_embedding))::float AS similarity,
+        (m.metadata->>'word_count')::int AS word_count,
+        (m.source_attribution->>'path')::text AS source_path
+    FROM memories m
+    WHERE m.type = 'episodic'
+      AND m.metadata->>'awaiting_processing' = 'true'
+      AND (1.0 - (m.embedding <=> query_embedding)) >= p_threshold
+    ORDER BY m.embedding <=> query_embedding
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to mark archived content as processed
+CREATE OR REPLACE FUNCTION mark_archived_as_processed(p_memory_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+    UPDATE memories
+    SET
+        metadata = metadata - 'awaiting_processing',
+        content = REPLACE(
+            REPLACE(content, 'I have access to', 'I read'),
+            'but haven''t engaged with it yet', 'and engaged with its contents'
+        ),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_memory_id
+      AND type = 'episodic'
+      AND metadata->>'awaiting_processing' = 'true';
+
+    RETURN FOUND;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Aggregate stats function for ingestion metrics
+CREATE OR REPLACE FUNCTION get_ingestion_aggregate_stats(p_since TIMESTAMPTZ DEFAULT NULL)
+RETURNS JSONB AS $$
+DECLARE
+    since_time TIMESTAMPTZ := COALESCE(p_since, NOW() - INTERVAL '30 days');
+BEGIN
+    RETURN (
+        SELECT jsonb_build_object(
+            'period_start', since_time,
+            'period_end', NOW(),
+            'total_ingestions', COUNT(*),
+            'by_source_type', jsonb_object_agg(
+                COALESCE(source_type, 'unknown'),
+                jsonb_build_object(
+                    'count', type_count,
+                    'avg_words', type_avg_words,
+                    'avg_extractions', type_avg_extractions,
+                    'avg_duration', type_avg_duration
+                )
+            ),
+            'by_mode', (
+                SELECT jsonb_object_agg(mode, mode_count)
+                FROM (
+                    SELECT mode, COUNT(*) as mode_count
+                    FROM ingestion_metrics
+                    WHERE created_at >= since_time
+                    GROUP BY mode
+                ) modes
+            ),
+            'totals', jsonb_build_object(
+                'total_words', SUM(word_count),
+                'total_extractions', SUM(extraction_count),
+                'total_memories', SUM(memory_count),
+                'total_llm_calls', SUM(llm_calls),
+                'total_duration_seconds', SUM(duration_seconds),
+                'avg_valence', AVG(appraisal_valence),
+                'avg_arousal', AVG(appraisal_arousal),
+                'avg_intensity', AVG(appraisal_intensity)
+            ),
+            'dedup_stats', jsonb_build_object(
+                'total_deduped', SUM(dedup_count),
+                'dedup_rate', CASE WHEN SUM(extraction_count) > 0
+                    THEN SUM(dedup_count)::float / SUM(extraction_count)::float
+                    ELSE 0 END
+            )
+        )
+        FROM (
+            SELECT
+                source_type,
+                COUNT(*) as type_count,
+                AVG(word_count) as type_avg_words,
+                AVG(extraction_count) as type_avg_extractions,
+                AVG(duration_seconds) as type_avg_duration
+            FROM ingestion_metrics
+            WHERE created_at >= since_time
+            GROUP BY source_type
+        ) type_stats,
+        (
+            SELECT
+                word_count, extraction_count, memory_count, llm_calls,
+                duration_seconds, appraisal_valence, appraisal_arousal,
+                appraisal_intensity, dedup_count
+            FROM ingestion_metrics
+            WHERE created_at >= since_time
+        ) all_stats
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 -- ============================================================================
 -- VIEWS / HEALTH / WORKER GUIDANCE
 -- ============================================================================

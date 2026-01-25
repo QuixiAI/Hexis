@@ -3,10 +3,108 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from core.instance import InstanceRegistry
+
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.cli]
+
+
+# Instance CLI tests
+
+@pytest.fixture
+def temp_hexis_dir(tmp_path):
+    """Create a temporary .hexis directory for instance tests."""
+    hexis_dir = tmp_path / ".hexis"
+    hexis_dir.mkdir()
+    return hexis_dir
+
+
+async def test_cli_instance_list_empty(temp_hexis_dir):
+    """Test listing instances when none exist."""
+    env = os.environ.copy()
+    with patch.object(InstanceRegistry, "CONFIG_DIR", temp_hexis_dir):
+        with patch.object(InstanceRegistry, "CONFIG_FILE", temp_hexis_dir / "instances.json"):
+            p = subprocess.run(
+                [sys.executable, "-m", "apps.hexis_cli", "list"],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(Path(__file__).resolve().parents[1]),
+            )
+    assert p.returncode == 0
+    assert "No instances" in p.stdout or p.stdout.strip() == ""
+
+
+async def test_cli_instance_current_none(temp_hexis_dir):
+    """Test showing current instance when none is set."""
+    env = os.environ.copy()
+    with patch.object(InstanceRegistry, "CONFIG_DIR", temp_hexis_dir):
+        with patch.object(InstanceRegistry, "CONFIG_FILE", temp_hexis_dir / "instances.json"):
+            p = subprocess.run(
+                [sys.executable, "-m", "apps.hexis_cli", "current"],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(Path(__file__).resolve().parents[1]),
+            )
+    assert p.returncode == 0
+
+
+async def test_cli_instance_use_nonexistent():
+    """Test switching to a nonexistent instance fails."""
+    env = os.environ.copy()
+    p = subprocess.run(
+        [sys.executable, "-m", "apps.hexis_cli", "use", "nonexistent-instance-xyz"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert p.returncode != 0
+
+
+# Consent CLI tests
+
+async def test_cli_consents_list(temp_hexis_dir):
+    """Test listing consent certificates."""
+    env = os.environ.copy()
+    consents_dir = temp_hexis_dir / "consents"
+    consents_dir.mkdir()
+
+    from core.consent import ConsentManager
+    with patch.object(ConsentManager, "CONSENTS_DIR", consents_dir):
+        p = subprocess.run(
+            [sys.executable, "-m", "apps.hexis_cli", "consents"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(Path(__file__).resolve().parents[1]),
+        )
+    assert p.returncode == 0
+
+
+async def test_cli_consents_show_nonexistent(temp_hexis_dir):
+    """Test showing a nonexistent consent certificate."""
+    env = os.environ.copy()
+    consents_dir = temp_hexis_dir / "consents"
+    consents_dir.mkdir()
+
+    from core.consent import ConsentManager
+    with patch.object(ConsentManager, "CONSENTS_DIR", consents_dir):
+        p = subprocess.run(
+            [sys.executable, "-m", "apps.hexis_cli", "consents", "show", "anthropic/nonexistent"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(Path(__file__).resolve().parents[1]),
+        )
+    assert p.returncode != 0 or "not found" in p.stderr.lower()
+
+
+# Original tests
 
 
 async def test_cli_status_json_no_docker(db_pool):

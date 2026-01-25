@@ -25,6 +25,26 @@ AS $$
         )
     );
 $$;
+CREATE OR REPLACE FUNCTION ensure_embedding_prefix(
+    p_text TEXT,
+    p_prefix TEXT DEFAULT 'search_document'
+) RETURNS TEXT AS $$
+DECLARE
+    normalized_prefix TEXT;
+BEGIN
+    IF p_text IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF p_text ~* '^\s*(search_document|search_query|clustering|classification)\s*:' THEN
+        RETURN ltrim(p_text);
+    END IF;
+    normalized_prefix := NULLIF(btrim(p_prefix), '');
+    IF normalized_prefix IS NULL THEN
+        RETURN p_text;
+    END IF;
+    RETURN normalized_prefix || ': ' || p_text;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
 CREATE OR REPLACE FUNCTION get_embedding(text_content TEXT)
 RETURNS vector AS $$
 	DECLARE
@@ -34,8 +54,11 @@ RETURNS vector AS $$
 	    embedding_array FLOAT[];
 	    embedding_json JSONB;
 	    v_content_hash TEXT;
+	    v_alt_hash TEXT;
 	    cached_embedding vector;
 	    expected_dim INT;
+	    effective_text TEXT;
+	    stripped_text TEXT;
 	    start_ts TIMESTAMPTZ;
 	    retry_seconds INT;
 	    retry_interval_seconds FLOAT;
@@ -43,16 +66,34 @@ RETURNS vector AS $$
 	BEGIN
 	    PERFORM sync_embedding_dimension_config();
 	    expected_dim := embedding_dimension();
+	    effective_text := ensure_embedding_prefix(text_content, 'search_document');
 	    v_content_hash := encode(sha256(text_content::bytea), 'hex');
-    SELECT ec.embedding INTO cached_embedding
-    FROM embedding_cache ec
-    WHERE ec.content_hash = v_content_hash;
+	    SELECT ec.embedding INTO cached_embedding
+	    FROM embedding_cache ec
+	    WHERE ec.content_hash = v_content_hash;
 
-    IF FOUND THEN
-        RETURN cached_embedding;
-    END IF;
+	    IF FOUND THEN
+	        RETURN cached_embedding;
+	    END IF;
+	    IF text_content ~* '^\s*(search_document|search_query|clustering|classification)\s*:' THEN
+	        stripped_text := regexp_replace(
+	            text_content,
+	            '^\s*(search_document|search_query|clustering|classification)\s*:\s*',
+	            '',
+	            'i'
+	        );
+	        v_alt_hash := encode(sha256(stripped_text::bytea), 'hex');
+	        IF v_alt_hash <> v_content_hash THEN
+	            SELECT ec.embedding INTO cached_embedding
+	            FROM embedding_cache ec
+	            WHERE ec.content_hash = v_alt_hash;
+	            IF FOUND THEN
+	                RETURN cached_embedding;
+	            END IF;
+	        END IF;
+	    END IF;
 	    service_url := (SELECT CASE WHEN jsonb_typeof(value) = 'string' THEN value #>> '{}' ELSE value::text END FROM config WHERE key = 'embedding.service_url');
-	    request_body := json_build_object('inputs', text_content)::TEXT;
+	    request_body := json_build_object('inputs', effective_text)::TEXT;
 	    retry_seconds := COALESCE(
 	        (SELECT (value #>> '{}')::int FROM config WHERE key = 'embedding.retry_seconds'),
 	        30

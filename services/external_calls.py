@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+import logging
+import uuid
+from typing import Any, TYPE_CHECKING
 
 from services.heartbeat_prompt import build_heartbeat_decision_prompt
 from core.llm_config import load_llm_config
@@ -14,10 +16,20 @@ from services.prompt_resources import (
     load_termination_confirm_prompt,
 )
 
+if TYPE_CHECKING:
+    from core.tools import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
 
 class ExternalCallProcessor:
-    def __init__(self, *, max_retries: int = 3):
+    def __init__(self, *, max_retries: int = 3, tool_registry: "ToolRegistry | None" = None):
         self.max_retries = max_retries
+        self._tool_registry = tool_registry
+
+    def set_tool_registry(self, registry: "ToolRegistry") -> None:
+        """Set the tool registry for processing tool_use calls."""
+        self._tool_registry = registry
 
     async def apply_result(self, conn, call: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
         return await apply_external_call_result(conn, call=call, output=output)
@@ -25,9 +37,75 @@ class ExternalCallProcessor:
     async def process_call_payload(self, conn, call_type: str, call_input: dict[str, Any]) -> dict[str, Any]:
         if call_type == "think":
             return await self._process_think_call(conn, call_input)
+        if call_type == "tool_use":
+            return await self._process_tool_use_call(conn, call_input)
         if call_type == "embed":
             raise RuntimeError("external_calls type 'embed' is unsupported; use get_embedding() inside Postgres")
         return {"error": f"Unsupported call_type: {call_type}"}
+
+    async def _process_tool_use_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
+        """Process a tool_use external call."""
+        if not self._tool_registry:
+            return {"error": "Tool registry not configured", "success": False}
+
+        tool_name = call_input.get("tool_name") or call_input.get("name")
+        if not tool_name:
+            return {"error": "Missing tool_name in call_input", "success": False}
+
+        arguments = call_input.get("arguments") or call_input.get("params") or {}
+        heartbeat_id = call_input.get("heartbeat_id")
+        energy_available = call_input.get("energy_available")
+
+        from core.tools import ToolContext, ToolExecutionContext
+
+        # Build execution context for heartbeat
+        context = ToolExecutionContext(
+            tool_context=ToolContext.HEARTBEAT,
+            call_id=str(uuid.uuid4()),
+            heartbeat_id=heartbeat_id,
+            energy_available=energy_available,
+            allow_network=True,
+            allow_shell=False,  # Default restrictive; can be overridden by config
+            allow_file_write=False,
+            allow_file_read=True,
+        )
+
+        # Apply context overrides from config
+        try:
+            config = await self._tool_registry.get_config()
+            ctx_override = config.get_context_overrides(ToolContext.HEARTBEAT)
+            context.allow_shell = ctx_override.allow_shell
+            context.allow_file_write = ctx_override.allow_file_write
+            if config.workspace_path:
+                context.workspace_path = config.workspace_path
+        except Exception as e:
+            logger.warning(f"Failed to load tool config: {e}")
+
+        # Execute the tool
+        try:
+            result = await self._tool_registry.execute(tool_name, arguments, context)
+
+            return {
+                "kind": "tool_use",
+                "tool_name": tool_name,
+                "success": result.success,
+                "output": result.output,
+                "error": result.error,
+                "error_type": result.error_type.value if result.error_type else None,
+                "energy_spent": result.energy_spent,
+                "duration_seconds": result.duration_seconds,
+                "heartbeat_id": heartbeat_id,
+            }
+
+        except Exception as e:
+            logger.exception(f"Tool execution failed: {tool_name}")
+            return {
+                "kind": "tool_use",
+                "tool_name": tool_name,
+                "success": False,
+                "error": str(e),
+                "heartbeat_id": heartbeat_id,
+            }
 
     async def _process_think_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
         kind = (call_input.get("kind") or "").strip() or "heartbeat_decision"

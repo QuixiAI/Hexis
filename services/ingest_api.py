@@ -32,6 +32,10 @@ async def stream_ingestion(
     path: str,
     recursive: bool,
     llm_config: dict[str, Any],
+    mode: str | None = None,
+    min_importance: float | None = None,
+    permanent: bool = False,
+    base_trust: float | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     normalized = normalize_llm_config(llm_config)
     cancel_event = _INGESTION_CANCEL.get(session_id) or threading.Event()
@@ -63,6 +67,10 @@ async def stream_ingestion(
             db_name=db_name,
             db_user=db_user,
             db_password=db_password,
+            mode=mode or "auto",
+            min_importance_floor=min_importance,
+            permanent=permanent,
+            base_trust=base_trust,
             verbose=True,
             log=log,
             cancel_check=cancel_event.is_set,

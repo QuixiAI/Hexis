@@ -793,6 +793,9 @@ BEGIN
     IF is_agent_terminated() THEN
         RETURN FALSE;
     END IF;
+    IF NOT is_agent_configured() THEN
+        RETURN FALSE;
+    END IF;
     IF NOT is_init_complete() THEN
         RETURN FALSE;
     END IF;

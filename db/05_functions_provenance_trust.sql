@@ -271,7 +271,7 @@ CREATE OR REPLACE FUNCTION search_clusters_by_query(
 BEGIN
     RETURN QUERY
     WITH query_embedding AS (
-        SELECT get_embedding(p_query) as emb
+        SELECT get_embedding(ensure_embedding_prefix(p_query, 'search_query')) as emb
     )
     SELECT
         c.id,
@@ -363,7 +363,7 @@ CREATE OR REPLACE FUNCTION search_procedural_memories(
 BEGIN
     RETURN QUERY
     WITH query_embedding AS (
-        SELECT get_embedding(p_task) as emb
+        SELECT get_embedding(ensure_embedding_prefix(p_task, 'search_query')) as emb
     )
     SELECT
         m.id,
@@ -399,7 +399,7 @@ CREATE OR REPLACE FUNCTION search_strategic_memories(
 BEGIN
     RETURN QUERY
     WITH query_embedding AS (
-        SELECT get_embedding(p_situation) as emb
+        SELECT get_embedding(ensure_embedding_prefix(p_situation, 'search_query')) as emb
     )
     SELECT
         m.id,
@@ -1327,7 +1327,7 @@ DECLARE
     query_embedding vector;
     zero_vec vector;
 BEGIN
-    query_embedding := get_embedding(p_query_text);
+    query_embedding := get_embedding(ensure_embedding_prefix(p_query_text, 'search_query'));
     zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
     
     RETURN QUERY
@@ -1728,7 +1728,7 @@ CREATE OR REPLACE FUNCTION search_working_memory(
 	    query_embedding vector;
 	    zero_vec vector;
 	BEGIN
-	    query_embedding := get_embedding(p_query_text);
+	    query_embedding := get_embedding(ensure_embedding_prefix(p_query_text, 'search_query'));
 	    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 	    PERFORM cleanup_working_memory();
 	    

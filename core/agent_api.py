@@ -9,13 +9,59 @@ from typing import Any
 import asyncpg
 
 
-def db_dsn_from_env() -> str:
+def db_dsn_from_env(instance: str | None = None) -> str:
+    """Build DSN, optionally for a specific named instance.
+
+    Args:
+        instance: Optional instance name. If provided, looks up DSN from registry.
+
+    Returns:
+        PostgreSQL DSN string.
+    """
+    if instance:
+        from core.instance import InstanceRegistry
+        return InstanceRegistry().dsn_for(instance)
+
+    # Check for HEXIS_INSTANCE env var
+    from_env = os.getenv("HEXIS_INSTANCE")
+    if from_env:
+        try:
+            from core.instance import InstanceRegistry
+            registry = InstanceRegistry()
+            if registry.exists(from_env):
+                return registry.dsn_for(from_env)
+        except Exception:
+            pass
+
+    # Check for current instance in registry
+    try:
+        from core.instance import InstanceRegistry
+        registry = InstanceRegistry()
+        current = registry.get_current()
+        if current and registry.exists(current):
+            return registry.dsn_for(current)
+    except Exception:
+        pass
+
+    # Fall back to env vars
     host = os.getenv("POSTGRES_HOST", "localhost")
     port = int(os.getenv("POSTGRES_PORT", "43815"))
     database = os.getenv("POSTGRES_DB", "hexis_memory")
     user = os.getenv("POSTGRES_USER", "hexis_user")
     password = os.getenv("POSTGRES_PASSWORD", "hexis_password")
     return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+
+
+def resolve_instance() -> str | None:
+    """Get current instance from HEXIS_INSTANCE env or registry."""
+    from_env = os.getenv("HEXIS_INSTANCE")
+    if from_env:
+        return from_env
+    try:
+        from core.instance import InstanceRegistry
+        return InstanceRegistry().get_current()
+    except Exception:
+        return None
 
 
 def _resolve_wait_seconds(wait_seconds: int | None) -> int:

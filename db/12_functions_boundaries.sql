@@ -15,7 +15,7 @@ DECLARE
     query_emb vector;
 BEGIN
     BEGIN
-        query_emb := get_embedding(p_content);
+        query_emb := get_embedding(ensure_embedding_prefix(p_content, 'search_query'));
     EXCEPTION
         WHEN OTHERS THEN
             query_emb := NULL;
