@@ -37,6 +37,7 @@ async def execute_tool(
         "get_strategies": _handle_get_strategies,
         "list_recent_episodes": _handle_list_recent_episodes,
         "create_goal": _handle_create_goal,
+        "schedule_task": _handle_schedule_task,
         "queue_user_message": _handle_queue_user_message,
     }
     handler = handlers.get(tool_name)
@@ -253,6 +254,40 @@ async def _handle_create_goal(args: dict[str, Any], mem_client: CognitiveMemory)
         due_at=due_at,
     )
     return {"goal_id": str(goal_id), "title": title}
+
+
+async def _handle_schedule_task(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:
+    name = str(args.get("name", "")).strip()
+    schedule_kind = str(args.get("schedule_kind", "")).strip()
+    schedule = args.get("schedule") or {}
+    action_kind = str(args.get("action_kind", "")).strip()
+    action_payload = args.get("action_payload") or {}
+    timezone = args.get("timezone")
+    description = args.get("description")
+    max_runs = args.get("max_runs")
+
+    if not name:
+        return {"error": "Missing name"}
+    if not schedule_kind:
+        return {"error": "Missing schedule_kind"}
+    if not isinstance(schedule, dict):
+        return {"error": "schedule must be an object"}
+    if not action_kind:
+        return {"error": "Missing action_kind"}
+    if not isinstance(action_payload, dict):
+        return {"error": "action_payload must be an object"}
+
+    task_id = await mem_client.create_scheduled_task(
+        name,
+        schedule_kind=schedule_kind,
+        schedule=schedule,
+        action_kind=action_kind,
+        action_payload=action_payload,
+        timezone=timezone,
+        description=description,
+        max_runs=max_runs,
+    )
+    return {"task_id": str(task_id), "name": name, "schedule_kind": schedule_kind, "action_kind": action_kind}
 
 
 async def _handle_queue_user_message(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:

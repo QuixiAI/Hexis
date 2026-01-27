@@ -50,6 +50,13 @@ async def run_maintenance_if_due(conn, stats_hint: dict[str, Any] | None = None)
     return _coerce_json(raw)
 
 
+async def run_scheduled_tasks(conn, limit: int = 25) -> dict[str, Any] | None:
+    raw = await conn.fetchval("SELECT run_scheduled_tasks($1::int)", int(limit))
+    if raw is None:
+        return None
+    return _coerce_json(raw)
+
+
 async def apply_external_call_result(
     conn,
     *,

@@ -49,3 +49,6 @@ CREATE INDEX idx_memory_activation_pending ON memory_activation (background_sear
 CREATE INDEX idx_memory_activation_pending_started ON memory_activation (background_search_started_at, created_at)
     WHERE background_search_pending = TRUE;
 CREATE INDEX idx_memory_activation_expires_at ON memory_activation (expires_at);
+CREATE INDEX idx_scheduled_tasks_due ON scheduled_tasks (next_run_at)
+    WHERE status = 'active';
+CREATE INDEX idx_scheduled_tasks_status ON scheduled_tasks (status);

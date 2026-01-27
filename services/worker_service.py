@@ -14,6 +14,7 @@ from core.state import (
     mark_subconscious_decider_run,
     run_heartbeat,
     run_maintenance_if_due,
+    run_scheduled_tasks,
     should_run_subconscious_decider,
 )
 from services.external_calls import ExternalCallProcessor
@@ -210,6 +211,23 @@ class MaintenanceWorker:
             await self.pool.close()
             logger.info("Disconnected from database")
 
+    async def _publish_outbox(self, messages: list[dict]) -> None:
+        if not messages:
+            return
+        if self.bridge:
+            await self.bridge.publish_outbox_payloads(messages)
+
+    async def _run_scheduled_tasks(self) -> None:
+        if not self.pool:
+            return
+        async with self.pool.acquire() as conn:
+            payload = await run_scheduled_tasks(conn)
+            if not isinstance(payload, dict):
+                return
+            outbox_messages = payload.get("outbox_messages")
+            if isinstance(outbox_messages, list):
+                await self._publish_outbox(outbox_messages)
+
     async def _run_maintenance_if_due(self) -> None:
         if not self.pool:
             return
@@ -246,6 +264,7 @@ class MaintenanceWorker:
                         continue
                     if self.bridge:
                         await self.bridge.poll_inbox_messages()
+                    await self._run_scheduled_tasks()
                     await self._run_maintenance_if_due()
                     await self._run_subconscious_if_due()
                 except Exception as exc:

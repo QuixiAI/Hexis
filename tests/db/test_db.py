@@ -9775,3 +9775,242 @@ async def test_terminate_action_requires_confirmation(db_pool):
             assert await conn.fetchval("SELECT is_agent_terminated()") is False
         finally:
             await tx.rollback()
+
+
+async def test_compute_next_run_weekly(db_pool):
+    async with db_pool.acquire() as conn:
+        base = datetime(2026, 1, 26, 15, 0, tzinfo=timezone.utc)  # Monday
+        schedule = {"weekday": "tuesday", "time": "10:00"}
+        next_run = await conn.fetchval(
+            "SELECT compute_next_run_at('weekly', $1::jsonb, 'UTC', $2::timestamptz)",
+            json.dumps(schedule),
+            base,
+        )
+        assert next_run == datetime(2026, 1, 27, 10, 0, tzinfo=timezone.utc)
+
+
+async def test_compute_next_run_daily(db_pool):
+    async with db_pool.acquire() as conn:
+        base = datetime(2026, 1, 26, 15, 0, tzinfo=timezone.utc)
+        schedule = {"time": "10:00"}
+        next_run = await conn.fetchval(
+            "SELECT compute_next_run_at('daily', $1::jsonb, 'UTC', $2::timestamptz)",
+            json.dumps(schedule),
+            base,
+        )
+        assert next_run == datetime(2026, 1, 27, 10, 0, tzinfo=timezone.utc)
+
+
+async def test_compute_next_run_interval(db_pool):
+    async with db_pool.acquire() as conn:
+        base = datetime(2026, 1, 26, 15, 0, tzinfo=timezone.utc)
+        schedule = {"every_minutes": 30, "anchor_at": "2026-01-26T14:00:00Z"}
+        next_run = await conn.fetchval(
+            "SELECT compute_next_run_at('interval', $1::jsonb, 'UTC', $2::timestamptz)",
+            json.dumps(schedule),
+            base,
+        )
+        assert next_run == datetime(2026, 1, 26, 15, 30, tzinfo=timezone.utc)
+
+
+async def test_compute_next_run_once_past_returns_null(db_pool):
+    async with db_pool.acquire() as conn:
+        base = datetime(2026, 1, 26, 15, 0, tzinfo=timezone.utc)
+        schedule = {"run_at": "2026-01-26T14:00:00Z"}
+        next_run = await conn.fetchval(
+            "SELECT compute_next_run_at('once', $1::jsonb, 'UTC', $2::timestamptz)",
+            json.dumps(schedule),
+            base,
+        )
+        assert next_run is None
+
+
+async def test_create_scheduled_task_rejects_invalid_timezone(db_pool):
+    async with db_pool.acquire() as conn:
+        with pytest.raises(Exception):
+            await conn.fetchval(
+                """
+                SELECT create_scheduled_task(
+                    $1,
+                    'daily',
+                    $2::jsonb,
+                    'queue_user_message',
+                    $3::jsonb,
+                    'Not/AZone'
+                )
+                """,
+                "Bad timezone",
+                json.dumps({"time": "10:00"}),
+                json.dumps({"message": "Test reminder"}),
+            )
+
+
+async def test_create_scheduled_task_once_past_raises(db_pool):
+    async with db_pool.acquire() as conn:
+        with pytest.raises(Exception):
+            await conn.fetchval(
+                """
+                SELECT create_scheduled_task(
+                    $1,
+                    'once',
+                    $2::jsonb,
+                    'queue_user_message',
+                    $3::jsonb,
+                    'UTC'
+                )
+                """,
+                "Past reminder",
+                json.dumps({"run_at": "2000-01-01T00:00:00Z"}),
+                json.dumps({"message": "Too late"}),
+            )
+
+
+async def test_run_scheduled_tasks_queues_reminder(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'interval',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Weekly reminder",
+            json.dumps({"every_minutes": 10}),
+            json.dumps({"message": "Test reminder", "intent": "reminder"}),
+        )
+        await conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+            task_id,
+        )
+
+        payload = _coerce_json(await conn.fetchval("SELECT run_scheduled_tasks(10)"))
+        outbox = payload.get("outbox_messages") or []
+        assert any(
+            (msg.get("payload") or {}).get("message") == "Test reminder"
+            for msg in outbox
+            if isinstance(msg, dict)
+        )
+
+        row = await conn.fetchrow(
+            "SELECT run_count, status, next_run_at FROM scheduled_tasks WHERE id = $1",
+            task_id,
+        )
+        assert row["run_count"] == 1
+        assert row["status"] == "active"
+        assert row["next_run_at"] > datetime.now(timezone.utc)
+
+
+async def test_run_scheduled_tasks_max_runs_disables(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'interval',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC',
+                NULL,
+                'active',
+                1
+            )
+            """,
+            "One-shot reminder",
+            json.dumps({"every_minutes": 5}),
+            json.dumps({"message": "Run once"}),
+        )
+        await conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+            task_id,
+        )
+        _ = _coerce_json(await conn.fetchval("SELECT run_scheduled_tasks(10)"))
+        row = await conn.fetchrow(
+            "SELECT run_count, status FROM scheduled_tasks WHERE id = $1",
+            task_id,
+        )
+        assert row["run_count"] == 1
+        assert row["status"] == "disabled"
+
+
+async def test_run_scheduled_tasks_create_goal_with_notify(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        title = f"Scheduled goal {uuid.uuid4().hex[:6]}"
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'interval',
+                $2::jsonb,
+                'create_goal',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Goal creator",
+            json.dumps({"every_minutes": 30}),
+            json.dumps(
+                {
+                    "title": title,
+                    "description": "From schedule",
+                    "priority": "queued",
+                    "source": "user_request",
+                    "notify": True,
+                }
+            ),
+        )
+        await conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+            task_id,
+        )
+
+        payload = _coerce_json(await conn.fetchval("SELECT run_scheduled_tasks(10)"))
+        outbox = payload.get("outbox_messages") or []
+        assert any(
+            (msg.get("payload") or {}).get("intent") == "goal_created"
+            for msg in outbox
+            if isinstance(msg, dict)
+        )
+
+        goal_row = await conn.fetchrow(
+            "SELECT id, content FROM memories WHERE type = 'goal' AND content = $1",
+            title,
+        )
+        assert goal_row is not None
+
+
+async def test_set_scheduled_task_status(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'daily',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Pause me",
+            json.dumps({"time": "10:00"}),
+            json.dumps({"message": "Should not run"}),
+        )
+        paused = await conn.fetchval(
+            "SELECT set_scheduled_task_status($1, 'paused', 'user request')",
+            task_id,
+        )
+        assert paused is True
+        status = await conn.fetchval(
+            "SELECT status FROM scheduled_tasks WHERE id = $1",
+            task_id,
+        )
+        assert status == "paused"

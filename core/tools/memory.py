@@ -594,6 +594,101 @@ class CreateGoalHandler(ToolHandler):
             return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
 
 
+class ScheduleTaskHandler(ToolHandler):
+    """Create a scheduled (cron-like) task."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="schedule_task",
+            description=(
+                "Create a scheduled task (cron-like). Use for recurring reminders or timed actions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short task name."},
+                    "description": {"type": "string", "description": "Optional longer description."},
+                    "schedule_kind": {
+                        "type": "string",
+                        "enum": ["once", "interval", "daily", "weekly"],
+                        "description": "Schedule type.",
+                    },
+                    "schedule": {"type": "object", "description": "Schedule details for the selected type."},
+                    "timezone": {
+                        "type": "string",
+                        "description": "IANA timezone name (e.g., America/Los_Angeles).",
+                    },
+                    "action_kind": {
+                        "type": "string",
+                        "enum": ["queue_user_message", "create_goal"],
+                        "description": "Action to perform when the schedule fires.",
+                    },
+                    "action_payload": {"type": "object", "description": "Action payload."},
+                    "max_runs": {
+                        "type": "integer",
+                        "description": "Optional max number of runs before auto-disable.",
+                    },
+                },
+                "required": ["name", "schedule_kind", "schedule", "action_kind", "action_payload"],
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=1,
+            is_read_only=False,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        import json
+
+        name = arguments["name"]
+        schedule_kind = arguments["schedule_kind"]
+        schedule = arguments.get("schedule") or {}
+        action_kind = arguments["action_kind"]
+        action_payload = arguments.get("action_payload") or {}
+        timezone = arguments.get("timezone")
+        description = arguments.get("description")
+        max_runs = arguments.get("max_runs")
+
+        try:
+            async with context.registry.pool.acquire() as conn:
+                task_id = await conn.fetchval(
+                    """
+                    SELECT create_scheduled_task(
+                        $1,
+                        $2,
+                        $3::jsonb,
+                        $4,
+                        $5::jsonb,
+                        $6,
+                        $7,
+                        'active',
+                        $8,
+                        'agent'
+                    )
+                    """,
+                    name,
+                    schedule_kind,
+                    json.dumps(schedule),
+                    action_kind,
+                    json.dumps(action_payload),
+                    timezone,
+                    description,
+                    max_runs,
+                )
+
+            return ToolResult.success_result(
+                output={"task_id": str(task_id), "name": name},
+                display_output=f"Scheduled task: {name}",
+            )
+
+        except Exception as e:
+            return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
+
+
 class QueueUserMessageHandler(ToolHandler):
     """Queue a message for the user."""
 
@@ -661,5 +756,6 @@ def create_memory_tools() -> list[ToolHandler]:
         GetProceduresHandler(),
         GetStrategiesHandler(),
         CreateGoalHandler(),
+        ScheduleTaskHandler(),
         QueueUserMessageHandler(),
     ]

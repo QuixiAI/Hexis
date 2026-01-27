@@ -710,6 +710,48 @@ class CognitiveMemory:
                 due_at,
             )
 
+    async def create_scheduled_task(
+        self,
+        name: str,
+        *,
+        schedule_kind: str,
+        schedule: dict[str, Any],
+        action_kind: str,
+        action_payload: dict[str, Any] | None = None,
+        timezone: str | None = None,
+        description: str | None = None,
+        status: str | None = None,
+        max_runs: int | None = None,
+        created_by: str | None = None,
+    ) -> UUID:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                SELECT create_scheduled_task(
+                    $1,
+                    $2,
+                    $3::jsonb,
+                    $4,
+                    $5::jsonb,
+                    $6,
+                    $7,
+                    $8,
+                    $9,
+                    $10
+                )
+                """,
+                name,
+                schedule_kind,
+                _to_jsonb_arg(schedule),
+                action_kind,
+                _to_jsonb_arg(action_payload or {}),
+                timezone,
+                description,
+                status,
+                max_runs,
+                created_by,
+            )
+
     async def queue_user_message(
         self,
         message: str,
@@ -1000,6 +1042,35 @@ class CognitiveMemorySync:
                 priority=priority,
                 parent_id=parent_id,
                 due_at=due_at,
+            )
+        )
+
+    def create_scheduled_task(
+        self,
+        name: str,
+        *,
+        schedule_kind: str,
+        schedule: dict[str, Any],
+        action_kind: str,
+        action_payload: dict[str, Any] | None = None,
+        timezone: str | None = None,
+        description: str | None = None,
+        status: str | None = None,
+        max_runs: int | None = None,
+        created_by: str | None = None,
+    ) -> UUID:
+        return self._run(
+            self._async.create_scheduled_task(
+                name,
+                schedule_kind=schedule_kind,
+                schedule=schedule,
+                action_kind=action_kind,
+                action_payload=action_payload,
+                timezone=timezone,
+                description=description,
+                status=status,
+                max_runs=max_runs,
+                created_by=created_by,
             )
         )
 

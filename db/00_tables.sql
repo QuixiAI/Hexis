@@ -450,7 +450,7 @@ INSERT INTO config (key, value, description) VALUES
     ('heartbeat.cost_terminate', '0'::jsonb, 'Terminate agent')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config (key, value, description) VALUES
-    ('agent.tools', '["recall","sense_memory_availability","request_background_search","recall_recent","recall_episode","explore_concept","explore_cluster","get_procedures","get_strategies","list_recent_episodes","create_goal","queue_user_message"]'::jsonb, 'Allowed tool names for agent tool use')
+    ('agent.tools', '["recall","sense_memory_availability","request_background_search","recall_recent","recall_episode","explore_concept","explore_cluster","get_procedures","get_strategies","list_recent_episodes","create_goal","schedule_task","queue_user_message"]'::jsonb, 'Allowed tool names for agent tool use')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config (key, value, description) VALUES
     ('maintenance.maintenance_interval_seconds', '60'::jsonb, 'Seconds between subconscious maintenance ticks'),
@@ -606,6 +606,29 @@ VALUES
         )
     )
 ON CONFLICT (key) DO NOTHING;
+
+-- ============================================================================
+-- SCHEDULED TASKS (CRON-LIKE REMINDERS)
+-- ============================================================================
+CREATE TABLE scheduled_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    description TEXT,
+    schedule_kind TEXT NOT NULL CHECK (schedule_kind IN ('once', 'interval', 'daily', 'weekly')),
+    schedule JSONB NOT NULL DEFAULT '{}'::jsonb,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    action_kind TEXT NOT NULL CHECK (action_kind IN ('queue_user_message', 'create_goal')),
+    action_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'disabled')),
+    next_run_at TIMESTAMPTZ NOT NULL,
+    last_run_at TIMESTAMPTZ,
+    run_count INT NOT NULL DEFAULT 0,
+    max_runs INT,
+    created_by TEXT DEFAULT 'agent',
+    last_error TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
 
 
 

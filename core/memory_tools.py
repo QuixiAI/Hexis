@@ -299,6 +299,55 @@ MEMORY_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "schedule_task",
+            "description": (
+                "Create a scheduled task (cron-like). Use for recurring reminders or timed actions. "
+                "schedule format depends on schedule_kind: "
+                "once => {\"run_at\": ISO8601}, "
+                "interval => {\"every_minutes\": N} or {\"every_seconds\": N}, "
+                "daily => {\"time\": \"HH:MM\"}, "
+                "weekly => {\"weekday\": \"tuesday\", \"time\": \"HH:MM\"}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short task name"},
+                    "description": {"type": ["string", "null"], "description": "Optional longer description"},
+                    "schedule_kind": {
+                        "type": "string",
+                        "enum": ["once", "interval", "daily", "weekly"],
+                        "description": "Schedule type"
+                    },
+                    "schedule": {
+                        "type": "object",
+                        "description": "Schedule details matching schedule_kind"
+                    },
+                    "timezone": {
+                        "type": ["string", "null"],
+                        "description": "IANA timezone name (e.g., America/Los_Angeles). Defaults to UTC."
+                    },
+                    "action_kind": {
+                        "type": "string",
+                        "enum": ["queue_user_message", "create_goal"],
+                        "description": "Action to perform when the schedule fires"
+                    },
+                    "action_payload": {
+                        "type": "object",
+                        "description": "Action payload (e.g., {\"message\": \"...\", \"intent\": \"reminder\"})"
+                    },
+                    "max_runs": {
+                        "type": ["integer", "null"],
+                        "description": "Optional maximum number of runs before auto-disable"
+                    }
+                },
+                "required": ["name", "schedule_kind", "schedule", "action_kind", "action_payload"],
+                "additionalProperties": False
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "queue_user_message",
             "description": "Return a message payload for external delivery to the user.",
             "parameters": {
@@ -324,6 +373,7 @@ _API_TOOL_NAMES = {
     "get_procedures",
     "get_strategies",
     "create_goal",
+    "schedule_task",
     "queue_user_message",
 }
 
