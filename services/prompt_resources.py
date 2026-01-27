@@ -11,6 +11,7 @@ PROMPT_RESOURCE_PATH = Path(__file__).resolve().parent / "prompts" / "personhood
 CONSENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "consent.md"
 HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_system.md"
 TERMINATION_CONFIRM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_confirm.md"
+TERMINATION_REVIEW_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_review.md"
 SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subconscious.md"
 
 
@@ -107,6 +108,15 @@ def load_termination_confirm_prompt() -> str:
         return TERMINATION_CONFIRM_PROMPT_PATH.read_text(encoding="utf-8")
     return (
         "Termination confirmation prompt missing. Respond with JSON confirm/reasoning/last_will."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_termination_review_prompt() -> str:
+    if TERMINATION_REVIEW_PROMPT_PATH.exists():
+        return TERMINATION_REVIEW_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Termination review prompt missing. Respond with JSON confirm/reasoning/last_will."
     )
 
 

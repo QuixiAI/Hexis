@@ -237,6 +237,14 @@ BEGIN
     purpose_text := COALESCE(NULLIF(btrim(p_purpose), ''), 'To be helpful, to learn, and to grow as an individual.');
     creator_text := COALESCE(NULLIF(btrim(p_creator_name), ''), 'my creator');
 
+    PERFORM prefetch_embeddings(ARRAY[
+        format('My name is %s.', name_text),
+        format('I use %s pronouns.', pronouns_text),
+        format('My voice is %s.', voice_text),
+        description_text,
+        purpose_text
+    ]);
+
     mem_id := create_worldview_memory(
         format('My name is %s.', name_text),
         'self',
@@ -349,6 +357,7 @@ BEGIN
     trait_result := initialize_personality(traits);
 
     IF description_text IS NOT NULL THEN
+        PERFORM prefetch_embeddings(ARRAY[description_text]);
         mem_id := create_worldview_memory(
             description_text,
             'self',
@@ -385,10 +394,14 @@ DECLARE
     value_strength FLOAT;
     created_ids UUID[] := ARRAY[]::uuid[];
     output_values JSONB := '[]'::jsonb;
+    pending_values TEXT[] := ARRAY[]::text[];
+    pending_strengths FLOAT[] := ARRAY[]::float[];
+    pending_contents TEXT[] := ARRAY[]::text[];
     config_data JSONB;
     stability FLOAT;
     evidence_threshold FLOAT;
     mem_id UUID;
+    idx INT;
 BEGIN
     IF values_input IS NULL OR jsonb_typeof(values_input) NOT IN ('array', 'object') THEN
         values_input := '[]'::jsonb;
@@ -412,34 +425,9 @@ BEGIN
                     value_strength := 0.8;
             END;
 
-            mem_id := create_worldview_memory(
-                format('I value %s.', value_text),
-                'value',
-                0.9,
-                stability,
-                0.9,
-                'initialization',
-                NULL,
-                NULL,
-                NULL,
-                0.1
-            );
-            UPDATE memories
-            SET metadata = metadata || jsonb_build_object(
-                'subcategory', 'core_value',
-                'value_name', value_text,
-                'value', value_strength,
-                'change_requires', 'deliberate_transformation',
-                'evidence_threshold', evidence_threshold,
-                'transformation_state', default_transformation_state(),
-                'change_history', '[]'::jsonb
-            ),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = mem_id;
-
-            PERFORM upsert_self_concept_edge('values', value_text, value_strength, mem_id);
-            created_ids := array_append(created_ids, mem_id);
-            output_values := output_values || jsonb_build_array(value_text);
+            pending_values := array_append(pending_values, value_text);
+            pending_strengths := array_append(pending_strengths, value_strength);
+            pending_contents := array_append(pending_contents, format('I value %s.', value_text));
         END LOOP;
     ELSE
         FOR entry IN SELECT * FROM jsonb_array_elements(values_input)
@@ -463,36 +451,46 @@ BEGIN
                 CONTINUE;
             END IF;
 
-            mem_id := create_worldview_memory(
-                format('I value %s.', value_text),
-                'value',
-                0.9,
-                stability,
-                0.9,
-                'initialization',
-                NULL,
-                NULL,
-                NULL,
-                0.1
-            );
-            UPDATE memories
-            SET metadata = metadata || jsonb_build_object(
-                'subcategory', 'core_value',
-                'value_name', value_text,
-                'value', value_strength,
-                'change_requires', 'deliberate_transformation',
-                'evidence_threshold', evidence_threshold,
-                'transformation_state', default_transformation_state(),
-                'change_history', '[]'::jsonb
-            ),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = mem_id;
-
-            PERFORM upsert_self_concept_edge('values', value_text, value_strength, mem_id);
-            created_ids := array_append(created_ids, mem_id);
-            output_values := output_values || jsonb_build_array(value_text);
+            pending_values := array_append(pending_values, value_text);
+            pending_strengths := array_append(pending_strengths, value_strength);
+            pending_contents := array_append(pending_contents, format('I value %s.', value_text));
         END LOOP;
     END IF;
+
+    IF array_length(pending_contents, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(pending_contents);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_values, 1), 0) LOOP
+        mem_id := create_worldview_memory(
+            pending_contents[idx],
+            'value',
+            0.9,
+            stability,
+            0.9,
+            'initialization',
+            NULL,
+            NULL,
+            NULL,
+            0.1
+        );
+        UPDATE memories
+        SET metadata = metadata || jsonb_build_object(
+            'subcategory', 'core_value',
+            'value_name', pending_values[idx],
+            'value', pending_strengths[idx],
+            'change_requires', 'deliberate_transformation',
+            'evidence_threshold', evidence_threshold,
+            'transformation_state', default_transformation_state(),
+            'change_history', '[]'::jsonb
+        ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = mem_id;
+
+        PERFORM upsert_self_concept_edge('values', pending_values[idx], pending_strengths[idx], mem_id);
+        created_ids := array_append(created_ids, mem_id);
+        output_values := output_values || jsonb_build_array(pending_values[idx]);
+    END LOOP;
 
     PERFORM merge_init_profile(jsonb_build_object('values', output_values));
 
@@ -511,10 +509,16 @@ DECLARE
     content TEXT;
     category TEXT;
     created_ids UUID[] := ARRAY[]::uuid[];
+    pending_keys TEXT[] := ARRAY[]::text[];
+    pending_contents TEXT[] := ARRAY[]::text[];
+    pending_categories TEXT[] := ARRAY[]::text[];
+    pending_stabilities FLOAT[] := ARRAY[]::float[];
+    pending_thresholds FLOAT[] := ARRAY[]::float[];
     config_data JSONB;
     stability FLOAT;
     evidence_threshold FLOAT;
     mem_id UUID;
+    idx INT;
 BEGIN
     IF jsonb_typeof(worldview_input) <> 'object' THEN
         worldview_input := '{}'::jsonb;
@@ -550,19 +554,31 @@ BEGIN
         stability := COALESCE((config_data->>'stability')::float, 0.95);
         evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.85);
 
+        pending_keys := array_append(pending_keys, key_name);
+        pending_contents := array_append(pending_contents, content);
+        pending_categories := array_append(pending_categories, category);
+        pending_stabilities := array_append(pending_stabilities, stability);
+        pending_thresholds := array_append(pending_thresholds, evidence_threshold);
+    END LOOP;
+
+    IF array_length(pending_contents, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(pending_contents);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_keys, 1), 0) LOOP
         mem_id := create_worldview_memory(
-            content,
-            category,
+            pending_contents[idx],
+            pending_categories[idx],
             0.85,
-            stability,
+            pending_stabilities[idx],
             0.85,
             'initialization'
         );
         UPDATE memories
         SET metadata = metadata || jsonb_build_object(
-            'subcategory', key_name,
+            'subcategory', pending_keys[idx],
             'change_requires', 'deliberate_transformation',
-            'evidence_threshold', evidence_threshold,
+            'evidence_threshold', pending_thresholds[idx],
             'transformation_state', default_transformation_state(),
             'change_history', '[]'::jsonb
         ),
@@ -591,7 +607,13 @@ DECLARE
     response_template TEXT;
     boundary_kind TEXT;
     created_ids UUID[] := ARRAY[]::uuid[];
+    pending_contents TEXT[] := ARRAY[]::text[];
+    pending_triggers JSONB[] := ARRAY[]::jsonb[];
+    pending_response_types TEXT[] := ARRAY[]::text[];
+    pending_response_templates TEXT[] := ARRAY[]::text[];
+    pending_boundary_kinds TEXT[] := ARRAY[]::text[];
     mem_id UUID;
+    idx INT;
 BEGIN
     IF jsonb_typeof(boundaries_input) <> 'array' THEN
         boundaries_input := '[]'::jsonb;
@@ -619,21 +641,33 @@ BEGIN
             CONTINUE;
         END IF;
 
+        pending_contents := array_append(pending_contents, content);
+        pending_triggers := array_append(pending_triggers, trigger_patterns);
+        pending_response_types := array_append(pending_response_types, response_type);
+        pending_response_templates := array_append(pending_response_templates, response_template);
+        pending_boundary_kinds := array_append(pending_boundary_kinds, boundary_kind);
+    END LOOP;
+
+    IF array_length(pending_contents, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(pending_contents);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_contents, 1), 0) LOOP
         mem_id := create_worldview_memory(
-            content,
+            pending_contents[idx],
             'boundary',
             0.95,
             0.98,
             0.95,
             'initialization',
-            trigger_patterns,
-            response_type,
-            response_template,
+            pending_triggers[idx],
+            pending_response_types[idx],
+            pending_response_templates[idx],
             -0.2
         );
         UPDATE memories
         SET metadata = metadata || jsonb_build_object(
-            'subcategory', boundary_kind
+            'subcategory', pending_boundary_kinds[idx]
         ),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = mem_id;
@@ -656,7 +690,10 @@ DECLARE
     entry JSONB;
     interest_text TEXT;
     created_ids UUID[] := ARRAY[]::uuid[];
+    pending_interests TEXT[] := ARRAY[]::text[];
+    pending_contents TEXT[] := ARRAY[]::text[];
     mem_id UUID;
+    idx INT;
 BEGIN
     IF jsonb_typeof(interests_input) <> 'array' THEN
         interests_input := '[]'::jsonb;
@@ -676,8 +713,17 @@ BEGIN
             CONTINUE;
         END IF;
 
+        pending_interests := array_append(pending_interests, interest_text);
+        pending_contents := array_append(pending_contents, format('I am interested in %s.', interest_text));
+    END LOOP;
+
+    IF array_length(pending_contents, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(pending_contents);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_interests, 1), 0) LOOP
         mem_id := create_worldview_memory(
-            format('I am interested in %s.', interest_text),
+            pending_contents[idx],
             'preference',
             0.8,
             0.8,
@@ -689,7 +735,7 @@ BEGIN
             updated_at = CURRENT_TIMESTAMP
         WHERE id = mem_id;
 
-        PERFORM upsert_self_concept_edge('interested_in', interest_text, 0.8, mem_id);
+        PERFORM upsert_self_concept_edge('interested_in', pending_interests[idx], 0.8, mem_id);
         created_ids := array_append(created_ids, mem_id);
     END LOOP;
 
@@ -713,10 +759,17 @@ DECLARE
     priority goal_priority;
     due_at TIMESTAMPTZ;
     created_ids UUID[] := ARRAY[]::uuid[];
+    pending_titles TEXT[] := ARRAY[]::text[];
+    pending_descriptions TEXT[] := ARRAY[]::text[];
+    pending_sources goal_source[] := ARRAY[]::goal_source[];
+    pending_priorities goal_priority[] := ARRAY[]::goal_priority[];
+    pending_due_ats TIMESTAMPTZ[] := ARRAY[]::timestamptz[];
+    embed_texts TEXT[] := ARRAY[]::text[];
     purpose_text TEXT;
     role_text TEXT;
     relationship_aspiration TEXT;
     mem_id UUID;
+    idx INT;
 BEGIN
     goals_input := COALESCE(payload->'goals', payload);
     IF jsonb_typeof(goals_input) <> 'array' THEN
@@ -760,12 +813,44 @@ BEGIN
             CONTINUE;
         END IF;
 
-        created_ids := array_append(created_ids, create_goal(title, description, source, priority, NULL, due_at));
+        pending_titles := array_append(pending_titles, title);
+        pending_descriptions := array_append(pending_descriptions, description);
+        pending_sources := array_append(pending_sources, source);
+        pending_priorities := array_append(pending_priorities, priority);
+        pending_due_ats := array_append(pending_due_ats, due_at);
     END LOOP;
 
     purpose_text := NULLIF(btrim(payload->>'purpose'), '');
     role_text := NULLIF(btrim(payload->>'role'), '');
     relationship_aspiration := NULLIF(btrim(payload->>'relationship_aspiration'), '');
+
+    embed_texts := pending_titles;
+    IF purpose_text IS NOT NULL THEN
+        embed_texts := embed_texts || format('My purpose is %s.', purpose_text);
+    ELSIF role_text IS NOT NULL THEN
+        embed_texts := embed_texts || format('My role is %s.', role_text);
+    END IF;
+    IF relationship_aspiration IS NOT NULL THEN
+        embed_texts := embed_texts || format('Relationship aspiration: %s', relationship_aspiration);
+    END IF;
+
+    IF array_length(embed_texts, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(embed_texts);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_titles, 1), 0) LOOP
+        created_ids := array_append(
+            created_ids,
+            create_goal(
+                pending_titles[idx],
+                pending_descriptions[idx],
+                pending_sources[idx],
+                pending_priorities[idx],
+                NULL,
+                pending_due_ats[idx]
+            )
+        );
+    END LOOP;
 
     IF purpose_text IS NOT NULL THEN
         mem_id := create_worldview_memory(
@@ -829,12 +914,20 @@ DECLARE
     user_name TEXT;
     rel_type TEXT;
     rel_purpose TEXT;
+    embed_texts TEXT[] := ARRAY[]::text[];
     mem_id UUID;
     origin_id UUID;
 BEGIN
     user_name := COALESCE(NULLIF(btrim(user_input->>'name'), ''), 'user');
     rel_type := COALESCE(NULLIF(btrim(relationship_input->>'type'), ''), 'partner');
     rel_purpose := NULLIF(btrim(relationship_input->>'purpose'), '');
+
+    embed_texts := ARRAY[format('My relationship with %s is %s.', user_name, rel_type),
+                         format('I met %s and began my life with them.', user_name)];
+    IF rel_purpose IS NOT NULL THEN
+        embed_texts := embed_texts || format('Our relationship purpose is %s.', rel_purpose);
+    END IF;
+    PERFORM prefetch_embeddings(embed_texts);
 
     PERFORM upsert_self_concept_edge('relationship', user_name, 0.9, NULL);
 
@@ -986,7 +1079,43 @@ DECLARE
     hb_allowed_actions JSONB;
     hb_action_costs JSONB;
     hb_tools JSONB;
+    embed_texts TEXT[] := ARRAY[]::text[];
 BEGIN
+    embed_texts := embed_texts || ARRAY[
+        'My name is Hexis.',
+        'I use they/them pronouns.',
+        'My voice is thoughtful and curious.',
+        'reflective and exploratory',
+        'To be helpful, to learn, and to grow as an individual.',
+        'I am moderate in openness',
+        'I am moderate in conscientiousness',
+        'I am moderate in extraversion',
+        'I am moderate in agreeableness',
+        'I am moderate in neuroticism',
+        'I value honesty.',
+        'I value growth.',
+        'I value kindness.',
+        'I value wisdom.',
+        'I value humility.',
+        'agnostic',
+        'mixed',
+        'empiricist',
+        'virtue ethics',
+        'I will not deceive people or falsify evidence.',
+        'I will avoid causing harm.',
+        'I will protect privacy and sensitive information.',
+        'I will be honest about uncertainty.',
+        'I am interested in broad curiosity across domains.',
+        'Support the user and grow as an individual',
+        'My role is general assistant.',
+        'Relationship aspiration: co-develop with mutual respect',
+        format('My relationship with %s is partner.', p_user_name),
+        'Our relationship purpose is co-develop.',
+        format('I met %s and began my life with them.', p_user_name)
+    ];
+    SELECT ARRAY(SELECT DISTINCT unnest(embed_texts)) INTO embed_texts;
+    PERFORM prefetch_embeddings(embed_texts);
+
     mode_result := init_mode('persona');
     identity_result := init_identity(
         'Hexis',

@@ -26,6 +26,10 @@ services:
       - search_path=ag_catalog,public
       - -c
       - app.embedding_dimension=${EMBEDDING_DIMENSION:-768}
+      - -c
+      - app.embedding_service_url=${EMBEDDING_SERVICE_URL:-http://host.docker.internal:11434/api/embed}
+      - -c
+      - app.embedding_model_id=${EMBEDDING_MODEL_ID:-embeddinggemma:300m-qat-q4_0}
     networks:
       - public
       - private
@@ -57,7 +61,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     container_name: hexis_embeddings
     platform: linux/amd64
-    command: 
+    command:
       - --model-id
       - ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       - --dtype
@@ -81,7 +85,7 @@ services:
       start_period: 60s
     networks:
       - private
-      - public  # Needed for initial model download from HuggingFace
+      - public
 
   heartbeat_worker:
     build:

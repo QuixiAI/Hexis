@@ -79,7 +79,7 @@ hexis/
 ### Key Database Functions
 - `fast_recall(text, limit)` - Primary hot-path retrieval (vector + neighborhood + temporal)
 - `create_semantic_memory()`, `create_episodic_memory()`, etc.
-- `get_embedding(text)` - Generate embeddings via HTTP (cached in DB)
+- `get_embedding(text[])` - Generate embeddings via HTTP (cached in DB), returns vector[]
 - `run_heartbeat()` - Autonomous cognitive loop
 - `run_subconscious_maintenance()` - Background upkeep
 

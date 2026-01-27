@@ -93,7 +93,7 @@ BEGIN
             p_priority := 'queued';
         END IF;
     END IF;
-    goal_embedding := get_embedding(p_title);
+    goal_embedding := (get_embedding(ARRAY[p_title]))[1];
     goal_metadata := jsonb_build_object(
         'title', p_title,
         'description', p_description,

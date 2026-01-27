@@ -364,7 +364,7 @@ BEGIN
 
     UPDATE memories
     SET content = p_new_content,
-        embedding = get_embedding(p_new_content),
+        embedding = (get_embedding(ARRAY[p_new_content]))[1],
         metadata = jsonb_set(
             jsonb_set(metadata, '{change_history}', history, true),
             '{transformation_state}', default_transformation_state(), true
@@ -656,8 +656,8 @@ BEGIN
     SET content = format('I am %s in %s - discovered through self-observation',
             descriptor,
             COALESCE(belief.metadata->>'trait', belief.metadata->>'subcategory', 'this area')),
-        embedding = get_embedding(format('I am %s in %s', descriptor,
-            COALESCE(belief.metadata->>'trait', belief.metadata->>'subcategory', 'this area'))),
+        embedding = (get_embedding(ARRAY[format('I am %s in %s', descriptor,
+            COALESCE(belief.metadata->>'trait', belief.metadata->>'subcategory', 'this area'))]))[1],
         metadata = jsonb_set(
             jsonb_set(
                 jsonb_set(
@@ -702,11 +702,16 @@ DECLARE
     trait_value FLOAT;
     trait_origin TEXT;
     created_ids UUID[] := ARRAY[]::uuid[];
+    pending_traits TEXT[] := ARRAY[]::text[];
+    pending_values FLOAT[] := ARRAY[]::float[];
+    pending_origins TEXT[] := ARRAY[]::text[];
+    pending_contents TEXT[] := ARRAY[]::text[];
     existing_id UUID;
     new_id UUID;
     config_data JSONB;
     stability FLOAT;
     evidence_threshold FLOAT;
+    idx INT;
 BEGIN
     config_data := get_transformation_config('personality', 'self');
     stability := COALESCE((config_data->>'stability')::float, 0.99);
@@ -738,17 +743,31 @@ BEGIN
             trait_origin := 'neutral_default';
         END IF;
 
-        new_id := create_worldview_memory(
+        pending_traits := array_append(pending_traits, trait_name);
+        pending_values := array_append(pending_values, trait_value);
+        pending_origins := array_append(pending_origins, trait_origin);
+        pending_contents := array_append(
+            pending_contents,
             format('I am %s in %s',
                 CASE WHEN trait_value > 0.6 THEN 'high'
                      WHEN trait_value < 0.4 THEN 'low'
                      ELSE 'moderate' END,
-                trait_name),
+                trait_name)
+        );
+    END LOOP;
+
+    IF array_length(pending_contents, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(pending_contents);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_traits, 1), 0) LOOP
+        new_id := create_worldview_memory(
+            pending_contents[idx],
             'self',
             0.95,
             stability,
             1.0,
-            trait_origin,
+            pending_origins[idx],
             NULL,
             NULL,
             NULL,
@@ -759,8 +778,8 @@ BEGIN
         SET metadata = metadata
             || jsonb_build_object(
                 'subcategory', 'personality',
-                'trait', trait_name,
-                'value', trait_value,
+                'trait', pending_traits[idx],
+                'value', pending_values[idx],
                 'change_requires', 'deliberate_transformation',
                 'evidence_threshold', evidence_threshold,
                 'transformation_state', default_transformation_state(),
@@ -788,11 +807,16 @@ DECLARE
     value_strength FLOAT;
     value_origin TEXT;
     created_ids UUID[] := ARRAY[]::uuid[];
+    pending_values TEXT[] := ARRAY[]::text[];
+    pending_strengths FLOAT[] := ARRAY[]::float[];
+    pending_origins TEXT[] := ARRAY[]::text[];
+    pending_contents TEXT[] := ARRAY[]::text[];
     existing_id UUID;
     new_id UUID;
     config_data JSONB;
     stability FLOAT;
     evidence_threshold FLOAT;
+    idx INT;
 BEGIN
     config_data := get_transformation_config('core_value', 'value');
     stability := COALESCE((config_data->>'stability')::float, 0.97);
@@ -824,13 +848,24 @@ BEGIN
             value_origin := 'neutral_default';
         END IF;
 
+        pending_values := array_append(pending_values, value_name);
+        pending_strengths := array_append(pending_strengths, value_strength);
+        pending_origins := array_append(pending_origins, value_origin);
+        pending_contents := array_append(pending_contents, format('I value %s', value_name));
+    END LOOP;
+
+    IF array_length(pending_contents, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(pending_contents);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_values, 1), 0) LOOP
         new_id := create_worldview_memory(
-            format('I value %s', value_name),
+            pending_contents[idx],
             'value',
             0.9,
             stability,
             0.9,
-            value_origin,
+            pending_origins[idx],
             NULL,
             NULL,
             NULL,
@@ -841,8 +876,8 @@ BEGIN
         SET metadata = metadata
             || jsonb_build_object(
                 'subcategory', 'core_value',
-                'value_name', value_name,
-                'value', value_strength,
+                'value_name', pending_values[idx],
+                'value', pending_strengths[idx],
                 'change_requires', 'deliberate_transformation',
                 'evidence_threshold', evidence_threshold,
                 'transformation_state', default_transformation_state(),
@@ -871,11 +906,18 @@ DECLARE
     origin TEXT;
     category TEXT;
     created_ids UUID[] := ARRAY[]::uuid[];
+    pending_keys TEXT[] := ARRAY[]::text[];
+    pending_contents TEXT[] := ARRAY[]::text[];
+    pending_origins TEXT[] := ARRAY[]::text[];
+    pending_categories TEXT[] := ARRAY[]::text[];
+    pending_stabilities FLOAT[] := ARRAY[]::float[];
+    pending_thresholds FLOAT[] := ARRAY[]::float[];
     existing_id UUID;
     new_id UUID;
     config_data JSONB;
     stability FLOAT;
     evidence_threshold FLOAT;
+    idx INT;
 BEGIN
     FOREACH key_name IN ARRAY keys LOOP
         SELECT id INTO existing_id
@@ -911,13 +953,26 @@ BEGIN
         stability := COALESCE((config_data->>'stability')::float, 0.95);
         evidence_threshold := COALESCE((config_data->>'evidence_threshold')::float, 0.85);
 
+        pending_keys := array_append(pending_keys, key_name);
+        pending_contents := array_append(pending_contents, content);
+        pending_origins := array_append(pending_origins, origin);
+        pending_categories := array_append(pending_categories, category);
+        pending_stabilities := array_append(pending_stabilities, stability);
+        pending_thresholds := array_append(pending_thresholds, evidence_threshold);
+    END LOOP;
+
+    IF array_length(pending_contents, 1) IS NOT NULL THEN
+        PERFORM prefetch_embeddings(pending_contents);
+    END IF;
+
+    FOR idx IN 1..COALESCE(array_length(pending_keys, 1), 0) LOOP
         new_id := create_worldview_memory(
-            content,
-            category,
+            pending_contents[idx],
+            pending_categories[idx],
             0.85,
-            stability,
+            pending_stabilities[idx],
             0.9,
-            origin,
+            pending_origins[idx],
             NULL,
             NULL,
             NULL,
@@ -927,9 +982,9 @@ BEGIN
         UPDATE memories
         SET metadata = metadata
             || jsonb_build_object(
-                'subcategory', key_name,
+                'subcategory', pending_keys[idx],
                 'change_requires', 'deliberate_transformation',
-                'evidence_threshold', evidence_threshold,
+                'evidence_threshold', pending_thresholds[idx],
                 'transformation_state', default_transformation_state(),
                 'change_history', '[]'::jsonb
             ),

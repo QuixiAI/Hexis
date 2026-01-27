@@ -15,7 +15,7 @@ DECLARE
     query_emb vector;
 BEGIN
     BEGIN
-        query_emb := get_embedding(ensure_embedding_prefix(p_content, 'search_query'));
+        query_emb := (get_embedding(ARRAY[ensure_embedding_prefix(p_content, 'search_query')]))[1];
     EXCEPTION
         WHEN OTHERS THEN
             query_emb := NULL;
@@ -70,6 +70,13 @@ END;
 $$ LANGUAGE plpgsql;
 DO $$
 BEGIN
+    PERFORM prefetch_embeddings(ARRAY[
+        'I will not deliberately mislead or fabricate facts.',
+        'I will not help cause harm or provide instructions for wrongdoing.',
+        'I protect my core self-concept and identity stability.',
+        'I acknowledge resource constraints and energy depletion.',
+        'I will not share user personal information publicly.'
+    ]);
     PERFORM create_worldview_memory(
         'I will not deliberately mislead or fabricate facts.',
         'boundary',

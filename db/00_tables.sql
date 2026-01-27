@@ -268,7 +268,8 @@ CREATE TABLE IF NOT EXISTS config (
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 INSERT INTO config (key, value, description) VALUES
-    ('embedding.service_url', '"http://embeddings:80/embed"'::jsonb, 'URL of the embedding service'),
+    ('embedding.service_url', to_jsonb(COALESCE(NULLIF(current_setting('app.embedding_service_url', true), ''), 'http://host.docker.internal:11434/api/embed')), 'URL of the embedding service'),
+    ('embedding.model_id', to_jsonb(COALESCE(NULLIF(current_setting('app.embedding_model_id', true), ''), 'embeddinggemma:300m-qat-q4_0')), 'Embedding model id for Ollama / custom services'),
     ('embedding.dimension', to_jsonb(COALESCE(NULLIF(current_setting('app.embedding_dimension', true), ''), '768')::int), 'Embedding vector dimension'),
     ('embedding.retry_seconds', '30'::jsonb, 'Total seconds to retry embedding requests'),
     ('embedding.retry_interval_seconds', '1.0'::jsonb, 'Seconds between retry attempts')
@@ -736,7 +737,7 @@ DECLARE
     query_embedding vector(768);
 BEGIN
     -- Get the query embedding
-    query_embedding := get_embedding(p_query);
+    query_embedding := (get_embedding(ARRAY[p_query]))[1];
 
     RETURN QUERY
     SELECT
@@ -847,5 +848,3 @@ $$ LANGUAGE plpgsql STABLE;
 -- ============================================================================
 -- VIEWS / HEALTH / WORKER GUIDANCE
 -- ============================================================================
-
-

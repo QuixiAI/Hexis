@@ -259,7 +259,7 @@ DECLARE
     top_similarity FLOAT;
     activation_id UUID;
 BEGIN
-    query_emb := COALESCE(p_query_embedding, get_embedding(ensure_embedding_prefix(p_query, 'search_query')));
+    query_emb := COALESCE(p_query_embedding, (get_embedding(ARRAY[ensure_embedding_prefix(p_query, 'search_query')]))[1]);
     zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 
     SELECT
@@ -315,7 +315,7 @@ DECLARE
     query_emb vector;
     activation_id UUID;
 BEGIN
-    query_emb := COALESCE(p_query_embedding, get_embedding(ensure_embedding_prefix(p_query, 'search_query')));
+    query_emb := COALESCE(p_query_embedding, (get_embedding(ARRAY[ensure_embedding_prefix(p_query, 'search_query')]))[1]);
 
     INSERT INTO memory_activation (
         query_embedding,
@@ -536,7 +536,7 @@ BEGIN
     END IF;
 
     BEGIN
-        query_emb := get_embedding(ensure_embedding_prefix(p_text, 'search_query'));
+        query_emb := (get_embedding(ARRAY[ensure_embedding_prefix(p_text, 'search_query')]))[1];
     EXCEPTION
         WHEN OTHERS THEN
             RETURN '[]'::jsonb;
@@ -569,24 +569,42 @@ CREATE OR REPLACE FUNCTION initialize_innate_emotions()
 RETURNS INT AS $$
 DECLARE
     inserted_count INT := 0;
+    trigger_patterns TEXT[] := ARRAY[
+        'gratitude appreciation thankful',
+        'success achieved accomplished',
+        'curious interesting fascinating',
+        'understood seen connected',
+        'beautiful elegant aesthetic',
+        'learned insight realized',
+        'threat danger harm',
+        'rejection dismissed ignored',
+        'unfair unjust wrong',
+        'confused lost uncertain',
+        'failed mistake error',
+        'violated boundary crossed',
+        'unexpected surprise sudden',
+        'conflict tension disagree'
+    ];
 BEGIN
+    PERFORM prefetch_embeddings(trigger_patterns);
+
     BEGIN
         INSERT INTO emotional_triggers (trigger_pattern, trigger_embedding, valence_delta, arousal_delta, dominance_delta, typical_emotion, origin)
         VALUES
-            ('gratitude appreciation thankful', get_embedding('gratitude appreciation thankful'), 0.4, 0.1, 0.1, 'joy', 'innate'),
-            ('success achieved accomplished', get_embedding('success achieved accomplished'), 0.5, 0.3, 0.3, 'pride', 'innate'),
-            ('curious interesting fascinating', get_embedding('curious interesting fascinating'), 0.3, 0.3, 0.1, 'interest', 'innate'),
-            ('understood seen connected', get_embedding('understood seen connected'), 0.4, 0.2, 0.2, 'warmth', 'innate'),
-            ('beautiful elegant aesthetic', get_embedding('beautiful elegant aesthetic'), 0.3, 0.2, 0.1, 'appreciation', 'innate'),
-            ('learned insight realized', get_embedding('learned insight realized'), 0.4, 0.4, 0.2, 'satisfaction', 'innate'),
-            ('threat danger harm', get_embedding('threat danger harm'), -0.5, 0.6, -0.3, 'fear', 'innate'),
-            ('rejection dismissed ignored', get_embedding('rejection dismissed ignored'), -0.4, 0.2, -0.2, 'sadness', 'innate'),
-            ('unfair unjust wrong', get_embedding('unfair unjust wrong'), -0.4, 0.5, 0.2, 'anger', 'innate'),
-            ('confused lost uncertain', get_embedding('confused lost uncertain'), -0.2, 0.3, -0.2, 'anxiety', 'innate'),
-            ('failed mistake error', get_embedding('failed mistake error'), -0.3, 0.3, -0.1, 'disappointment', 'innate'),
-            ('violated boundary crossed', get_embedding('violated boundary crossed'), -0.5, 0.5, -0.2, 'alarm', 'innate'),
-            ('unexpected surprise sudden', get_embedding('unexpected surprise sudden'), 0.0, 0.6, -0.1, 'surprise', 'innate'),
-            ('conflict tension disagree', get_embedding('conflict tension disagree'), -0.2, 0.4, 0.0, 'discomfort', 'innate')
+            ('gratitude appreciation thankful', (get_embedding(ARRAY['gratitude appreciation thankful']))[1], 0.4, 0.1, 0.1, 'joy', 'innate'),
+            ('success achieved accomplished', (get_embedding(ARRAY['success achieved accomplished']))[1], 0.5, 0.3, 0.3, 'pride', 'innate'),
+            ('curious interesting fascinating', (get_embedding(ARRAY['curious interesting fascinating']))[1], 0.3, 0.3, 0.1, 'interest', 'innate'),
+            ('understood seen connected', (get_embedding(ARRAY['understood seen connected']))[1], 0.4, 0.2, 0.2, 'warmth', 'innate'),
+            ('beautiful elegant aesthetic', (get_embedding(ARRAY['beautiful elegant aesthetic']))[1], 0.3, 0.2, 0.1, 'appreciation', 'innate'),
+            ('learned insight realized', (get_embedding(ARRAY['learned insight realized']))[1], 0.4, 0.4, 0.2, 'satisfaction', 'innate'),
+            ('threat danger harm', (get_embedding(ARRAY['threat danger harm']))[1], -0.5, 0.6, -0.3, 'fear', 'innate'),
+            ('rejection dismissed ignored', (get_embedding(ARRAY['rejection dismissed ignored']))[1], -0.4, 0.2, -0.2, 'sadness', 'innate'),
+            ('unfair unjust wrong', (get_embedding(ARRAY['unfair unjust wrong']))[1], -0.4, 0.5, 0.2, 'anger', 'innate'),
+            ('confused lost uncertain', (get_embedding(ARRAY['confused lost uncertain']))[1], -0.2, 0.3, -0.2, 'anxiety', 'innate'),
+            ('failed mistake error', (get_embedding(ARRAY['failed mistake error']))[1], -0.3, 0.3, -0.1, 'disappointment', 'innate'),
+            ('violated boundary crossed', (get_embedding(ARRAY['violated boundary crossed']))[1], -0.5, 0.5, -0.2, 'alarm', 'innate'),
+            ('unexpected surprise sudden', (get_embedding(ARRAY['unexpected surprise sudden']))[1], 0.0, 0.6, -0.1, 'surprise', 'innate'),
+            ('conflict tension disagree', (get_embedding(ARRAY['conflict tension disagree']))[1], -0.2, 0.4, 0.0, 'discomfort', 'innate')
         ON CONFLICT DO NOTHING;
         GET DIAGNOSTICS inserted_count = ROW_COUNT;
     EXCEPTION

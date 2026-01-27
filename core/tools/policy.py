@@ -299,7 +299,7 @@ async def create_tool_boundary(
         memory_id = await conn.fetchval(
             """
             INSERT INTO memories (type, content, embedding, metadata, importance)
-            VALUES ('worldview', $1, get_embedding($1), $2::jsonb, 0.9)
+            VALUES ('worldview', $1, (get_embedding(ARRAY[$1]))[1], $2::jsonb, 0.9)
             RETURNING id
             """,
             content,

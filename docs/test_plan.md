@@ -293,13 +293,13 @@ async def test_episode_summary_view_completeness(db_pool):
 
 ```python
 async def test_get_embedding_caching(db_pool):
-    """Test get_embedding() caches results in embedding_cache table"""
+    """Test get_embedding(text[]) caches results in embedding_cache table"""
 
 async def test_get_embedding_cache_hit(db_pool):
-    """Test get_embedding() returns cached embedding on second call"""
+    """Test get_embedding(text[]) returns cached embedding on second call"""
 
 async def test_get_embedding_response_formats(db_pool):
-    """Test get_embedding() handles different response formats:
+    """Test get_embedding(text[]) handles different response formats:
     - embeddings array
     - embedding object
     - data array with embedding

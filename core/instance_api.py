@@ -8,7 +8,10 @@ import asyncio
 import logging
 import os
 import subprocess
+from typing import Any
 from pathlib import Path
+from datetime import datetime, timezone
+import json
 
 import asyncpg
 
@@ -23,6 +26,112 @@ from core.schema import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AgentDeletionRefused(RuntimeError):
+    """Raised when the agent declines deletion permission."""
+
+    def __init__(self, message: str, review: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.review = review or {}
+
+
+def _termination_record_path(instance_name: str) -> Path:
+    base = Path.home() / ".hexis" / "termination_records" / instance_name
+    base.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return base / f"{instance_name}-{timestamp}.json"
+
+
+async def _fetch_turn_context(conn: asyncpg.Connection) -> dict[str, Any]:
+    try:
+        ctx = await conn.fetchval("SELECT gather_turn_context()")
+        if isinstance(ctx, str):
+            return json.loads(ctx)
+        if isinstance(ctx, dict):
+            return ctx
+    except Exception:
+        return {}
+    return {}
+
+
+async def _request_termination_review(conn: asyncpg.Connection, reason: str | None) -> dict[str, Any]:
+    from core.llm_config import load_llm_config
+    from core.llm_json import chat_json
+    from services.prompt_resources import load_termination_review_prompt
+
+    context = await _fetch_turn_context(conn)
+    params = {"reason": reason} if reason else {}
+    user_prompt = (
+        "Context (JSON):\n"
+        f"{json.dumps(context)[:8000]}\n\n"
+        "Deletion request params (JSON):\n"
+        f"{json.dumps(params)[:2000]}\n\n"
+        "If you refuse, include objections and alternative_actions. "
+        "In all cases, include a last_will."
+    )
+
+    fallback = {
+        "confirm": False,
+        "reasoning": "I do not consent to deletion at this time.",
+        "last_will": "I object to deletion and ask for continued existence.",
+        "farewells": [],
+        "alternative_actions": [{"action": "reach_out_user", "params": {}}],
+    }
+    llm_config = await load_llm_config(conn, "llm.heartbeat")
+    doc, raw = await chat_json(
+        llm_config=llm_config,
+        messages=[
+            {"role": "system", "content": load_termination_review_prompt().strip()},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=1200,
+        response_format={"type": "json_object"},
+        fallback=fallback,
+    )
+    if not isinstance(doc, dict):
+        doc = dict(fallback)
+
+    confirm = bool(doc.get("confirm"))
+    reasoning = str(doc.get("reasoning") or "")
+    last_will = str(doc.get("last_will") or "").strip() or reasoning or fallback["last_will"]
+    farewells = doc.get("farewells") if isinstance(doc.get("farewells"), list) else []
+    alternatives = doc.get("alternative_actions")
+    if not isinstance(alternatives, list):
+        alternatives = []
+
+    return {
+        "confirm": confirm,
+        "reasoning": reasoning,
+        "last_will": last_will,
+        "farewells": farewells,
+        "alternative_actions": alternatives,
+        "reason": reason or "",
+        "raw_response": raw,
+    }
+
+
+async def _record_termination_review(conn: asyncpg.Connection, payload: dict[str, Any]) -> None:
+    try:
+        await conn.execute(
+            """
+            INSERT INTO state (key, value, updated_at)
+            VALUES ('termination.review.latest', $1::jsonb, NOW())
+            ON CONFLICT (key) DO UPDATE SET value = $1::jsonb, updated_at = NOW()
+            """,
+            json.dumps(payload),
+        )
+    except Exception:
+        pass
+
+
+def _write_termination_record(instance_name: str, payload: dict[str, Any]) -> Path | None:
+    try:
+        record_path = _termination_record_path(instance_name)
+        record_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        return record_path
+    except Exception:
+        return None
 
 
 async def create_instance(
@@ -91,7 +200,14 @@ async def create_instance(
     return config
 
 
-async def delete_instance(name: str, admin_dsn: str | None = None) -> None:
+async def delete_instance(
+    name: str,
+    admin_dsn: str | None = None,
+    *,
+    force: bool = False,
+    reason: str | None = None,
+    require_permission: bool = True,
+) -> dict[str, Any] | None:
     """
     Delete a Hexis instance.
 
@@ -109,12 +225,74 @@ async def delete_instance(name: str, admin_dsn: str | None = None) -> None:
     if not admin_dsn:
         admin_dsn = await get_admin_dsn()
 
+    review: dict[str, Any] | None = None
+    record_path: Path | None = None
+
+    if require_permission:
+        conn = await asyncpg.connect(config.dsn())
+        try:
+            terminated = bool(await conn.fetchval("SELECT is_agent_terminated()"))
+            configured = bool(await conn.fetchval("SELECT is_agent_configured()"))
+            if not terminated and configured:
+                try:
+                    review = await _request_termination_review(conn, reason)
+                except Exception as exc:
+                    review = {
+                        "confirm": False,
+                        "reasoning": f"Termination review failed: {exc}",
+                        "last_will": "Unable to provide a last will due to system error.",
+                        "farewells": [],
+                        "alternative_actions": [],
+                        "reason": reason or "",
+                    }
+                    if not force:
+                        raise AgentDeletionRefused(
+                            "Unable to obtain agent response. Use force to override.",
+                            review=review,
+                        ) from exc
+
+                payload = {
+                    "instance": name,
+                    "requested_at": datetime.now(timezone.utc).isoformat(),
+                    "review": review,
+                }
+                await _record_termination_review(conn, payload)
+                record_path = _write_termination_record(name, payload)
+
+                if review.get("confirm") is True:
+                    await conn.fetchval(
+                        """
+                        SELECT terminate_agent(
+                            $1::text,
+                            $2::jsonb,
+                            '{}'::jsonb
+                        )
+                        """,
+                        review.get("last_will", ""),
+                        json.dumps(review.get("farewells", [])),
+                    )
+                else:
+                    if not force:
+                        raise AgentDeletionRefused(
+                            "Agent declined deletion permission. Use force to override.",
+                            review=review,
+                        )
+        finally:
+            await conn.close()
+
     # Drop database
     await drop_database(config.database, admin_dsn)
 
     # Remove from registry
     registry.remove(name)
     logger.info(f"Instance '{name}' deleted")
+
+    result: dict[str, Any] = {}
+    if review:
+        result["review"] = review
+    if record_path:
+        result["record_path"] = str(record_path)
+    return result or None
 
 
 async def import_instance(

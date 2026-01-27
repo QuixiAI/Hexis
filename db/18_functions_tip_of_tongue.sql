@@ -19,7 +19,7 @@ DECLARE
     query_embedding vector;
 BEGIN
     BEGIN
-        query_embedding := get_embedding(ensure_embedding_prefix(p_query_text, 'search_query'));
+        query_embedding := (get_embedding(ARRAY[ensure_embedding_prefix(p_query_text, 'search_query')]))[1];
     EXCEPTION
         WHEN OTHERS THEN
             query_embedding := NULL;

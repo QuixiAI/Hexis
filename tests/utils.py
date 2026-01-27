@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+from time import perf_counter
 
 TEST_SESSION_ID = str(uuid.uuid4())[:8]
 
@@ -23,6 +24,23 @@ def _coerce_json(val):
     if isinstance(val, str):
         return json.loads(val)
     return val
+
+
+async def timed_db_call(label: str, coro, conn=None, track_embeddings: bool = False):
+    """Time an awaited DB call and optionally report embedding_cache delta."""
+    start_count = None
+    if track_embeddings and conn is not None:
+        start_count = await conn.fetchval("SELECT COUNT(*) FROM embedding_cache")
+    start = perf_counter()
+    result = await coro
+    duration = perf_counter() - start
+    if track_embeddings and conn is not None:
+        end_count = await conn.fetchval("SELECT COUNT(*) FROM embedding_cache")
+        delta = end_count - (start_count or 0)
+        print(f"[timing] {label}: {duration:.3f}s (embeddings +{delta})")
+    else:
+        print(f"[timing] {label}: {duration:.3f}s")
+    return result
 
 
 async def _set_embedding_retry_config(

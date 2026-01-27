@@ -326,11 +326,6 @@ async def ensure_embedding_service(db_pool):
     with a clear timeout error (no skipping).
     """
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config table
-        await conn.execute(
-            "SELECT set_config('embedding.service_url', '\"http://embeddings:80/embed\"'::jsonb)"
-        )
-
         wait_seconds = int(os.getenv("EMBEDDINGS_WAIT_SECONDS", "30"))
         retrying = AsyncRetrying(
             stop=stop_after_delay(wait_seconds),
@@ -351,6 +346,6 @@ async def ensure_embedding_service(db_pool):
             except Exception:
                 pass
             pytest.fail(
-                f"Embedding service not available after {wait_seconds}s (service_url=http://embeddings:80/embed). "
+                f"Embedding service not available after {wait_seconds}s."
                 f"last_exception={last_exc!r} last_result={last_res!r}"
             )

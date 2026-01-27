@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from tests.utils import _coerce_json
+from tests.utils import _coerce_json, timed_db_call
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
 
@@ -139,14 +139,19 @@ async def test_init_identity_personality_values_worldview(db_pool, ensure_embedd
         await tr.start()
         try:
             identity = _coerce_json(
-                await conn.fetchval(
-                    "SELECT init_identity($1, $2, $3, $4, $5, $6)",
-                    "Astra",
-                    "she/her",
-                    "calm",
-                    "A developing mind",
-                    "To learn",
-                    "Creator",
+                await timed_db_call(
+                    "init_identity",
+                    conn.fetchval(
+                        "SELECT init_identity($1, $2, $3, $4, $5, $6)",
+                        "Astra",
+                        "she/her",
+                        "calm",
+                        "A developing mind",
+                        "To learn",
+                        "Creator",
+                    ),
+                    conn=conn,
+                    track_embeddings=True,
                 )
             )
             assert identity["stage"] == "identity"
@@ -157,18 +162,28 @@ async def test_init_identity_personality_values_worldview(db_pool, ensure_embedd
             assert int(count) >= 1
 
             personality = _coerce_json(
-                await conn.fetchval(
-                    "SELECT init_personality($1::jsonb, $2)",
-                    json.dumps({"openness": 0.8, "agreeableness": 0.7}),
-                    "reflective",
+                await timed_db_call(
+                    "init_personality",
+                    conn.fetchval(
+                        "SELECT init_personality($1::jsonb, $2)",
+                        json.dumps({"openness": 0.8, "agreeableness": 0.7}),
+                        "reflective",
+                    ),
+                    conn=conn,
+                    track_embeddings=True,
                 )
             )
             assert personality["stage"] == "personality"
 
             values = _coerce_json(
-                await conn.fetchval(
-                    "SELECT init_values($1::jsonb)",
-                    json.dumps(["honesty", "curiosity"]),
+                await timed_db_call(
+                    "init_values",
+                    conn.fetchval(
+                        "SELECT init_values($1::jsonb)",
+                        json.dumps(["honesty", "curiosity"]),
+                    ),
+                    conn=conn,
+                    track_embeddings=True,
                 )
             )
             assert values["stage"] == "values"
@@ -178,9 +193,14 @@ async def test_init_identity_personality_values_worldview(db_pool, ensure_embedd
             assert int(value_count) >= 2
 
             worldview = _coerce_json(
-                await conn.fetchval(
-                    "SELECT init_worldview($1::jsonb)",
-                    json.dumps({"metaphysics": "agnostic", "ethics": "compassion"}),
+                await timed_db_call(
+                    "init_worldview",
+                    conn.fetchval(
+                        "SELECT init_worldview($1::jsonb)",
+                        json.dumps({"metaphysics": "agnostic", "ethics": "compassion"}),
+                    ),
+                    conn=conn,
+                    track_embeddings=True,
                 )
             )
             assert worldview["stage"] == "worldview"
@@ -281,15 +301,32 @@ async def test_init_with_defaults_and_reset(db_pool, ensure_embedding_service):
         tr = conn.transaction()
         await tr.start()
         try:
-            status = _coerce_json(await conn.fetchval("SELECT reset_initialization()"))
+            status = _coerce_json(
+                await timed_db_call(
+                    "reset_initialization",
+                    conn.fetchval("SELECT reset_initialization()"),
+                    conn=conn,
+                )
+            )
             assert status["stage"] == "not_started"
 
             result = _coerce_json(
-                await conn.fetchval("SELECT init_with_defaults($1)", "Tester")
+                await timed_db_call(
+                    "init_with_defaults",
+                    conn.fetchval("SELECT init_with_defaults($1)", "Tester"),
+                    conn=conn,
+                    track_embeddings=True,
+                )
             )
             assert result["status"]["stage"] == "consent"
 
-            status = _coerce_json(await conn.fetchval("SELECT reset_initialization()"))
+            status = _coerce_json(
+                await timed_db_call(
+                    "reset_initialization_cleanup",
+                    conn.fetchval("SELECT reset_initialization()"),
+                    conn=conn,
+                )
+            )
             assert status["stage"] == "not_started"
             assert await conn.fetchval("SELECT get_config('agent.mode')") is None
         finally:
@@ -323,9 +360,14 @@ async def test_run_full_initialization(db_pool, ensure_embedding_service):
             }
 
             result = _coerce_json(
-                await conn.fetchval(
-                    "SELECT run_full_initialization($1::jsonb)",
-                    json.dumps(payload),
+                await timed_db_call(
+                    "run_full_initialization",
+                    conn.fetchval(
+                        "SELECT run_full_initialization($1::jsonb)",
+                        json.dumps(payload),
+                    ),
+                    conn=conn,
+                    track_embeddings=True,
                 )
             )
             assert "results" in result

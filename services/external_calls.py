@@ -40,7 +40,7 @@ class ExternalCallProcessor:
         if call_type == "tool_use":
             return await self._process_tool_use_call(conn, call_input)
         if call_type == "embed":
-            raise RuntimeError("external_calls type 'embed' is unsupported; use get_embedding() inside Postgres")
+            raise RuntimeError("external_calls type 'embed' is unsupported; use get_embedding(text[]) inside Postgres")
         return {"error": f"Unsupported call_type: {call_type}"}
 
     async def _process_tool_use_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:

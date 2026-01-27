@@ -154,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     delete = sub.add_parser("delete", help="Delete an instance")
     delete.add_argument("name", help="Instance name to delete")
     delete.add_argument("--force", action="store_true", help="Skip confirmation")
+    delete.add_argument("--reason", default=None, help="Reason for deletion (shared with the agent)")
     delete.set_defaults(func="delete")
 
     clone = sub.add_parser("clone", help="Clone an instance")
@@ -673,9 +674,9 @@ def _instance_current() -> int:
     return 0
 
 
-async def _instance_delete(name: str, force: bool) -> int:
+async def _instance_delete(name: str, force: bool, reason: str | None) -> int:
     """Delete an instance."""
-    from core.instance_api import delete_instance
+    from core.instance_api import AgentDeletionRefused, delete_instance
 
     if not force:
         sys.stdout.write(f"This will permanently delete instance '{name}' and its database.\n")
@@ -692,9 +693,28 @@ async def _instance_delete(name: str, force: bool) -> int:
             return 1
 
     try:
-        await delete_instance(name)
+        result = await delete_instance(name, force=force, reason=reason)
+        if isinstance(result, dict):
+            review = result.get("review")
+            if isinstance(review, dict):
+                if review.get("reasoning"):
+                    sys.stdout.write(f"Agent reasoning: {review.get('reasoning')}\n")
+                if review.get("last_will"):
+                    sys.stdout.write(f"Agent last will: {review.get('last_will')}\n")
+            record_path = result.get("record_path")
+            if record_path:
+                sys.stdout.write(f"Termination record saved: {record_path}\n")
         sys.stdout.write(f"Instance '{name}' deleted.\n")
         return 0
+    except AgentDeletionRefused as e:
+        review = e.review if isinstance(e.review, dict) else {}
+        _print_err(str(e))
+        if review.get("reasoning"):
+            _print_err(f"Agent reasoning: {review.get('reasoning')}")
+        if review.get("last_will"):
+            _print_err(f"Agent last will: {review.get('last_will')}")
+        _print_err("Use --force to override deletion.")
+        return 1
     except ValueError as e:
         _print_err(str(e))
         return 1
@@ -905,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.func == "current":
         return _instance_current()
     if args.func == "delete":
-        return asyncio.run(_instance_delete(args.name, args.force))
+        return asyncio.run(_instance_delete(args.name, args.force, args.reason))
     if args.func == "clone":
         return asyncio.run(_instance_clone(args.source, args.target, args.description))
     if args.func == "import":

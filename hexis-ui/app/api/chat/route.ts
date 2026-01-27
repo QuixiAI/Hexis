@@ -492,7 +492,7 @@ async function executeToolCall(name: string, args: Record<string, any>) {
       const rows = await prisma.$queryRaw<
         { id: string; content: string; importance: number; score: number }[]
       >`
-        WITH query AS (SELECT get_embedding(${task}) as emb)
+        WITH query AS (SELECT (get_embedding(ARRAY[${task}]))[1] as emb)
         SELECT m.id, m.content, m.importance, 1 - (m.embedding <=> (SELECT emb FROM query)) as score
         FROM memories m
         WHERE m.type = 'procedural' AND m.status = 'active' AND m.embedding IS NOT NULL
@@ -511,7 +511,7 @@ async function executeToolCall(name: string, args: Record<string, any>) {
       const rows = await prisma.$queryRaw<
         { id: string; content: string; importance: number; score: number }[]
       >`
-        WITH query AS (SELECT get_embedding(${topic}) as emb)
+        WITH query AS (SELECT (get_embedding(ARRAY[${topic}]))[1] as emb)
         SELECT m.id, m.content, m.importance, 1 - (m.embedding <=> (SELECT emb FROM query)) as score
         FROM memories m
         WHERE m.type = 'strategic' AND m.status = 'active' AND m.embedding IS NOT NULL

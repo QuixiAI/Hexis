@@ -76,7 +76,7 @@ class TestDeleteInstance:
 
         with patch("core.instance_api.drop_database", new_callable=AsyncMock):
             with patch("core.instance_api.get_admin_dsn", new_callable=AsyncMock, return_value="postgresql://admin@localhost/postgres"):
-                await delete_instance("test")
+                await delete_instance("test", require_permission=False)
 
         # Reload registry from file to check the deletion was persisted
         fresh_registry = InstanceRegistry()
@@ -84,7 +84,7 @@ class TestDeleteInstance:
 
     async def test_delete_nonexistent_fails(self, temp_registry):
         with pytest.raises(ValueError, match="not found"):
-            await delete_instance("nonexistent")
+            await delete_instance("nonexistent", require_permission=False)
 
 
 @pytest.mark.asyncio(loop_scope="session")

@@ -271,7 +271,7 @@ CREATE OR REPLACE FUNCTION search_clusters_by_query(
 BEGIN
     RETURN QUERY
     WITH query_embedding AS (
-        SELECT get_embedding(ensure_embedding_prefix(p_query, 'search_query')) as emb
+        SELECT (get_embedding(ARRAY[ensure_embedding_prefix(p_query, 'search_query')]))[1] as emb
     )
     SELECT
         c.id,
@@ -363,7 +363,7 @@ CREATE OR REPLACE FUNCTION search_procedural_memories(
 BEGIN
     RETURN QUERY
     WITH query_embedding AS (
-        SELECT get_embedding(ensure_embedding_prefix(p_task, 'search_query')) as emb
+        SELECT (get_embedding(ARRAY[ensure_embedding_prefix(p_task, 'search_query')]))[1] as emb
     )
     SELECT
         m.id,
@@ -399,7 +399,7 @@ CREATE OR REPLACE FUNCTION search_strategic_memories(
 BEGIN
     RETURN QUERY
     WITH query_embedding AS (
-        SELECT get_embedding(ensure_embedding_prefix(p_situation, 'search_query')) as emb
+        SELECT (get_embedding(ARRAY[ensure_embedding_prefix(p_situation, 'search_query')]))[1] as emb
     )
     SELECT
         m.id,
@@ -741,7 +741,7 @@ BEGIN
         END;
     END IF;
     effective_trust := LEAST(1.0, GREATEST(0.0, effective_trust));
-    embedding_vec := get_embedding(p_content);
+    embedding_vec := (get_embedding(ARRAY[p_content]))[1];
 
     INSERT INTO memories (type, content, embedding, importance, source_attribution, trust_level, trust_updated_at, metadata)
     VALUES (p_type, p_content, embedding_vec, p_importance, normalized_source, effective_trust, CURRENT_TIMESTAMP, COALESCE(p_metadata, '{}'::jsonb))
@@ -1327,7 +1327,7 @@ DECLARE
     query_embedding vector;
     zero_vec vector;
 BEGIN
-    query_embedding := get_embedding(ensure_embedding_prefix(p_query_text, 'search_query'));
+    query_embedding := (get_embedding(ARRAY[ensure_embedding_prefix(p_query_text, 'search_query')]))[1];
     zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
     
     RETURN QUERY
@@ -1688,7 +1688,7 @@ CREATE OR REPLACE FUNCTION add_to_working_memory(
 	    normalized_source JSONB;
 	    effective_trust FLOAT;
 	BEGIN
-	    embedding_vec := get_embedding(p_content);
+	    embedding_vec := (get_embedding(ARRAY[p_content]))[1];
 
 	    normalized_source := normalize_source_reference(p_source_attribution);
 	    IF normalized_source = '{}'::jsonb THEN
@@ -1728,7 +1728,7 @@ CREATE OR REPLACE FUNCTION search_working_memory(
 	    query_embedding vector;
 	    zero_vec vector;
 	BEGIN
-	    query_embedding := get_embedding(ensure_embedding_prefix(p_query_text, 'search_query'));
+	    query_embedding := (get_embedding(ARRAY[ensure_embedding_prefix(p_query_text, 'search_query')]))[1];
 	    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 	    PERFORM cleanup_working_memory();
 	    

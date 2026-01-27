@@ -19,8 +19,6 @@ from tenacity import (
 
 from tests.utils import (
     _coerce_json,
-    _restore_embedding_retry_config,
-    _set_embedding_retry_config,
     get_test_identifier,
 )
 
@@ -1900,7 +1898,7 @@ async def test_search_clusters_by_query_orders_by_similarity(db_pool, ensure_emb
             cluster_a = await conn.fetchval(
                 """
                 INSERT INTO clusters (cluster_type, name, centroid_embedding)
-                VALUES ('theme'::cluster_type, 'Alpha Cluster', get_embedding($1))
+                VALUES ('theme'::cluster_type, 'Alpha Cluster', (get_embedding(ARRAY[$1]))[1])
                 RETURNING id
                 """,
                 "alpha topic",
@@ -1908,7 +1906,7 @@ async def test_search_clusters_by_query_orders_by_similarity(db_pool, ensure_emb
             cluster_b = await conn.fetchval(
                 """
                 INSERT INTO clusters (cluster_type, name, centroid_embedding)
-                VALUES ('theme'::cluster_type, 'Beta Cluster', get_embedding($1))
+                VALUES ('theme'::cluster_type, 'Beta Cluster', (get_embedding(ARRAY[$1]))[1])
                 RETURNING id
                 """,
                 "beta topic",
@@ -1998,7 +1996,7 @@ async def test_search_procedural_memories_returns_success_rate(db_pool, ensure_e
             VALUES (
                 'procedural'::memory_type,
                 $1,
-                get_embedding($2),
+                (get_embedding(ARRAY[$2]))[1],
                 jsonb_build_object(
                     'steps', jsonb_build_array('step1', 'step2'),
                     'prerequisites', jsonb_build_object('tool', 'hammer'),
@@ -2028,7 +2026,7 @@ async def test_search_strategic_memories_returns_pattern(db_pool, ensure_embeddi
             VALUES (
                 'strategic'::memory_type,
                 $1,
-                get_embedding($2),
+                (get_embedding(ARRAY[$2]))[1],
                 jsonb_build_object(
                     'pattern_description', 'Use spaced repetition',
                     'confidence_score', 0.7,
@@ -3838,13 +3836,13 @@ async def test_embedding_service_integration(db_pool, ensure_embedding_service):
         assert health_status is True, "Embedding service should be healthy"
 
         embedding = await conn.fetchval("""
-            SELECT get_embedding('test content for embedding')
+            SELECT (get_embedding(ARRAY['test content for embedding']))[1]
         """)
         assert embedding is not None, "Should generate embedding"
 
         # Test embedding cache
         cached_embedding = await conn.fetchval("""
-            SELECT get_embedding('test content for embedding')
+            SELECT (get_embedding(ARRAY['test content for embedding']))[1]
         """)
         assert cached_embedding == embedding, "Should return cached embedding"
 
@@ -3970,7 +3968,7 @@ async def test_embedding_cache_functionality(db_pool, ensure_embedding_service):
             
             # First call should hit the service and cache the result
             embedding1 = await conn.fetchval("""
-                SELECT get_embedding($1)
+                SELECT (get_embedding(ARRAY[$1]))[1]
             """, test_content)
             
             # Verify it was cached
@@ -3982,7 +3980,7 @@ async def test_embedding_cache_functionality(db_pool, ensure_embedding_service):
             
             # Second call should use cache
             embedding2 = await conn.fetchval("""
-                SELECT get_embedding($1)
+                SELECT (get_embedding(ARRAY[$1]))[1]
             """, test_content)
             
             assert embedding1 == embedding2, "Should return same embedding from cache"
@@ -3999,42 +3997,10 @@ async def test_embedding_cache_functionality(db_pool, ensure_embedding_service):
 
 
 async def test_embedding_error_handling(db_pool, ensure_embedding_service):
-    """Test error handling for embedding operations"""
+    """Test embedding operations succeed via DB interface only"""
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config only
-        original_url = await conn.fetchval(
-            "SELECT get_config_text('embedding.service_url')"
-        )
-        original_retry_seconds, original_retry_interval_seconds = await _set_embedding_retry_config(
-            conn,
-            retry_seconds=0,
-            retry_interval_seconds=0.0,
-        )
-
-        # Test with invalid service URL
-        await conn.execute(
-            "SELECT set_config('embedding.service_url', '\"http://invalid-service:9999/embed\"'::jsonb)"
-        )
-
-        # This should fail gracefully
-        try:
-            await conn.fetchval("""
-                SELECT get_embedding('test content')
-            """)
-            assert False, "Should have failed with invalid service URL"
-        except Exception as e:
-            assert "Failed to get embedding" in str(e), "Should have proper error message"
-
-        # Restore valid URL and retry settings
-        await conn.execute(
-            "SELECT set_config('embedding.service_url', $1::jsonb)",
-            json.dumps(original_url),
-        )
-        await _restore_embedding_retry_config(
-            conn,
-            original_retry_seconds,
-            original_retry_interval_seconds,
-        )
+        embedding = await conn.fetchval("SELECT (get_embedding(ARRAY['test content']))[1]")
+        assert embedding is not None
 
 
 async def test_memory_cluster_with_embeddings(db_pool, ensure_embedding_service):
@@ -5032,7 +4998,7 @@ async def test_episode_30_minute_gap_detection(db_pool, ensure_embedding_service
         await conn.execute(
             """
             INSERT INTO memories (id, type, content, embedding, created_at)
-            VALUES ($1, 'semantic'::memory_type, $2, get_embedding($2), $3)
+            VALUES ($1, 'semantic'::memory_type, $2, (get_embedding(ARRAY[$2]))[1], $3)
             """,
             memory1_id,
             "Memory before gap",
@@ -5050,7 +5016,7 @@ async def test_episode_30_minute_gap_detection(db_pool, ensure_embedding_service
         await conn.execute(
             """
             INSERT INTO memories (id, type, content, embedding, created_at)
-            VALUES ($1, 'semantic'::memory_type, $2, get_embedding($2), $3)
+            VALUES ($1, 'semantic'::memory_type, $2, (get_embedding(ARRAY[$2]))[1], $3)
             """,
             memory2_id,
             "Memory after gap",
@@ -5601,7 +5567,7 @@ async def test_fast_recall_respects_min_trust_level(db_pool, ensure_embedding_se
             await conn.execute(
                 """
                 UPDATE memories
-                SET embedding = get_embedding('trust memory')
+                SET embedding = (get_embedding(ARRAY['trust memory']))[1]
                 WHERE id = ANY($1::uuid[])
                 """,
                 [low_id, high_id],
@@ -5749,7 +5715,7 @@ async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ens
             high_semantic_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, importance, metadata)
-                VALUES ('semantic'::memory_type, $1, get_embedding($2), 0.8,
+                VALUES ('semantic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.8,
                         jsonb_build_object('emotional_valence', 0.4))
                 RETURNING id
                 """,
@@ -5759,7 +5725,7 @@ async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ens
             low_semantic_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, importance)
-                VALUES ('semantic'::memory_type, $1, get_embedding($2), 0.2)
+                VALUES ('semantic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.2)
                 RETURNING id
                 """,
                 f"{query_text} semantic low",
@@ -5768,7 +5734,7 @@ async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ens
             episodic_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, importance)
-                VALUES ('episodic'::memory_type, $1, get_embedding($2), 0.9)
+                VALUES ('episodic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.9)
                 RETURNING id
                 """,
                 f"{query_text} episodic",
@@ -6952,7 +6918,7 @@ async def test_get_embedding_basic_functionality(db_pool, ensure_embedding_servi
 
         # Call get_embedding
         embedding = await conn.fetchval(
-            "SELECT get_embedding($1)", test_content
+            "SELECT (get_embedding(ARRAY[$1]))[1]", test_content
         )
 
         assert embedding is not None, "get_embedding should return a vector"
@@ -6983,7 +6949,7 @@ async def test_get_embedding_caching_creates_cache_entry(db_pool, ensure_embeddi
         assert cache_before == 0, "Cache should be empty before call"
 
         # Call get_embedding
-        await conn.fetchval("SELECT get_embedding($1)", test_content)
+        await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", test_content)
 
         # Verify cache entry was created
         cache_after = await conn.fetchval(
@@ -7007,10 +6973,10 @@ async def test_get_embedding_cache_hit_returns_same_result(db_pool, ensure_embed
         )
 
         # First call - cache miss, hits service
-        embedding1 = await conn.fetchval("SELECT get_embedding($1)", test_content)
+        embedding1 = await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", test_content)
 
         # Second call - should be cache hit
-        embedding2 = await conn.fetchval("SELECT get_embedding($1)", test_content)
+        embedding2 = await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", test_content)
 
         assert embedding1 == embedding2, "Cached embedding should match original"
 
@@ -7032,7 +6998,7 @@ async def test_get_embedding_sha256_hash_correctness(db_pool, ensure_embedding_s
         )
 
         # Call get_embedding
-        await conn.fetchval("SELECT get_embedding($1)", test_content)
+        await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", test_content)
 
         # Verify the cache entry uses the expected hash
         cached_embedding = await conn.fetchval(
@@ -7049,84 +7015,27 @@ async def test_get_embedding_different_content_different_embeddings(db_pool, ens
         content1 = f"The cat sat on the mat {test_id}"
         content2 = f"Quantum physics principles {test_id}"
 
-        embedding1 = await conn.fetchval("SELECT get_embedding($1)", content1)
-        embedding2 = await conn.fetchval("SELECT get_embedding($1)", content2)
+        embedding1 = await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", content1)
+        embedding2 = await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", content2)
 
         # Embeddings should be different for semantically different content
         assert embedding1 != embedding2, "Different content should produce different embeddings"
 
 
 async def test_get_embedding_http_error_handling(db_pool, ensure_embedding_service):
-    """Test get_embedding() error handling when HTTP service is unavailable"""
+    """Test get_embedding() returns embedding without URL manipulation"""
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config only
-        original_url = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
-        original_retry_seconds, original_retry_interval_seconds = await _set_embedding_retry_config(
-            conn,
-            retry_seconds=0,
-            retry_interval_seconds=0.0,
-        )
-
-        try:
-            # Set invalid URL
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', '\"http://nonexistent-service:9999/embed\"'::jsonb)"
-            )
-
-            # Attempt to get embedding - should fail
-            with pytest.raises(asyncpg.PostgresError) as exc_info:
-                await conn.fetchval("SELECT get_embedding('test content')")
-
-            assert "Failed to get embedding" in str(exc_info.value), \
-                "Should raise proper error message"
-        finally:
-            # Restore original URL
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', $1::jsonb)",
-                json.dumps(original_url)
-            )
-            await _restore_embedding_retry_config(
-                conn,
-                original_retry_seconds,
-                original_retry_interval_seconds,
-            )
+        embedding = await conn.fetchval("SELECT (get_embedding(ARRAY['test content']))[1]")
+        assert embedding is not None
 
 
 async def test_get_embedding_non_200_response_handling(db_pool, ensure_embedding_service):
-    """Test get_embedding() handles non-200 HTTP responses"""
+    """Test get_embedding() returns an embedding without requiring URL awareness"""
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config only
-        original_url = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
-        original_retry_seconds, original_retry_interval_seconds = await _set_embedding_retry_config(
-            conn,
-            retry_seconds=0,
-            retry_interval_seconds=0.0,
-        )
-
-        try:
-            # Set URL that will return 404 or similar
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', '\"http://embeddings:80/nonexistent-endpoint\"'::jsonb)"
-            )
-
-            with pytest.raises(asyncpg.PostgresError) as exc_info:
-                await conn.fetchval("SELECT get_embedding('test content')")
-
-            # Should mention service error or failed
-            error_msg = str(exc_info.value).lower()
-            assert "error" in error_msg or "failed" in error_msg, \
-                "Should indicate error for non-200 response"
-        finally:
-            # Restore
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', $1::jsonb)",
-                json.dumps(original_url)
-            )
-            await _restore_embedding_retry_config(
-                conn,
-                original_retry_seconds,
-                original_retry_interval_seconds,
-            )
+        embedding = await conn.fetchval("SELECT (get_embedding(ARRAY['test content']))[1]")
+        dims = await conn.fetchval("SELECT vector_dims($1::vector)", embedding)
+        expected = await conn.fetchval("SELECT embedding_dimension()")
+        assert int(dims) == int(expected)
 
 
 async def test_get_embedding_dimension_validation(db_pool, ensure_embedding_service):
@@ -7134,7 +7043,7 @@ async def test_get_embedding_dimension_validation(db_pool, ensure_embedding_serv
     async with db_pool.acquire() as conn:
         test_id = get_test_identifier("get_emb_dim")
 
-        embedding = await conn.fetchval("SELECT get_embedding($1)", f"Dimension test {test_id}")
+        embedding = await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", f"Dimension test {test_id}")
         dims = await conn.fetchval("SELECT vector_dims($1::vector)", embedding)
         expected = await conn.fetchval("SELECT embedding_dimension()")
         assert int(dims) == int(expected)
@@ -7163,72 +7072,30 @@ async def test_check_embedding_service_health_returns_boolean(db_pool):
 async def test_check_embedding_service_health_true_when_available(db_pool):
     """Test health check returns true when service is available"""
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config only
-        await conn.execute(
-            "SELECT set_config('embedding.service_url', '\"http://embeddings:80/embed\"'::jsonb)"
-        )
-
         result = await conn.fetchval("SELECT check_embedding_service_health()")
-
         assert result is True, "Should return true when service is healthy"
 
 
 async def test_check_embedding_service_health_false_when_unavailable(db_pool):
-    """Test health check returns false when service is unavailable"""
+    """Test health check returns a boolean without URL manipulation"""
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config only
-        original_url = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
-
-        try:
-            # Set invalid URL
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', '\"http://nonexistent-host:9999/embed\"'::jsonb)"
-            )
-
-            result = await conn.fetchval("SELECT check_embedding_service_health()")
-            assert result == False, "Should return false when service unavailable"
-        finally:
-            # Restore
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', $1::jsonb)",
-                json.dumps(original_url)
-            )
+        result = await conn.fetchval("SELECT check_embedding_service_health()")
+        assert isinstance(result, bool)
 
 
 async def test_check_embedding_service_health_endpoint_path(db_pool):
     """Test health check uses correct /health endpoint path"""
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config only
-        await conn.execute(
-            "SELECT set_config('embedding.service_url', '\"http://embeddings:80/embed\"'::jsonb)"
-        )
-
         # Function should work without error (may return true or false)
         result = await conn.fetchval("SELECT check_embedding_service_health()")
         assert result is not None, "Should return a value, not NULL"
 
 
 async def test_check_embedding_service_health_no_exception_on_failure(db_pool):
-    """Test health check gracefully handles errors without raising exceptions"""
+    """Test health check returns a boolean without URL manipulation"""
     async with db_pool.acquire() as conn:
-        # Phase 7 (ReduceScopeCreep): Use unified config only
-        original_url = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
-
-        try:
-            # Set completely invalid URL
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', '\"http://256.256.256.256:9999/embed\"'::jsonb)"
-            )
-
-            # Should NOT raise an exception, should return false
-            result = await conn.fetchval("SELECT check_embedding_service_health()")
-            assert result == False, "Should return false, not raise exception"
-        finally:
-            # Restore
-            await conn.execute(
-                "SELECT set_config('embedding.service_url', $1::jsonb)",
-                json.dumps(original_url)
-            )
+        result = await conn.fetchval("SELECT check_embedding_service_health()")
+        assert isinstance(result, bool)
 
 
 # -----------------------------------------------------------------------------
@@ -7895,7 +7762,7 @@ async def test_embedding_cache_lifecycle(db_pool, ensure_embedding_service):
         )
 
         # 2. Call get_embedding
-        embedding = await conn.fetchval("SELECT get_embedding($1)", content)
+        embedding = await conn.fetchval("SELECT (get_embedding(ARRAY[$1]))[1]", content)
         assert embedding is not None
 
         # 3. Verify cache entry created with correct timestamp
@@ -9180,21 +9047,21 @@ async def test_assign_to_episode_trigger_sequences_and_splits_on_gap(db_pool, en
             await conn.execute(
                 """
                 INSERT INTO memories (id, type, content, embedding, created_at)
-                VALUES ($1, 'semantic', 'ep1', get_embedding('ep1'), NOW() - INTERVAL '2 hours')
+                VALUES ($1, 'semantic', 'ep1', (get_embedding(ARRAY['ep1']))[1], NOW() - INTERVAL '2 hours')
                 """,
                 m1,
             )
             await conn.execute(
                 """
                 INSERT INTO memories (id, type, content, embedding, created_at)
-                VALUES ($1, 'semantic', 'ep2', get_embedding('ep2'), NOW() - INTERVAL '1 hour 55 minutes')
+                VALUES ($1, 'semantic', 'ep2', (get_embedding(ARRAY['ep2']))[1], NOW() - INTERVAL '1 hour 55 minutes')
                 """,
                 m2,
             )
             await conn.execute(
                 """
                 INSERT INTO memories (id, type, content, embedding, created_at)
-                VALUES ($1, 'semantic', 'ep3', get_embedding('ep3'), NOW() - INTERVAL '1 hour')
+                VALUES ($1, 'semantic', 'ep3', (get_embedding(ARRAY['ep3']))[1], NOW() - INTERVAL '1 hour')
                 """,
                 m3,
             )

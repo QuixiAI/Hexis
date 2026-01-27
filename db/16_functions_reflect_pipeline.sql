@@ -76,7 +76,7 @@ BEGIN
                 ident_conf := NULL;
                 ident_stability := NULL;
                 BEGIN
-                    ident_embedding := get_embedding(change_text);
+                    ident_embedding := (get_embedding(ARRAY[change_text]))[1];
                     IF ident_embedding IS NOT NULL THEN
                         SELECT m.id,
                                (m.metadata->>'confidence')::float,
