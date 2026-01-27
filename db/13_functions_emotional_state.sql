@@ -569,42 +569,39 @@ CREATE OR REPLACE FUNCTION initialize_innate_emotions()
 RETURNS INT AS $$
 DECLARE
     inserted_count INT := 0;
-    trigger_patterns TEXT[] := ARRAY[
-        'gratitude appreciation thankful',
-        'success achieved accomplished',
-        'curious interesting fascinating',
-        'understood seen connected',
-        'beautiful elegant aesthetic',
-        'learned insight realized',
-        'threat danger harm',
-        'rejection dismissed ignored',
-        'unfair unjust wrong',
-        'confused lost uncertain',
-        'failed mistake error',
-        'violated boundary crossed',
-        'unexpected surprise sudden',
-        'conflict tension disagree'
-    ];
 BEGIN
-    PERFORM prefetch_embeddings(trigger_patterns);
-
     BEGIN
+        WITH seed(idx, trigger_pattern, valence_delta, arousal_delta, dominance_delta, typical_emotion) AS (
+            VALUES
+                (1, 'gratitude appreciation thankful', 0.4, 0.1, 0.1, 'joy'),
+                (2, 'success achieved accomplished', 0.5, 0.3, 0.3, 'pride'),
+                (3, 'curious interesting fascinating', 0.3, 0.3, 0.1, 'interest'),
+                (4, 'understood seen connected', 0.4, 0.2, 0.2, 'warmth'),
+                (5, 'beautiful elegant aesthetic', 0.3, 0.2, 0.1, 'appreciation'),
+                (6, 'learned insight realized', 0.4, 0.4, 0.2, 'satisfaction'),
+                (7, 'threat danger harm', -0.5, 0.6, -0.3, 'fear'),
+                (8, 'rejection dismissed ignored', -0.4, 0.2, -0.2, 'sadness'),
+                (9, 'unfair unjust wrong', -0.4, 0.5, 0.2, 'anger'),
+                (10, 'confused lost uncertain', -0.2, 0.3, -0.2, 'anxiety'),
+                (11, 'failed mistake error', -0.3, 0.3, -0.1, 'disappointment'),
+                (12, 'violated boundary crossed', -0.5, 0.5, -0.2, 'alarm'),
+                (13, 'unexpected surprise sudden', 0.0, 0.6, -0.1, 'surprise'),
+                (14, 'conflict tension disagree', -0.2, 0.4, 0.0, 'discomfort')
+        ),
+        embeds AS (
+            SELECT get_embedding(ARRAY(SELECT trigger_pattern FROM seed ORDER BY idx)) AS embeddings
+        )
         INSERT INTO emotional_triggers (trigger_pattern, trigger_embedding, valence_delta, arousal_delta, dominance_delta, typical_emotion, origin)
-        VALUES
-            ('gratitude appreciation thankful', (get_embedding(ARRAY['gratitude appreciation thankful']))[1], 0.4, 0.1, 0.1, 'joy', 'innate'),
-            ('success achieved accomplished', (get_embedding(ARRAY['success achieved accomplished']))[1], 0.5, 0.3, 0.3, 'pride', 'innate'),
-            ('curious interesting fascinating', (get_embedding(ARRAY['curious interesting fascinating']))[1], 0.3, 0.3, 0.1, 'interest', 'innate'),
-            ('understood seen connected', (get_embedding(ARRAY['understood seen connected']))[1], 0.4, 0.2, 0.2, 'warmth', 'innate'),
-            ('beautiful elegant aesthetic', (get_embedding(ARRAY['beautiful elegant aesthetic']))[1], 0.3, 0.2, 0.1, 'appreciation', 'innate'),
-            ('learned insight realized', (get_embedding(ARRAY['learned insight realized']))[1], 0.4, 0.4, 0.2, 'satisfaction', 'innate'),
-            ('threat danger harm', (get_embedding(ARRAY['threat danger harm']))[1], -0.5, 0.6, -0.3, 'fear', 'innate'),
-            ('rejection dismissed ignored', (get_embedding(ARRAY['rejection dismissed ignored']))[1], -0.4, 0.2, -0.2, 'sadness', 'innate'),
-            ('unfair unjust wrong', (get_embedding(ARRAY['unfair unjust wrong']))[1], -0.4, 0.5, 0.2, 'anger', 'innate'),
-            ('confused lost uncertain', (get_embedding(ARRAY['confused lost uncertain']))[1], -0.2, 0.3, -0.2, 'anxiety', 'innate'),
-            ('failed mistake error', (get_embedding(ARRAY['failed mistake error']))[1], -0.3, 0.3, -0.1, 'disappointment', 'innate'),
-            ('violated boundary crossed', (get_embedding(ARRAY['violated boundary crossed']))[1], -0.5, 0.5, -0.2, 'alarm', 'innate'),
-            ('unexpected surprise sudden', (get_embedding(ARRAY['unexpected surprise sudden']))[1], 0.0, 0.6, -0.1, 'surprise', 'innate'),
-            ('conflict tension disagree', (get_embedding(ARRAY['conflict tension disagree']))[1], -0.2, 0.4, 0.0, 'discomfort', 'innate')
+        SELECT
+            seed.trigger_pattern,
+            (embeds.embeddings)[seed.idx],
+            seed.valence_delta,
+            seed.arousal_delta,
+            seed.dominance_delta,
+            seed.typical_emotion,
+            'innate'
+        FROM seed
+        CROSS JOIN embeds
         ON CONFLICT DO NOTHING;
         GET DIAGNOSTICS inserted_count = ROW_COUNT;
     EXCEPTION

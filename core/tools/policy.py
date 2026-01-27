@@ -161,41 +161,15 @@ class ToolPolicy:
     async def _check_boundaries(self, spec: ToolSpec) -> PolicyCheckResult:
         """Check if any worldview boundary restricts this tool."""
         async with self.pool.acquire() as conn:
-            # Check for boundary that restricts this specific tool
             boundary = await conn.fetchval(
-                """
-                SELECT content FROM memories
-                WHERE type = 'worldview'
-                  AND metadata->>'category' = 'boundary'
-                  AND metadata->'restricts_tools' ? $1
-                  AND status = 'active'
-                LIMIT 1
-                """,
+                "SELECT tool_boundary_violation($1::text, $2::text)",
                 spec.name,
-            )
-
-            if boundary:
-                return PolicyCheckResult.deny(
-                    f"Boundary restriction: {boundary}",
-                    ToolErrorType.BOUNDARY_VIOLATION,
-                )
-
-            # Check for boundary that restricts this category
-            boundary = await conn.fetchval(
-                """
-                SELECT content FROM memories
-                WHERE type = 'worldview'
-                  AND metadata->>'category' = 'boundary'
-                  AND metadata->'restricts_categories' ? $1
-                  AND status = 'active'
-                LIMIT 1
-                """,
                 spec.category.value,
             )
 
             if boundary:
                 return PolicyCheckResult.deny(
-                    f"Boundary restriction on category '{spec.category.value}': {boundary}",
+                    f"Boundary restriction: {boundary}",
                     ToolErrorType.BOUNDARY_VIOLATION,
                 )
 
@@ -217,11 +191,7 @@ class ToolPolicy:
         # For heartbeat, check if tool has been approved
         async with self.pool.acquire() as conn:
             approved = await conn.fetchval(
-                """
-                SELECT 1 FROM config
-                WHERE key = 'tools.approvals'
-                  AND value ? $1
-                """,
+                "SELECT is_tool_approved($1::text)",
                 spec.name,
             )
 
@@ -237,46 +207,20 @@ class ToolPolicy:
 async def grant_tool_approval(pool: "asyncpg.Pool", tool_name: str) -> None:
     """Grant approval for autonomous use of a tool."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO config (key, value, description, updated_at)
-            VALUES ('tools.approvals', jsonb_build_array($1), 'Approved tools for autonomous use', NOW())
-            ON CONFLICT (key) DO UPDATE SET
-                value = config.value || jsonb_build_array($1),
-                updated_at = NOW()
-            WHERE NOT config.value ? $1
-            """,
-            tool_name,
-        )
+        await conn.execute("SELECT grant_tool_approval($1::text)", tool_name)
 
 
 async def revoke_tool_approval(pool: "asyncpg.Pool", tool_name: str) -> None:
     """Revoke approval for autonomous use of a tool."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE config
-            SET value = value - $1, updated_at = NOW()
-            WHERE key = 'tools.approvals'
-            """,
-            tool_name,
-        )
+        await conn.execute("SELECT revoke_tool_approval($1::text)", tool_name)
 
 
 async def list_approved_tools(pool: "asyncpg.Pool") -> list[str]:
     """List tools approved for autonomous use."""
     async with pool.acquire() as conn:
-        row = await conn.fetchval(
-            "SELECT value FROM config WHERE key = 'tools.approvals'"
-        )
-        if row:
-            import json
-
-            try:
-                return json.loads(row) if isinstance(row, str) else list(row)
-            except (json.JSONDecodeError, TypeError):
-                return []
-        return []
+        row = await conn.fetchval("SELECT list_tool_approvals()")
+        return list(row or [])
 
 
 async def create_tool_boundary(
@@ -286,23 +230,18 @@ async def create_tool_boundary(
     restricts_categories: list[str] | None = None,
 ) -> str:
     """Create a worldview boundary that restricts tools."""
-    import json
-    from uuid import uuid4
-
-    metadata = {"category": "boundary"}
-    if restricts_tools:
-        metadata["restricts_tools"] = restricts_tools
-    if restricts_categories:
-        metadata["restricts_categories"] = restricts_categories
-
     async with pool.acquire() as conn:
         memory_id = await conn.fetchval(
             """
-            INSERT INTO memories (type, content, embedding, metadata, importance)
-            VALUES ('worldview', $1, (get_embedding(ARRAY[$1]))[1], $2::jsonb, 0.9)
-            RETURNING id
+            SELECT create_tool_boundary(
+                $1,
+                $2::text[],
+                $3::text[],
+                0.9
+            )
             """,
             content,
-            json.dumps(metadata),
+            restricts_tools,
+            restricts_categories,
         )
         return str(memory_id)

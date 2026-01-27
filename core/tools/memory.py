@@ -689,6 +689,174 @@ class ScheduleTaskHandler(ToolHandler):
             return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
 
 
+class ListScheduledTasksHandler(ToolHandler):
+    """List scheduled tasks."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="list_scheduled_tasks",
+            description="List scheduled tasks with optional filters.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Optional status filter"},
+                    "due_before": {"type": "string", "description": "Optional ISO8601 cutoff"},
+                    "limit": {"type": "integer", "default": 50},
+                },
+                "required": [],
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=0,
+            is_read_only=True,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        status = arguments.get("status")
+        due_before = arguments.get("due_before")
+        limit = int(arguments.get("limit", 50))
+
+        try:
+            async with context.registry.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM list_scheduled_tasks($1, $2::timestamptz, $3)",
+                    status,
+                    due_before,
+                    limit,
+                )
+            tasks = [dict(row) for row in rows]
+            return ToolResult.success_result(
+                output={"tasks": tasks, "count": len(tasks)},
+                display_output=f"Found {len(tasks)} scheduled task(s)",
+            )
+        except Exception as e:
+            return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
+
+
+class UpdateScheduledTaskHandler(ToolHandler):
+    """Update a scheduled task."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="update_scheduled_task",
+            description="Update a scheduled task (schedule/action/status).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "schedule_kind": {"type": "string"},
+                    "schedule": {"type": "object"},
+                    "timezone": {"type": "string"},
+                    "action_kind": {"type": "string"},
+                    "action_payload": {"type": "object"},
+                    "status": {"type": "string"},
+                    "max_runs": {"type": "integer"},
+                },
+                "required": ["task_id"],
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=1,
+            is_read_only=False,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        import json
+
+        task_id = arguments["task_id"]
+        try:
+            async with context.registry.pool.acquire() as conn:
+                updated = await conn.fetchval(
+                    """
+                    SELECT update_scheduled_task(
+                        $1::uuid,
+                        $2,
+                        $3,
+                        $4,
+                        $5::jsonb,
+                        $6,
+                        $7,
+                        $8::jsonb,
+                        $9,
+                        $10
+                    )
+                    """,
+                    task_id,
+                    arguments.get("name"),
+                    arguments.get("description"),
+                    arguments.get("schedule_kind"),
+                    json.dumps(arguments.get("schedule")) if arguments.get("schedule") is not None else None,
+                    arguments.get("timezone"),
+                    arguments.get("action_kind"),
+                    json.dumps(arguments.get("action_payload")) if arguments.get("action_payload") is not None else None,
+                    arguments.get("status"),
+                    arguments.get("max_runs"),
+                )
+
+            return ToolResult.success_result(
+                output={"task": updated},
+                display_output=f"Updated task {task_id}",
+            )
+        except Exception as e:
+            return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
+
+
+class DeleteScheduledTaskHandler(ToolHandler):
+    """Disable or delete a scheduled task."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="delete_scheduled_task",
+            description="Disable or delete a scheduled task.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "hard_delete": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["task_id"],
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=1,
+            is_read_only=False,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        task_id = arguments["task_id"]
+        hard_delete = bool(arguments.get("hard_delete", False))
+        reason = arguments.get("reason")
+        try:
+            async with context.registry.pool.acquire() as conn:
+                ok = await conn.fetchval(
+                    "SELECT delete_scheduled_task($1::uuid, $2::boolean, $3)",
+                    task_id,
+                    hard_delete,
+                    reason,
+                )
+            return ToolResult.success_result(
+                output={"deleted": bool(ok), "task_id": task_id},
+                display_output=f"Deleted task {task_id}" if hard_delete else f"Disabled task {task_id}",
+            )
+        except Exception as e:
+            return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
+
+
 class QueueUserMessageHandler(ToolHandler):
     """Queue a message for the user."""
 
@@ -757,5 +925,8 @@ def create_memory_tools() -> list[ToolHandler]:
         GetStrategiesHandler(),
         CreateGoalHandler(),
         ScheduleTaskHandler(),
+        ListScheduledTasksHandler(),
+        UpdateScheduledTaskHandler(),
+        DeleteScheduledTaskHandler(),
         QueueUserMessageHandler(),
     ]

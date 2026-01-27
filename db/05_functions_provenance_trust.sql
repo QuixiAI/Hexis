@@ -920,7 +920,8 @@ CREATE OR REPLACE FUNCTION create_worldview_memory(
     p_trigger_patterns JSONB DEFAULT NULL,
     p_response_type TEXT DEFAULT NULL,
     p_response_template TEXT DEFAULT NULL,
-    p_emotional_valence FLOAT DEFAULT 0.0
+    p_emotional_valence FLOAT DEFAULT 0.0,
+    p_extra_metadata JSONB DEFAULT NULL
 ) RETURNS UUID AS $$
 DECLARE
     new_memory_id UUID;
@@ -941,6 +942,9 @@ BEGIN
         'response_type', p_response_type,
         'response_template', p_response_template
     );
+    IF p_extra_metadata IS NOT NULL THEN
+        meta := meta || p_extra_metadata;
+    END IF;
 
     new_memory_id := create_memory('worldview', p_content, p_importance, normalized_source, effective_trust, meta);
     BEGIN

@@ -257,6 +257,166 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION list_scheduled_tasks(
+    p_status TEXT DEFAULT NULL,
+    p_due_before TIMESTAMPTZ DEFAULT NULL,
+    p_limit INT DEFAULT 50
+)
+RETURNS TABLE (
+    id UUID,
+    name TEXT,
+    description TEXT,
+    schedule_kind TEXT,
+    schedule JSONB,
+    timezone TEXT,
+    action_kind TEXT,
+    action_payload JSONB,
+    status TEXT,
+    next_run_at TIMESTAMPTZ,
+    last_run_at TIMESTAMPTZ,
+    run_count INT,
+    max_runs INT,
+    created_by TEXT,
+    last_error TEXT,
+    created_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        t.id,
+        t.name,
+        t.description,
+        t.schedule_kind,
+        t.schedule,
+        t.timezone,
+        t.action_kind,
+        t.action_payload,
+        t.status,
+        t.next_run_at,
+        t.last_run_at,
+        t.run_count,
+        t.max_runs,
+        t.created_by,
+        t.last_error,
+        t.created_at,
+        t.updated_at
+    FROM scheduled_tasks t
+    WHERE (p_status IS NULL OR t.status = p_status)
+      AND (p_due_before IS NULL OR t.next_run_at <= p_due_before)
+    ORDER BY t.next_run_at ASC
+    LIMIT GREATEST(1, LEAST(p_limit, 200));
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_scheduled_task(
+    p_task_id UUID,
+    p_name TEXT DEFAULT NULL,
+    p_description TEXT DEFAULT NULL,
+    p_schedule_kind TEXT DEFAULT NULL,
+    p_schedule JSONB DEFAULT NULL,
+    p_timezone TEXT DEFAULT NULL,
+    p_action_kind TEXT DEFAULT NULL,
+    p_action_payload JSONB DEFAULT NULL,
+    p_status TEXT DEFAULT NULL,
+    p_max_runs INT DEFAULT NULL
+)
+RETURNS JSONB AS $$
+DECLARE
+    current_task scheduled_tasks%ROWTYPE;
+    updated_row JSONB;
+    new_schedule_kind TEXT;
+    new_schedule JSONB;
+    new_timezone TEXT;
+    new_action_kind TEXT;
+    new_action_payload JSONB;
+    new_status TEXT;
+    new_next_run TIMESTAMPTZ;
+BEGIN
+    SELECT * INTO current_task
+    FROM scheduled_tasks
+    WHERE id = p_task_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Scheduled task not found: %', p_task_id;
+    END IF;
+
+    new_schedule_kind := COALESCE(NULLIF(p_schedule_kind, ''), current_task.schedule_kind);
+    new_schedule := COALESCE(p_schedule, current_task.schedule);
+    new_timezone := normalize_timezone(COALESCE(NULLIF(p_timezone, ''), current_task.timezone));
+    new_action_kind := COALESCE(NULLIF(p_action_kind, ''), current_task.action_kind);
+    new_action_payload := COALESCE(p_action_payload, current_task.action_payload);
+    new_status := COALESCE(NULLIF(p_status, ''), current_task.status);
+
+    IF new_status NOT IN ('active', 'paused', 'disabled') THEN
+        RAISE EXCEPTION 'Invalid status: %', new_status;
+    END IF;
+    IF new_action_kind NOT IN ('queue_user_message', 'create_goal') THEN
+        RAISE EXCEPTION 'Invalid action_kind: %', new_action_kind;
+    END IF;
+    IF new_action_kind = 'queue_user_message' THEN
+        IF new_action_payload IS NULL OR NULLIF(new_action_payload->>'message', '') IS NULL THEN
+            RAISE EXCEPTION 'queue_user_message requires action_payload.message';
+        END IF;
+    ELSIF new_action_kind = 'create_goal' THEN
+        IF new_action_payload IS NULL OR NULLIF(new_action_payload->>'title', '') IS NULL THEN
+            RAISE EXCEPTION 'create_goal requires action_payload.title';
+        END IF;
+    END IF;
+
+    IF new_schedule_kind IS DISTINCT FROM current_task.schedule_kind
+        OR new_schedule IS DISTINCT FROM current_task.schedule
+        OR new_timezone IS DISTINCT FROM current_task.timezone THEN
+        new_next_run := compute_next_run_at(new_schedule_kind, new_schedule, new_timezone, CURRENT_TIMESTAMP);
+        IF new_next_run IS NULL THEN
+            RAISE EXCEPTION 'Schedule does not produce a future run';
+        END IF;
+    ELSE
+        new_next_run := current_task.next_run_at;
+    END IF;
+
+    UPDATE scheduled_tasks
+    SET name = COALESCE(NULLIF(p_name, ''), current_task.name),
+        description = COALESCE(p_description, current_task.description),
+        schedule_kind = new_schedule_kind,
+        schedule = new_schedule,
+        timezone = new_timezone,
+        action_kind = new_action_kind,
+        action_payload = new_action_payload,
+        status = new_status,
+        next_run_at = new_next_run,
+        max_runs = COALESCE(p_max_runs, current_task.max_runs),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_task_id
+    RETURNING to_jsonb(scheduled_tasks.*) INTO updated_row;
+
+    RETURN updated_row;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION delete_scheduled_task(
+    p_task_id UUID,
+    p_hard_delete BOOLEAN DEFAULT FALSE,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+    IF COALESCE(p_hard_delete, FALSE) THEN
+        DELETE FROM scheduled_tasks WHERE id = p_task_id;
+        RETURN FOUND;
+    END IF;
+
+    UPDATE scheduled_tasks
+    SET status = 'disabled',
+        last_error = COALESCE(NULLIF(p_reason, ''), last_error),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_task_id;
+
+    RETURN FOUND;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION run_scheduled_tasks(p_limit INT DEFAULT 25)
 RETURNS JSONB AS $$
 DECLARE

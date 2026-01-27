@@ -68,6 +68,37 @@ BEGIN
     ORDER BY am.boundary_id, am.importance DESC, am.similarity DESC;
 END;
 $$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION create_tool_boundary(
+    p_content TEXT,
+    p_restricts_tools TEXT[] DEFAULT NULL,
+    p_restricts_categories TEXT[] DEFAULT NULL,
+    p_importance FLOAT DEFAULT 0.9
+)
+RETURNS UUID AS $$
+DECLARE
+    extra JSONB;
+    mem_id UUID;
+BEGIN
+    extra := jsonb_build_object(
+        'restricts_tools', COALESCE(to_jsonb(p_restricts_tools), '[]'::jsonb),
+        'restricts_categories', COALESCE(to_jsonb(p_restricts_categories), '[]'::jsonb)
+    );
+    mem_id := create_worldview_memory(
+        p_content,
+        'boundary',
+        0.95,
+        0.9,
+        p_importance,
+        'policy',
+        NULL,
+        NULL,
+        NULL,
+        0.0,
+        extra
+    );
+    RETURN mem_id;
+END;
+$$ LANGUAGE plpgsql;
 DO $$
 BEGIN
     PERFORM prefetch_embeddings(ARRAY[

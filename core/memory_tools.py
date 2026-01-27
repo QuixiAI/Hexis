@@ -348,6 +348,102 @@ MEMORY_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_scheduled_tasks",
+            "description": "List scheduled tasks with optional filters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": ["string", "null"],
+                        "enum": ["active", "paused", "disabled"],
+                        "description": "Filter by status",
+                    },
+                    "due_before": {
+                        "type": ["string", "null"],
+                        "description": "Return tasks due before this ISO8601 timestamp",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max tasks to return",
+                        "default": 50,
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_scheduled_task",
+            "description": "Update a scheduled task (schedule/action/status).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Scheduled task UUID"},
+                    "name": {"type": ["string", "null"], "description": "Optional name"},
+                    "description": {"type": ["string", "null"], "description": "Optional description"},
+                    "schedule_kind": {
+                        "type": ["string", "null"],
+                        "enum": ["once", "interval", "daily", "weekly"],
+                        "description": "Optional schedule type",
+                    },
+                    "schedule": {"type": ["object", "null"], "description": "Optional schedule payload"},
+                    "timezone": {
+                        "type": ["string", "null"],
+                        "description": "Optional IANA timezone",
+                    },
+                    "action_kind": {
+                        "type": ["string", "null"],
+                        "enum": ["queue_user_message", "create_goal"],
+                        "description": "Optional action",
+                    },
+                    "action_payload": {
+                        "type": ["object", "null"],
+                        "description": "Optional action payload",
+                    },
+                    "status": {
+                        "type": ["string", "null"],
+                        "enum": ["active", "paused", "disabled"],
+                        "description": "Optional status",
+                    },
+                    "max_runs": {
+                        "type": ["integer", "null"],
+                        "description": "Optional max runs",
+                    },
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_scheduled_task",
+            "description": "Disable or delete a scheduled task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Scheduled task UUID"},
+                    "hard_delete": {
+                        "type": ["boolean", "null"],
+                        "description": "If true, delete row; otherwise disable",
+                    },
+                    "reason": {
+                        "type": ["string", "null"],
+                        "description": "Reason for disabling",
+                    },
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "queue_user_message",
             "description": "Return a message payload for external delivery to the user.",
             "parameters": {
@@ -374,6 +470,9 @@ _API_TOOL_NAMES = {
     "get_strategies",
     "create_goal",
     "schedule_task",
+    "list_scheduled_tasks",
+    "update_scheduled_task",
+    "delete_scheduled_task",
     "queue_user_message",
 }
 

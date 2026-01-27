@@ -38,6 +38,9 @@ async def execute_tool(
         "list_recent_episodes": _handle_list_recent_episodes,
         "create_goal": _handle_create_goal,
         "schedule_task": _handle_schedule_task,
+        "list_scheduled_tasks": _handle_list_scheduled_tasks,
+        "update_scheduled_task": _handle_update_scheduled_task,
+        "delete_scheduled_task": _handle_delete_scheduled_task,
         "queue_user_message": _handle_queue_user_message,
     }
     handler = handlers.get(tool_name)
@@ -288,6 +291,43 @@ async def _handle_schedule_task(args: dict[str, Any], mem_client: CognitiveMemor
         max_runs=max_runs,
     )
     return {"task_id": str(task_id), "name": name, "schedule_kind": schedule_kind, "action_kind": action_kind}
+
+
+async def _handle_list_scheduled_tasks(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:
+    status = args.get("status")
+    due_before = args.get("due_before")
+    limit = args.get("limit", 50)
+    tasks = await mem_client.list_scheduled_tasks(status=status, due_before=due_before, limit=int(limit))
+    return {"tasks": tasks, "count": len(tasks)}
+
+
+async def _handle_update_scheduled_task(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:
+    task_id = str(args.get("task_id", "")).strip()
+    if not task_id:
+        return {"error": "Missing task_id"}
+    updated = await mem_client.update_scheduled_task(
+        task_id,
+        name=args.get("name"),
+        description=args.get("description"),
+        schedule_kind=args.get("schedule_kind"),
+        schedule=args.get("schedule"),
+        timezone=args.get("timezone"),
+        action_kind=args.get("action_kind"),
+        action_payload=args.get("action_payload"),
+        status=args.get("status"),
+        max_runs=args.get("max_runs"),
+    )
+    return {"task": updated}
+
+
+async def _handle_delete_scheduled_task(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:
+    task_id = str(args.get("task_id", "")).strip()
+    if not task_id:
+        return {"error": "Missing task_id"}
+    hard_delete = bool(args.get("hard_delete", False))
+    reason = args.get("reason")
+    ok = await mem_client.delete_scheduled_task(task_id, hard_delete=hard_delete, reason=reason)
+    return {"deleted": bool(ok), "task_id": task_id}
 
 
 async def _handle_queue_user_message(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:

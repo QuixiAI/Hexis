@@ -752,6 +752,82 @@ class CognitiveMemory:
                 created_by,
             )
 
+    async def list_scheduled_tasks(
+        self,
+        *,
+        status: str | None = None,
+        due_before: datetime | str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM list_scheduled_tasks($1, $2::timestamptz, $3)",
+                status,
+                due_before,
+                int(limit),
+            )
+            return [dict(row) for row in rows]
+
+    async def update_scheduled_task(
+        self,
+        task_id: UUID,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        schedule_kind: str | None = None,
+        schedule: dict[str, Any] | None = None,
+        timezone: str | None = None,
+        action_kind: str | None = None,
+        action_payload: dict[str, Any] | None = None,
+        status: str | None = None,
+        max_runs: int | None = None,
+    ) -> dict[str, Any]:
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval(
+                """
+                SELECT update_scheduled_task(
+                    $1::uuid,
+                    $2,
+                    $3,
+                    $4,
+                    $5::jsonb,
+                    $6,
+                    $7,
+                    $8::jsonb,
+                    $9,
+                    $10
+                )
+                """,
+                task_id,
+                name,
+                description,
+                schedule_kind,
+                _to_jsonb_arg(schedule),
+                timezone,
+                action_kind,
+                _to_jsonb_arg(action_payload),
+                status,
+                max_runs,
+            )
+            return _coerce_json(raw) if raw is not None else {}
+
+    async def delete_scheduled_task(
+        self,
+        task_id: UUID,
+        *,
+        hard_delete: bool = False,
+        reason: str | None = None,
+    ) -> bool:
+        async with self._pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    "SELECT delete_scheduled_task($1::uuid, $2::boolean, $3)",
+                    task_id,
+                    hard_delete,
+                    reason,
+                )
+            )
+
     async def queue_user_message(
         self,
         message: str,
@@ -1059,7 +1135,7 @@ class CognitiveMemorySync:
         max_runs: int | None = None,
         created_by: str | None = None,
     ) -> UUID:
-        return self._run(
+        return self._loop.run_until_complete(
             self._async.create_scheduled_task(
                 name,
                 schedule_kind=schedule_kind,
@@ -1071,6 +1147,61 @@ class CognitiveMemorySync:
                 status=status,
                 max_runs=max_runs,
                 created_by=created_by,
+            )
+        )
+
+    def list_scheduled_tasks(
+        self,
+        *,
+        status: str | None = None,
+        due_before: datetime | str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        return self._loop.run_until_complete(
+            self._async.list_scheduled_tasks(status=status, due_before=due_before, limit=limit)
+        )
+
+    def update_scheduled_task(
+        self,
+        task_id: UUID,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        schedule_kind: str | None = None,
+        schedule: dict[str, Any] | None = None,
+        timezone: str | None = None,
+        action_kind: str | None = None,
+        action_payload: dict[str, Any] | None = None,
+        status: str | None = None,
+        max_runs: int | None = None,
+    ) -> dict[str, Any]:
+        return self._loop.run_until_complete(
+            self._async.update_scheduled_task(
+                task_id,
+                name=name,
+                description=description,
+                schedule_kind=schedule_kind,
+                schedule=schedule,
+                timezone=timezone,
+                action_kind=action_kind,
+                action_payload=action_payload,
+                status=status,
+                max_runs=max_runs,
+            )
+        )
+
+    def delete_scheduled_task(
+        self,
+        task_id: UUID,
+        *,
+        hard_delete: bool = False,
+        reason: str | None = None,
+    ) -> bool:
+        return self._loop.run_until_complete(
+            self._async.delete_scheduled_task(
+                task_id,
+                hard_delete=hard_delete,
+                reason=reason,
             )
         )
 

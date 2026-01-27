@@ -10014,3 +10014,259 @@ async def test_set_scheduled_task_status(db_pool):
             task_id,
         )
         assert status == "paused"
+
+
+async def test_list_scheduled_tasks_filters_status(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        _ = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'daily',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Active task",
+            json.dumps({"time": "10:00"}),
+            json.dumps({"message": "Active reminder"}),
+        )
+        paused_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'daily',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Paused task",
+            json.dumps({"time": "11:00"}),
+            json.dumps({"message": "Paused reminder"}),
+        )
+        await conn.fetchval("SELECT set_scheduled_task_status($1, 'paused')", paused_id)
+
+        rows = await conn.fetch("SELECT * FROM list_scheduled_tasks('active', NULL, 50)")
+        assert len(rows) == 1
+        assert rows[0]["name"] == "Active task"
+
+
+async def test_update_scheduled_task_changes_payload(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'interval',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Update me",
+            json.dumps({"every_minutes": 15}),
+            json.dumps({"message": "Old message"}),
+        )
+
+        updated = _coerce_json(
+            await conn.fetchval(
+                """
+                SELECT update_scheduled_task(
+                    $1::uuid,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    $2::jsonb,
+                    NULL,
+                    NULL
+                )
+                """,
+                task_id,
+                json.dumps({"message": "New message"}),
+            )
+        )
+        assert updated.get("action_payload", {}).get("message") == "New message"
+
+
+async def test_delete_scheduled_task_soft_and_hard(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'daily',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Delete me",
+            json.dumps({"time": "10:00"}),
+            json.dumps({"message": "Delete reminder"}),
+        )
+        ok = await conn.fetchval("SELECT delete_scheduled_task($1, false, 'cleanup')", task_id)
+        assert ok is True
+        status = await conn.fetchval("SELECT status FROM scheduled_tasks WHERE id = $1", task_id)
+        assert status == "disabled"
+
+        hard_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'daily',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Hard delete",
+            json.dumps({"time": "12:00"}),
+            json.dumps({"message": "Hard delete reminder"}),
+        )
+        ok = await conn.fetchval("SELECT delete_scheduled_task($1, true, NULL)", hard_id)
+        assert ok is True
+        missing = await conn.fetchval("SELECT 1 FROM scheduled_tasks WHERE id = $1", hard_id)
+        assert missing is None
+
+
+async def test_list_scheduled_tasks_due_before(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        soon_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'interval',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Due soon",
+            json.dumps({"every_minutes": 10}),
+            json.dumps({"message": "Soon"}),
+        )
+        later_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'interval',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Due later",
+            json.dumps({"every_minutes": 120}),
+            json.dumps({"message": "Later"}),
+        )
+        await conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = NOW() + INTERVAL '5 minutes' WHERE id = $1",
+            soon_id,
+        )
+        await conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = NOW() + INTERVAL '2 hours' WHERE id = $1",
+            later_id,
+        )
+        rows = await conn.fetch(
+            "SELECT * FROM list_scheduled_tasks(NULL, NOW() + INTERVAL '30 minutes', 50)"
+        )
+        names = {row["name"] for row in rows}
+        assert "Due soon" in names
+        assert "Due later" not in names
+
+
+async def test_update_scheduled_task_recomputes_next_run(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'weekly',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Update schedule",
+            json.dumps({"weekday": "tuesday", "time": "10:00"}),
+            json.dumps({"message": "Weekly"}),
+        )
+        updated = _coerce_json(
+            await conn.fetchval(
+                """
+                SELECT update_scheduled_task(
+                    $1::uuid,
+                    NULL,
+                    NULL,
+                    'daily',
+                    $2::jsonb,
+                    'UTC',
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL
+                )
+                """,
+                task_id,
+                json.dumps({"time": "09:00"}),
+            )
+        )
+        assert updated.get("schedule_kind") == "daily"
+        assert updated.get("next_run_at") is not None
+
+
+async def test_update_scheduled_task_invalid_action_payload(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM scheduled_tasks")
+        task_id = await conn.fetchval(
+            """
+            SELECT create_scheduled_task(
+                $1,
+                'daily',
+                $2::jsonb,
+                'queue_user_message',
+                $3::jsonb,
+                'UTC'
+            )
+            """,
+            "Bad update",
+            json.dumps({"time": "10:00"}),
+            json.dumps({"message": "Ok"}),
+        )
+        with pytest.raises(Exception):
+            await conn.fetchval(
+                """
+                SELECT update_scheduled_task(
+                    $1::uuid,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    'queue_user_message',
+                    $2::jsonb,
+                    NULL,
+                    NULL
+                )
+                """,
+                task_id,
+                json.dumps({}),
+            )
