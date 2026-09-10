@@ -49,6 +49,7 @@ def _plain(text: str, token: str = "text") -> Text:
 
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
+    "atlascloud": "deepseek-ai/deepseek-v4-pro",
     "openai": "gpt-4o",
     "openai-codex": "gpt-5.2",
     "grok": "grok-3",
@@ -63,6 +64,7 @@ _DEFAULT_MODELS: dict[str, str] = {
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
+    "atlascloud": "ATLASCLOUD_API_KEY",
     "openai": "OPENAI_API_KEY",
     "openai-codex": "",
     "grok": "XAI_API_KEY",
@@ -79,6 +81,7 @@ _PROVIDER_OPTIONS: list[tuple[str, str]] = [
     ("OpenAI Codex (ChatGPT OAuth)", "openai-codex"),
     ("OpenAI Platform (API key)", "openai"),
     ("Anthropic (API key)", "anthropic"),
+    ("Atlas Cloud (API key)", "atlascloud"),
     ("Grok (xAI)", "grok"),
     ("Gemini", "gemini"),
     ("Chutes (OAuth)", "chutes"),
@@ -173,6 +176,8 @@ class LLMConfigScreen(Screen):
 
     @staticmethod
     def _default_endpoint(provider: str) -> str:
+        if provider == "atlascloud":
+            return "https://api.atlascloud.ai/v1"
         if provider == "openai":
             return os.getenv("OPENAI_BASE_URL", "")
         return ""

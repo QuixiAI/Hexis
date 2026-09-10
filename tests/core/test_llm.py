@@ -56,6 +56,10 @@ def test_normalize_endpoint_defaults():
 
 
 def test_normalize_endpoint_new_providers():
+    assert (
+        llm.normalize_endpoint("atlascloud", None)
+        == "https://api.atlascloud.ai/v1"
+    )
     assert llm.normalize_endpoint("chutes", None) == "https://api.chutes.ai/v1"
     assert llm.normalize_endpoint("qwen-portal", None) == "https://portal.qwen.ai/v1"
     assert llm.normalize_endpoint("google-gemini-cli", None) == "https://cloudcode-pa.googleapis.com"
@@ -65,6 +69,25 @@ def test_normalize_endpoint_new_providers():
         llm.normalize_endpoint("openai-codex", "https://api.openai.com/v1")
         == "https://chatgpt.com/backend-api"
     )
+
+
+def test_atlascloud_uses_chat_completions_only():
+    assert "atlascloud" in llm.OPENAI_COMPATIBLE
+    assert not llm._should_try_responses(
+        "https://api.atlascloud.ai/v1", provider="atlascloud"
+    )
+
+
+def test_atlascloud_resolves_conventional_api_key(monkeypatch):
+    monkeypatch.setenv("ATLASCLOUD_API_KEY", "atlas-test-key")
+    normalized = llm.normalize_llm_config(
+        {
+            "provider": "atlascloud",
+            "model": "deepseek-ai/deepseek-v4-pro",
+        }
+    )
+    assert normalized["api_key"] == "atlas-test-key"
+    assert normalized["endpoint"] == "https://api.atlascloud.ai/v1"
 
 
 def test_normalize_llm_config_preserves_auth_mode():

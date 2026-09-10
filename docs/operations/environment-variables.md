@@ -47,6 +47,7 @@ All environment variables used by Hexis, configured via `.env`.
 | `ANTHROPIC_API_KEY` | Anthropic API key |
 | `GEMINI_API_KEY` | Google Gemini API key |
 | `XAI_API_KEY` | xAI Grok API key |
+| `ATLASCLOUD_API_KEY` | Atlas Cloud API key |
 
 These are only needed for API-key providers. OAuth providers store credentials in the database.
 

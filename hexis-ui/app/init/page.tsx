@@ -53,6 +53,7 @@ const stagePrompt: Record<InitStage, string> = {
 type LlmProvider =
   | "openai-codex"
   | "openai"
+  | "atlascloud"
   | "anthropic"
   | "grok"
   | "gemini"
@@ -195,6 +196,13 @@ const providerMeta: Record<LlmProvider, ProviderMeta> = {
     label: "OpenAI",
     endpoint: "https://api.openai.com/v1",
     apiKeyLabel: "OpenAI API Key",
+    apiKeyRequired: true,
+    oauth: false,
+  },
+  atlascloud: {
+    label: "Atlas Cloud",
+    endpoint: "https://api.atlascloud.ai/v1",
+    apiKeyLabel: "Atlas Cloud API Key",
     apiKeyRequired: true,
     oauth: false,
   },

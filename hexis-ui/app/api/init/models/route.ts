@@ -2,8 +2,8 @@
 //
 // Mirrors apps/tui/model_catalog.py: prefer a live, auto-updating source over a
 // hand-maintained list, treat it as advisory, and always allow a free-typed id.
-//   * cloud providers -> the models.dev catalog (one no-auth JSON), cached ~24h
-//     in-memory and sorted newest-first
+//   * most cloud providers -> the models.dev catalog, cached ~24h in-memory
+//   * Atlas Cloud -> its public model catalog, filtered to visible LLMs
 //   * on any failure -> a short curated fallback; the model field stays free-text
 
 import { catalogDeclaredDefault } from "@/lib/init-llm";
@@ -12,6 +12,7 @@ import { hexisApiBaseUrl } from "@/lib/python-api";
 export const runtime = "nodejs";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
+const ATLAS_MODELS_URL = "https://api.atlascloud.ai/api/v1/models";
 const CACHE_TTL_MS = 24 * 3600 * 1000;
 const TIMEOUT_MS = 12000;
 
@@ -61,6 +62,7 @@ const DEFAULT_SKIP = [
 
 // Minimal offline fallback if models.dev is unreachable.
 const FALLBACK: Record<string, string[]> = {
+  atlascloud: ["deepseek-ai/deepseek-v4-pro"],
   openai: ["gpt-5.2", "gpt-4o", "gpt-4o-mini"],
   anthropic: ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"],
   grok: ["grok-4.3", "grok-3"],
@@ -169,6 +171,21 @@ function chatModels(value: unknown): string[] {
   return ids;
 }
 
+export function atlasChatModels(value: unknown): string[] {
+  const rows = asRecord(value).data;
+  if (!Array.isArray(rows)) return [];
+  return rows.flatMap((value) => {
+    const row = asRecord(value);
+    const categories = Array.isArray(row.categories) ? row.categories : [];
+    return row.display_console === true &&
+      row.type === "Text" &&
+      categories.includes("LLM") &&
+      typeof row.model === "string"
+      ? [row.model]
+      : [];
+  });
+}
+
 // Pick a sensible default from the live catalog (newest-first list).
 function recommendedDefault(_provider: string, models: string[]): string {
   if (models.length === 0) return "";
@@ -211,6 +228,26 @@ export async function GET(request: Request) {
         },
         { status: 503 }
       );
+    }
+  }
+
+  if (provider === "atlascloud") {
+    try {
+      const response = await fetchWithTimeout(ATLAS_MODELS_URL);
+      if (!response.ok) throw new Error(`Atlas Cloud responded ${response.status}`);
+      const models = atlasChatModels(await response.json());
+      const available = models.length > 0 ? models : FALLBACK[provider];
+      return Response.json({
+        models: available,
+        default: recommendedDefault(provider, available),
+      });
+    } catch (err: unknown) {
+      const models = FALLBACK[provider];
+      return Response.json({
+        models,
+        default: recommendedDefault(provider, models),
+        error: errorMessage(err, "Unable to load Atlas Cloud model catalog."),
+      });
     }
   }
 

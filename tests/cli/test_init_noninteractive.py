@@ -135,7 +135,7 @@ def test_default_models_derive_from_live_catalog():
 
     # Catalog-backed providers map to models.dev. A custom endpoint cannot:
     # its model list is defined by that server, so callers pass --model.
-    for provider in set(_PROVIDER_ENV_VARS) - {"openai_compatible"}:
+    for provider in set(_PROVIDER_ENV_VARS) - {"atlascloud", "openai_compatible"}:
         assert provider in model_catalog.PROVIDER_SLUG, f"No catalog slug for {provider}"
     # The flagship heuristic picks a sensible non-variant default.
     assert model_catalog.recommended_default(
@@ -229,6 +229,21 @@ def test_standard_openai_does_not_inherit_custom_endpoint(monkeypatch):
 
     assert endpoint == ""
     assert source == ""
+
+
+def test_atlascloud_uses_provider_endpoint_and_key_env(monkeypatch):
+    monkeypatch.setenv("ATLASCLOUD_API_KEY", "atlas-test-key")
+    args = build_parser().parse_args([
+        "--provider", "atlascloud",
+        "--model", "deepseek-ai/deepseek-v4-pro",
+        "--api-key-env", "ATLASCLOUD_API_KEY",
+    ])
+
+    endpoint, source = _resolve_noninteractive_endpoint(args, "atlascloud")
+
+    assert endpoint == "https://api.atlascloud.ai/v1"
+    assert source == "provider default"
+    assert _resolve_noninteractive_api_key_env(args, "atlascloud") == "ATLASCLOUD_API_KEY"
 
 
 # ---------------------------------------------------------------------------

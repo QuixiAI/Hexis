@@ -41,6 +41,7 @@ from apps.cli_theme import console, err_console, heading, make_panel, make_table
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
+    "atlascloud": "ATLASCLOUD_API_KEY",
     "openai": "OPENAI_API_KEY",
     "openai_compatible": "OPENAI_API_KEY",
     "openai-codex": "",
@@ -133,6 +134,9 @@ def _resolve_noninteractive_endpoint(
     """Return the endpoint and its visible source label."""
     endpoint = (args.endpoint or "").strip()
     source = "--endpoint" if endpoint else ""
+    if not endpoint and provider == "atlascloud":
+        endpoint = "https://api.atlascloud.ai/v1"
+        source = "provider default"
     if not endpoint and provider == "openai_compatible":
         endpoint = os.getenv("OPENAI_BASE_URL", "").strip()
         source = "OPENAI_BASE_URL" if endpoint else ""
@@ -793,6 +797,7 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         ("OpenAI Codex — ChatGPT Plus/Pro OAuth (no API key)", "openai-codex"),
         ("OpenAI — API key", "openai"),
         ("Anthropic — API key", "anthropic"),
+        ("Atlas Cloud — API key", "atlascloud"),
         ("Grok (xAI) — API key", "grok"),
         ("Gemini — API key", "gemini"),
         ("Chutes — OAuth", "chutes"),
@@ -880,7 +885,13 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
             "Endpoint (blank for provider default)",
             # Only OpenAI-shaped providers should inherit OPENAI_BASE_URL — don't
             # bleed it into Grok/Gemini/Anthropic (Bar #5).
-            default=os.getenv("OPENAI_BASE_URL", "") if provider in {"openai", "openai_compatible"} else "",
+            default=(
+                "https://api.atlascloud.ai/v1"
+                if provider == "atlascloud"
+                else os.getenv("OPENAI_BASE_URL", "")
+                if provider in {"openai", "openai_compatible"}
+                else ""
+            ),
         )
         api_key_env = _prompt(
             "API key env var name (e.g. OPENAI_API_KEY)",

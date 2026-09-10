@@ -4,8 +4,8 @@ Mirrors how hermes-agent / openclaw populate their model pickers: prefer a live,
 auto-updating source over a hand-maintained list, treat it as advisory, and
 always allow a free-typed id.
 
-  * cloud providers → the models.dev catalog (one no-auth JSON covering every
-    provider), cached on disk ~24h and sorted newest-first
+  * most cloud providers → the models.dev catalog, cached on disk ~24h
+  * Atlas Cloud → its public model catalog, filtered to visible LLMs
   * on any failure → a short curated fallback; the model field stays free-text
 """
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pathlib import Path
 from core.integration_reliability import request_json
 
 MODELS_DEV_URL = "https://models.dev/api.json"
+ATLAS_MODELS_URL = "https://api.atlascloud.ai/api/v1/models"
 _CACHE = Path.home() / ".cache" / "hexis" / "models_dev.json"
 _CACHE_TTL = 24 * 3600
 _TIMEOUT = 12.0
@@ -46,6 +47,7 @@ _NON_CHAT_RE = re.compile(
 
 # Minimal offline fallback if models.dev is unreachable.
 _FALLBACK: dict[str, list[str]] = {
+    "atlascloud": ["deepseek-ai/deepseek-v4-pro"],
     "openai": ["gpt-5.2", "gpt-4o", "gpt-4o-mini"],
     "openai-codex": ["gpt-5.2", "gpt-5.2-codex"],
     "anthropic": ["claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"],
@@ -192,6 +194,29 @@ async def fetch_models(
     api_key: str | None = None,
 ) -> list[str]:
     """Best-effort current chat model ids for *provider* (newest first)."""
+    if provider == "atlascloud":
+        try:
+            data = await request_json(
+                "atlascloud_models",
+                "GET",
+                ATLAS_MODELS_URL,
+                timeout=_TIMEOUT,
+                attempts=2,
+                max_delay=2.0,
+            )
+            rows = data.get("data", []) if isinstance(data, dict) else []
+            models = [
+                str(row["model"])
+                for row in rows
+                if isinstance(row, dict)
+                and row.get("display_console") is True
+                and row.get("type") == "Text"
+                and "LLM" in (row.get("categories") or [])
+                and row.get("model")
+            ]
+            return models or _FALLBACK[provider]
+        except Exception:
+            return _FALLBACK[provider]
     if provider == "openai_compatible":
         if not endpoint:
             return []

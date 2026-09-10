@@ -33,6 +33,7 @@ except Exception:  # pragma: no cover
 
 OPENAI_COMPATIBLE = {
     "openai",
+    "atlascloud",
     "openai_compatible",
     "openai-chat-completions-endpoint",
     "grok",
@@ -477,7 +478,11 @@ def _should_try_responses(
     # A generic compatible endpoint promises Chat Completions, not the
     # Responses event grammar. Some servers expose /responses nominally but
     # emit tool/reasoning items the official SDK cannot parse safely.
-    if provider in {"openai_compatible", "openai-chat-completions-endpoint"}:
+    if provider in {
+        "atlascloud",
+        "openai_compatible",
+        "openai-chat-completions-endpoint",
+    }:
         return False
     if not _HAS_RESPONSES_API:
         return False
@@ -678,6 +683,7 @@ def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:
     if endpoint:
         return endpoint.strip() or None
     _DEFAULTS: dict[str, str] = {
+        "atlascloud": "https://api.atlascloud.ai/v1",
         "grok": "https://api.x.ai/v1",
         "chutes": "https://api.chutes.ai/v1",
         "qwen-portal": "https://portal.qwen.ai/v1",
@@ -718,6 +724,7 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
     if not api_key:
         provider_env_map = {
             "openai": "OPENAI_API_KEY",
+            "atlascloud": "ATLASCLOUD_API_KEY",
             "anthropic": "ANTHROPIC_API_KEY",
             "grok": "XAI_API_KEY",
             "gemini": "GEMINI_API_KEY",

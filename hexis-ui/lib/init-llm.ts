@@ -1,4 +1,5 @@
 const ENDPOINT_DEFAULTS: Record<string, string> = {
+  atlascloud: "https://api.atlascloud.ai/v1",
   openai: "https://api.openai.com/v1",
 };
 
