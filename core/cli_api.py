@@ -429,7 +429,7 @@ async def config_validate(
                     errors.append(f"{name}.api_key_env={api_key_env} is not set in environment")
                 return
 
-            if provider in {"openai", "anthropic", "grok", "gemini"}:
+            if provider in {"openai", "atlascloud", "anthropic", "grok", "gemini"}:
                 if api_key_env:
                     if os.getenv(api_key_env) is None:
                         errors.append(

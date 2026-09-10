@@ -9,6 +9,7 @@ import os from "os";
 
 export type LlmProviderName =
   | "openai"
+  | "atlascloud"
   | "openai-codex"
   | "anthropic"
   | "grok"
@@ -173,6 +174,8 @@ async function callOpenAICompatible(params: {
   const baseURL =
     params.provider === "grok"
       ? "https://api.x.ai/v1"
+      : params.provider === "atlascloud"
+        ? params.endpoint || "https://api.atlascloud.ai/v1"
       : params.endpoint || undefined;
   const client = new OpenAI({
     apiKey: params.apiKey || "local-key",

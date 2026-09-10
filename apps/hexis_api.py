@@ -3350,6 +3350,7 @@ def _resolve_fallback_api_key(provider: str, role: str) -> str | None:
     # Then provider-specific conventional env vars.
     mapping = {
         "openai": "OPENAI_API_KEY",
+        "atlascloud": "ATLASCLOUD_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "grok": "XAI_API_KEY",
         "gemini": "GEMINI_API_KEY",
@@ -3537,7 +3538,7 @@ async def init_consent_request(req: InitConsentRequest):
         # Fail early if we need a key (unless mocked).
         if (
             not use_mock_consent
-            and provider in {"openai", "anthropic", "grok", "gemini"}
+            and provider in {"openai", "atlascloud", "anthropic", "grok", "gemini"}
             and not api_key
         ):
             return JSONResponse({"error": "Missing API key"}, status_code=400)
