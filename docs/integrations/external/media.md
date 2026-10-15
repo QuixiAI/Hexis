@@ -39,7 +39,7 @@ hexis tools enable twitter_search
 | `twitter_search` | 2 | Search tweets and trends |
 
 `twitter_search` uses FxTwitter first, then falls back to configured API providers:
-TwitterAPI.io (`twitterapi_io`), Xquik (`xquik`), X API v2 (`x_api_bearer`),
+TwitterAPI.io (`twitterapi_io`), Xquik (`xquik`), TwittrAPI (`twittrapi`), X API v2 (`x_api_bearer`),
 and xAI Search (`xai`). Use the provider key name that matches your account.
 
 ## Fathom

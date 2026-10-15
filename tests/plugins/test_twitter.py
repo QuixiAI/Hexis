@@ -110,6 +110,7 @@ class TestTwitterNoAuthRequired:
             ]
         )
         handler._search_xquik = AsyncMock(return_value=[])
+        handler._search_twittrapi = AsyncMock(return_value=[])
         handler._search_x_api = AsyncMock(return_value=[])
         handler._search_xai = AsyncMock(return_value=[])
 
@@ -131,6 +132,7 @@ class TestTwitterNoAuthRequired:
         assert result.output["tier"] == 2
         handler._search_twitterapi_io.assert_awaited_once()
         handler._search_xquik.assert_not_called()
+        handler._search_twittrapi.assert_not_called()
         handler._search_x_api.assert_not_called()
         handler._search_xai.assert_not_called()
 
@@ -152,6 +154,7 @@ class TestTwitterNoAuthRequired:
                 }
             ]
         )
+        handler._search_twittrapi = AsyncMock(return_value=[])
         handler._search_x_api = AsyncMock(return_value=[])
         handler._search_xai = AsyncMock(return_value=[])
 
@@ -175,6 +178,7 @@ class TestTwitterNoAuthRequired:
         assert result.output["tier"] == 3
         handler._search_twitterapi_io.assert_awaited_once()
         handler._search_xquik.assert_awaited_once()
+        handler._search_twittrapi.assert_not_called()
         handler._search_x_api.assert_not_called()
         handler._search_xai.assert_not_called()
 
@@ -220,6 +224,99 @@ class TestTwitterNoAuthRequired:
         }
 
     @pytest.mark.asyncio
+    async def test_falls_back_to_twittrapi(self):
+        handler = SearchTwitterHandler()
+        ctx = _make_context()
+
+        handler._search_fxtwitter = AsyncMock(side_effect=RuntimeError("fx down"))
+        handler._search_twitterapi_io = AsyncMock(return_value=[])
+        handler._search_xquik = AsyncMock(return_value=[])
+        handler._search_twittrapi = AsyncMock(
+            return_value=[
+                {
+                    "id": "5",
+                    "text": "twittrapi fallback",
+                    "author": "erin",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "metrics": {"likes": 5, "retweets": 2, "replies": 1},
+                }
+            ]
+        )
+        handler._search_x_api = AsyncMock(return_value=[])
+        handler._search_xai = AsyncMock(return_value=[])
+
+        async def _resolve_key(
+            _context, *, explicit_resolver=None, config_key=None, env_names=()
+        ):
+            if config_key == "twittrapi":
+                return "twittrapi-key"
+            return None
+
+        with (
+            patch("httpx.AsyncClient", return_value=self._dummy_client()),
+            patch("plugins.installed.twitter.tools.resolve_api_key", side_effect=_resolve_key),
+        ):
+            result = await handler.execute({"query": "test"}, ctx)
+
+        assert result.success
+        assert result.output["provider"] == "twittrapi"
+        assert result.output["tier"] == 4
+        handler._search_twitterapi_io.assert_not_called()
+        handler._search_xquik.assert_not_called()
+        handler._search_twittrapi.assert_awaited_once()
+        handler._search_x_api.assert_not_called()
+        handler._search_xai.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_twittrapi_request_and_response_mapping(self):
+        handler = SearchTwitterHandler()
+        payload = {
+            "data": [
+                {
+                    "id": "6",
+                    "url": "https://x.com/frank/status/6",
+                    "text": "mapped",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "author": {"id": "42", "username": "frank", "name": "Frank"},
+                    "counts": {
+                        "likes": 6,
+                        "retweets": 3,
+                        "replies": 2,
+                        "quotes": 0,
+                        "bookmarks": 0,
+                        "views": 100,
+                    },
+                }
+            ],
+            "nextCursor": None,
+            "previousCursor": None,
+            "hasNextPage": False,
+        }
+
+        with patch("plugins.installed.twitter.tools.request_json", AsyncMock(return_value=payload)) as request_json:
+            tweets = await handler._search_twittrapi("from:frank", 25, "twittrapi-key")
+
+        assert tweets == [
+            {
+                "id": "6",
+                "text": "mapped",
+                "author": "frank",
+                "created_at": "2026-01-01T00:00:00Z",
+                "metrics": {"likes": 6, "retweets": 3, "replies": 2},
+            }
+        ]
+        request_json.assert_awaited_once()
+        args, kwargs = request_json.await_args
+        assert args[2] == "https://api.twittrapi.com/search"
+        assert kwargs["headers"]["X-API-KEY"] == "twittrapi-key"
+        assert kwargs["params"] == {
+            "searchItem": "from:frank",
+            "category": "Latest",
+            "count": 25,
+            "format": "simple",
+        }
+
+    @pytest.mark.asyncio
     async def test_all_tiers_fail_returns_error(self):
         handler = SearchTwitterHandler()
         ctx = _make_context()
@@ -227,6 +324,7 @@ class TestTwitterNoAuthRequired:
         handler._search_fxtwitter = AsyncMock(side_effect=RuntimeError("fx down"))
         handler._search_twitterapi_io = AsyncMock(return_value=[])
         handler._search_xquik = AsyncMock(return_value=[])
+        handler._search_twittrapi = AsyncMock(return_value=[])
         handler._search_x_api = AsyncMock(return_value=[])
         handler._search_xai = AsyncMock(return_value=[])
 
