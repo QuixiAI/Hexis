@@ -4,8 +4,9 @@ Implements a multi-tier fallback strategy:
 1) FxTwitter (free, unauthenticated)
 2) TwitterAPI.io (if key configured)
 3) Xquik (if key configured)
-4) Official X API v2 (if bearer token configured)
-5) xAI Search endpoint (best-effort fallback, if key configured)
+4) TwittrAPI (if key configured)
+5) Official X API v2 (if bearer token configured)
+6) xAI Search endpoint (best-effort fallback, if key configured)
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ _FXTWITTER_BASE = "https://api.fxtwitter.com"
 _TWITTERAPI_IO_BASE = "https://api.twitterapi.io"
 _XQUIK_BASE = "https://xquik.com/api/v1"
 _XQUIK_API_CONTRACT = "2026-04-29"
+_TWITTRAPI_BASE = "https://api.twittrapi.com"
 _X_API_BASE = "https://api.twitter.com/2"
 _XAI_SEARCH_BASE = "https://api.x.ai/v1"
 
@@ -72,7 +74,7 @@ class SearchTwitterHandler(ToolHandler):
             description=(
                 "Search Twitter/X for recent tweets matching a query. "
                 "Uses automatic fallback across FxTwitter, TwitterAPI.io, Xquik, "
-                "official X API, and xAI Search when keys are available."
+                "TwittrAPI, official X API, and xAI Search when keys are available."
             ),
             parameters={
                 "type": "object",
@@ -173,7 +175,32 @@ class SearchTwitterHandler(ToolHandler):
         else:
             attempts.append("Xquik: skipped (no API key)")
 
-        # Tier 4: Official X API v2
+        # Tier 4: TwittrAPI
+        twittrapi_key = await resolve_api_key(
+            context,
+            config_key="twittrapi",
+            env_names=("TWITTRAPI_API_KEY",),
+        )
+        if twittrapi_key:
+            try:
+                tweets = await self._search_twittrapi(query, max_results, twittrapi_key)
+                if tweets:
+                    return ToolResult.success_result(
+                        {
+                            "tweets": tweets,
+                            "count": len(tweets),
+                            "provider": "twittrapi",
+                            "tier": 4,
+                        },
+                        display_output=f"Found {len(tweets)} tweet(s) for '{query}' (TwittrAPI)",
+                    )
+                attempts.append("TwittrAPI: no results")
+            except Exception as e:
+                attempts.append(f"TwittrAPI: {e}")
+        else:
+            attempts.append("TwittrAPI: skipped (no API key)")
+
+        # Tier 5: Official X API v2
         x_bearer = await resolve_api_key(
             context,
             config_key="x_api_bearer",
@@ -188,7 +215,7 @@ class SearchTwitterHandler(ToolHandler):
                             "tweets": tweets,
                             "count": len(tweets),
                             "provider": "x_api_v2",
-                            "tier": 4,
+                            "tier": 5,
                         },
                         display_output=f"Found {len(tweets)} tweet(s) for '{query}' (X API v2)",
                     )
@@ -198,7 +225,7 @@ class SearchTwitterHandler(ToolHandler):
         else:
             attempts.append("X API v2: skipped (no bearer token)")
 
-        # Tier 5: xAI Search fallback (best-effort)
+        # Tier 6: xAI Search fallback (best-effort)
         xai_key = await resolve_api_key(
             context,
             explicit_resolver=self._api_key_resolver,
@@ -214,7 +241,7 @@ class SearchTwitterHandler(ToolHandler):
                             "tweets": tweets,
                             "count": len(tweets),
                             "provider": "xai_search",
-                            "tier": 5,
+                            "tier": 6,
                         },
                         display_output=f"Found {len(tweets)} tweet(s) for '{query}' (xAI search)",
                     )
@@ -363,6 +390,48 @@ class SearchTwitterHandler(ToolHandler):
                         or t.get("replies")
                         or 0
                     ),
+                )
+            )
+        return tweets
+
+    async def _search_twittrapi(
+        self,
+        query: str,
+        max_results: int,
+        api_key: str,
+    ) -> list[dict[str, Any]]:
+        # format=simple returns {data: [Tweet], nextCursor, hasNextPage} with
+        # flat camelCase tweets and counts under "counts".
+        data = await request_json(
+            "twittrapi",
+            "GET",
+            f"{_TWITTRAPI_BASE}/search",
+            headers={"X-API-KEY": api_key, "Accept": "application/json"},
+            params={
+                "searchItem": query,
+                "category": "Latest",
+                "count": min(max_results, 100),
+                "format": "simple",
+            },
+            timeout=20.0,
+            attempts=3,
+            max_delay=10.0,
+        )
+
+        rows = data.get("data") if isinstance(data, dict) else []
+        tweets: list[dict[str, Any]] = []
+        for t in (rows or [])[:max_results]:
+            user = t.get("author") or {}
+            counts = t.get("counts") or {}
+            tweets.append(
+                _tweet_dict(
+                    tweet_id=t.get("id"),
+                    text=t.get("text", ""),
+                    author=user.get("username") or user.get("name") or "unknown",
+                    created_at=t.get("createdAt"),
+                    likes=int(counts.get("likes") or 0),
+                    retweets=int(counts.get("retweets") or 0),
+                    replies=int(counts.get("replies") or 0),
                 )
             )
         return tweets
