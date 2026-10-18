@@ -52,12 +52,34 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "minimax-portal": "",
     "google-gemini-cli": "",
     "google-antigravity": "",
+    "xai-oauth": "",
+    # Key-plus-model providers the wizard offers. Azure, Bedrock and Vertex AI
+    # also need an endpoint (resource URL, region, project) the wizard does not
+    # ask for yet; configure them with `hexis init --provider … --endpoint …`.
+    "openrouter": "OPENROUTER_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+    "qwen_coding": "QWEN_API_KEY",
+    "meta": "META_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    # Enterprise clouds. Bedrock and Vertex AI can use the server's own cloud
+    # credentials (an IAM role, AWS_* variables, Application Default
+    # Credentials), so their key is optional.
+    "azure_openai": "AZURE_OPENAI_API_KEY",
+    "bedrock": "AWS_BEARER_TOKEN_BEDROCK",
+    "vertex": "",
 }
+
+# Clouds whose "endpoint" is a resource URL, a region, or a project/location
+# rather than an OpenAI-style base URL; the wizard asks for those by name.
+_CLOUD_PROVIDERS: set[str] = {"azure_openai", "bedrock", "vertex"}
+_KEY_OPTIONAL_PROVIDERS: set[str] = {"bedrock", "vertex", "openai_compatible"}
 
 # Providers that use OAuth / device-code / token auth (no API key needed).
 _OAUTH_PROVIDERS: set[str] = {
     "openai-codex", "chutes", "github-copilot", "qwen-portal",
-    "minimax-portal", "google-gemini-cli", "google-antigravity",
+    "minimax-portal", "google-gemini-cli", "google-antigravity", "xai-oauth",
 }
 
 
@@ -85,6 +107,7 @@ def _normalize_provider_name(provider: str | None) -> str:
         "minimax_portal": "minimax-portal",
         "google_gemini_cli": "google-gemini-cli",
         "google_antigravity": "google-antigravity",
+        "xai_oauth": "xai-oauth",
     }
     return _ALIASES.get(raw, raw)
 
@@ -141,6 +164,28 @@ def _resolve_noninteractive_endpoint(
             "An OpenAI-compatible endpoint is required. Pass --endpoint URL "
             "or set OPENAI_BASE_URL in .env."
         )
+    if provider == "azure_openai" and not endpoint:
+        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+        source = "AZURE_OPENAI_ENDPOINT" if endpoint else ""
+        if not endpoint:
+            raise ValueError(
+                "Azure OpenAI needs the resource URL (https://<resource>.openai.azure.com). "
+                "Pass --endpoint URL or set AZURE_OPENAI_ENDPOINT in .env."
+            )
+    if provider == "bedrock" and not endpoint:
+        endpoint = os.getenv("AWS_REGION", "").strip() or "us-east-1"
+        source = "AWS_REGION" if os.getenv("AWS_REGION", "").strip() else "default region"
+    if provider == "vertex":
+        from core.llm import parse_vertex_endpoint
+
+        if not endpoint and os.getenv("GOOGLE_CLOUD_PROJECT", "").strip():
+            endpoint = f"projects/{os.getenv('GOOGLE_CLOUD_PROJECT', '').strip()}/locations/us-central1"
+            source = "GOOGLE_CLOUD_PROJECT"
+        if not parse_vertex_endpoint(endpoint)[0]:
+            raise ValueError(
+                "Vertex AI needs a Google Cloud project. Pass "
+                "--endpoint projects/<project-id>/locations/<region> or set GOOGLE_CLOUD_PROJECT in .env."
+            )
     return endpoint, source
 
 
@@ -150,6 +195,10 @@ def _resolve_noninteractive_api_key_env(
 ) -> str:
     """Choose a credential env var without silently consuming ambient keys."""
     if provider in _OAUTH_PROVIDERS:
+        return ""
+    if provider in _KEY_OPTIONAL_PROVIDERS and not args.api_key and not args.api_key_env:
+        # Bedrock and Vertex AI fall back to the server's cloud credentials;
+        # a local OpenAI-compatible server often needs no key at all.
         return ""
 
     api_key_env = (args.api_key_env or _PROVIDER_ENV_VARS.get(provider, "")).strip()
@@ -201,6 +250,7 @@ async def _ensure_oauth_login(
         "minimax-portal":     ("core.auth.minimax_portal",     "load_credentials"),
         "google-gemini-cli":  ("core.auth.google_gemini_cli",  "load_credentials"),
         "google-antigravity": ("core.auth.google_antigravity", "load_credentials"),
+        "xai-oauth":          ("core.auth.xai_oauth",          "load_credentials"),
     }
 
     entry = _LOADERS.get(provider)
@@ -228,7 +278,7 @@ async def _ensure_oauth_login(
     from apps.cli_auth import (
         _openai_codex_login, _chutes_login, _github_copilot_login,
         _qwen_portal_login, _minimax_portal_login,
-        _google_gemini_cli_login, _google_antigravity_login,
+        _google_gemini_cli_login, _google_antigravity_login, _xai_oauth_login,
     )
 
     ns = argparse.Namespace(
@@ -261,6 +311,8 @@ async def _ensure_oauth_login(
         rc = await _google_gemini_cli_login(dsn, wait_seconds, ns)
     elif provider == "google-antigravity":
         rc = await _google_antigravity_login(dsn, wait_seconds, ns)
+    elif provider == "xai-oauth":
+        rc = await _xai_oauth_login(dsn, wait_seconds, ns)
     else:
         return
 
@@ -801,6 +853,17 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         ("MiniMax Portal — OAuth", "minimax-portal"),
         ("Google Gemini CLI — OAuth", "google-gemini-cli"),
         ("Google Antigravity — OAuth", "google-antigravity"),
+        ("xAI (SuperGrok / X account) — OAuth", "xai-oauth"),
+        ("OpenRouter — API key", "openrouter"),
+        ("DeepSeek — API key", "deepseek"),
+        ("Z.ai (GLM) — API key", "zai"),
+        ("Qwen (Alibaba Model Studio) — API key", "qwen"),
+        ("Qwen Coding Plan — API key", "qwen_coding"),
+        ("MiniMax — API key", "minimax"),
+        ("Meta (Muse) — API key", "meta"),
+        ("Azure OpenAI — API key + resource URL", "azure_openai"),
+        ("Amazon Bedrock — API key or the server's AWS credentials", "bedrock"),
+        ("Google Vertex AI — service account or the server's Google credentials", "vertex"),
         (
             "Local / custom — OpenAI-compatible (Ollama, LM Studio, vLLM)",
             "openai_compatible",
@@ -838,6 +901,18 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
                 else ""
             ),
         )
+    elif provider == "azure_openai":
+        endpoint = _prompt(
+            "Azure OpenAI resource URL (https://<resource>.openai.azure.com)",
+            default=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
+            required=True,
+        )
+    elif provider == "bedrock":
+        endpoint = _prompt("AWS region", default=os.getenv("AWS_REGION", "") or "us-east-1", required=True)
+    elif provider == "vertex":
+        project = _prompt("Google Cloud project ID", default=os.getenv("GOOGLE_CLOUD_PROJECT", ""), required=True)
+        location = _prompt("Vertex AI region", default="us-central1", required=True)
+        endpoint = f"projects/{project.strip()}/locations/{location.strip()}"
 
     # Model — the list AND the default both come from the live catalog
     # (models.dev), the way hermes-agent and openclaw do it. No
@@ -875,6 +950,16 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         api_key_env = ""
         console.print("[muted]OAuth provider — no endpoint or API key needed.[/muted]")
         use_separate_sub = False
+    elif provider in _CLOUD_PROVIDERS:
+        # The cloud target was asked for above; only the credential is left.
+        hint = (
+            "API key env var name"
+            if provider == "azure_openai"
+            else "API key env var name (blank to use the server's cloud credentials)"
+        )
+        api_key_env = _prompt(hint, default=_PROVIDER_ENV_VARS.get(provider, ""),
+                              required=(provider == "azure_openai"))
+        use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
     elif provider != "openai_compatible":
         endpoint = _prompt(
             "Endpoint (blank for provider default)",

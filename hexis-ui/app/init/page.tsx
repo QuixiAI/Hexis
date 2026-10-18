@@ -4,7 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { ConsentExchangeView, type ConsentExchange } from "./consent-exchange";
-import { getOAuthStatus, OAuthControl } from "./oauth-control";
+import {
+  defaultLlmConfig,
+  llmConfigFromSaved,
+  ModelsForm,
+  providerLabel,
+  type LlmConfig,
+  type SavedModels,
+} from "./models-form";
 
 type InitStage =
   | "llm"
@@ -50,26 +57,7 @@ const stagePrompt: Record<InitStage, string> = {
     "Initialization is complete. The heartbeat may begin when the system is ready.",
 };
 
-type LlmProvider =
-  | "openai-codex"
-  | "openai"
-  | "anthropic"
-  | "grok"
-  | "gemini"
-  | "chutes"
-  | "github-copilot"
-  | "qwen-portal"
-  | "minimax-portal"
-  | "google-gemini-cli"
-  | "google-antigravity"
-  | "openai_compatible";
 type LlmRole = "conscious" | "subconscious";
-type LlmConfig = {
-  provider: LlmProvider;
-  model: string;
-  endpoint: string;
-  apiKey: string;
-};
 type ConsentRecord = {
   decision: string;
   signature: string | null;
@@ -171,116 +159,6 @@ type WorldviewForm = {
   ethics: string;
 };
 
-// Provider metadata. Model lists + default models are NOT hardcoded here — they
-// are derived live from /api/init/models. This only holds
-// labels, endpoint defaults, and how the api-key/OAuth field should render.
-type ProviderMeta = {
-  label: string;
-  endpoint: string;
-  apiKeyLabel: string;
-  apiKeyRequired: boolean;
-  oauth: boolean;
-};
-
-// Ordered so the dropdown mirrors the CLI's full provider set.
-const providerMeta: Record<LlmProvider, ProviderMeta> = {
-  "openai-codex": {
-    label: "ChatGPT Plus/Pro (Codex OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
-  openai: {
-    label: "OpenAI",
-    endpoint: "https://api.openai.com/v1",
-    apiKeyLabel: "OpenAI API Key",
-    apiKeyRequired: true,
-    oauth: false,
-  },
-  anthropic: {
-    label: "Anthropic",
-    endpoint: "",
-    apiKeyLabel: "Anthropic API Key",
-    apiKeyRequired: true,
-    oauth: false,
-  },
-  grok: {
-    label: "Grok (xAI)",
-    endpoint: "",
-    apiKeyLabel: "Grok API Key",
-    apiKeyRequired: true,
-    oauth: false,
-  },
-  gemini: {
-    label: "Gemini",
-    endpoint: "",
-    apiKeyLabel: "Gemini API Key",
-    apiKeyRequired: true,
-    oauth: false,
-  },
-  chutes: {
-    label: "Chutes (OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
-  "github-copilot": {
-    label: "GitHub Copilot (OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
-  "qwen-portal": {
-    label: "Qwen Portal (OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
-  "minimax-portal": {
-    label: "MiniMax Portal (OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
-  "google-gemini-cli": {
-    label: "Google Gemini CLI (OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
-  "google-antigravity": {
-    label: "Google Antigravity (OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
-  openai_compatible: {
-    label: "Local (OpenAI-compatible: vLLM, llama.cpp, LM Studio)",
-    endpoint: "http://localhost:8000/v1",
-    apiKeyLabel: "API Key (optional)",
-    apiKeyRequired: false,
-    oauth: false,
-  },
-};
-
-const providerOrder = Object.keys(providerMeta) as LlmProvider[];
-
-const persistedProvider = (provider: LlmProvider): string => provider;
-
-const defaultLlmConfig = (provider: LlmProvider): LlmConfig => ({
-  provider,
-  model: "",
-  endpoint: providerMeta[provider].endpoint,
-  apiKey: "",
-});
-
 type BoundaryForm = {
   content: string;
   trigger_patterns: string;
@@ -333,6 +211,12 @@ async function postJson<T>(url: string, payload?: unknown): Promise<T> {
     );
   }
   return responsePayload as T;
+}
+
+async function fetchInitStatus(): Promise<InitStatusResponse> {
+  const res = await fetch("/api/init/status", { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to load init status");
+  return (await res.json()) as InitStatusResponse;
 }
 
 function parseLines(text: string) {
@@ -527,35 +411,15 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Live model catalog per role (derived from /api/init/models, never hardcoded).
-  type ModelCatalog = {
-    models: string[];
-    loading: boolean;
-    error: string | null;
-    recommended: string;
-    selectedUnavailable: boolean;
-  };
-  const [modelCatalog, setModelCatalog] = useState<Record<LlmRole, ModelCatalog>>({
-    conscious: {
-      models: [],
-      loading: false,
-      error: null,
-      recommended: "",
-      selectedUnavailable: false,
-    },
-    subconscious: {
-      models: [],
-      loading: false,
-      error: null,
-      recommended: "",
-      selectedUnavailable: false,
-    },
-  });
-  const [oauthRefreshKey, setOAuthRefreshKey] = useState(0);
 
   const [llmConscious, setLlmConscious] = useState<LlmConfig>(defaultLlmConfig("openai"));
   const [llmSubconscious, setLlmSubconscious] = useState<LlmConfig>(
     defaultLlmConfig("openai")
   );
+  // Remount the models form when saved settings arrive from the server, so
+  // it starts from them rather than from the defaults it mounted with.
+  const llmFormKey = [llmConscious.provider, llmConscious.model, llmConscious.endpoint,
+    llmSubconscious.provider, llmSubconscious.model, llmSubconscious.endpoint].join("|");
 
   // Shared state
   const [userName, setUserName] = useState("User");
@@ -631,10 +495,9 @@ export default function Home() {
             ? 10
             : 50;
 
-  const loadStatus = async () => {
-    const res = await fetch("/api/init/status", { cache: "no-store" });
-    if (!res.ok) throw new Error("Failed to load init status");
-    const data = await res.json() as InitStatusResponse;
+  // Apply a status payload to the page. Kept apart from the fetch so the
+  // mount effect only subscribes to the response and sets state in its callback.
+  const applyStatus = useCallback((data: InitStatusResponse) => {
     setStatus(data.status ?? {});
     setProfile(data.profile ?? {});
     if (data.consent_records) {
@@ -644,19 +507,12 @@ export default function Home() {
       });
     }
     if (data.llm_heartbeat) {
-      const heartbeatConfig = data.llm_heartbeat;
-      setLlmConscious((prev) => ({
-        ...prev,
-        provider: heartbeatConfig.provider || prev.provider,
-        model: heartbeatConfig.model || prev.model,
-        endpoint: heartbeatConfig.endpoint || prev.endpoint,
-      }));
+      setLlmConscious((prev) => llmConfigFromSaved(data.llm_heartbeat, prev));
     }
     if (data.llm_subconscious) {
       const subconsciousConfig = data.llm_subconscious;
       setLlmSubconscious((prev) => ({
-        ...prev,
-        provider: subconsciousConfig.provider || prev.provider,
+        ...llmConfigFromSaved(subconsciousConfig, prev),
         model: subconsciousConfig.model || prev.model,
         endpoint: subconsciousConfig.endpoint || prev.endpoint,
       }));
@@ -665,18 +521,22 @@ export default function Home() {
       // no longer tracking mode separately
     }
     setStage((prev) => nextStageFromInitStatus(prev, data));
-  };
+  }, []);
+
+  const loadStatus = useCallback(async () => {
+    applyStatus(await fetchInitStatus());
+  }, [applyStatus]);
 
   useEffect(() => {
-    loadStatus().catch((err) => setError(err.message));
-  }, []);
+    fetchInitStatus().then(applyStatus).catch((err) => setError(err.message));
+  }, [applyStatus]);
 
   useEffect(() => {
     if (stage === "consent") {
       const interval = setInterval(() => loadStatus().catch(() => undefined), 3000);
       return () => clearInterval(interval);
     }
-  }, [stage]);
+  }, [stage, loadStatus]);
 
   // Load characters when entering character stage
   useEffect(() => {
@@ -732,145 +592,16 @@ export default function Home() {
     }
   }, [stage, catalogProvider, catalogTags, catalogSort, includeNsfw, loadCatalog]);
 
-  // Fetch the live model catalog for a role's provider. Populates the free-text
-  // model field with the recommended default only when it is currently empty.
-  const loadModels = useCallback(async (role: LlmRole, config: LlmConfig) => {
-    const setConfig = role === "conscious" ? setLlmConscious : setLlmSubconscious;
-    setModelCatalog((prev) => ({
-      ...prev,
-      [role]: { ...prev[role], loading: true, error: null },
-    }));
-    try {
-      const params = new URLSearchParams({ provider: config.provider });
-      const res = await fetch(`/api/init/models?${params.toString()}`);
-      const payload = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(
-          typeof payload?.error === "string" ? payload.error : "Unable to load models."
-        );
-      }
-      const models = Array.isArray(payload?.models)
-        ? payload.models.filter((item: unknown) => typeof item === "string")
-        : [];
-      const recommended = typeof payload?.default === "string" ? payload.default : "";
-      const unavailableModels = Array.isArray(payload?.unavailable_models)
-        ? payload.unavailable_models.filter((item: unknown) => typeof item === "string")
-        : [];
-      const selectedUnavailable = unavailableModels.includes(config.model.trim());
-      setModelCatalog((prev) => ({
-        ...prev,
-        [role]: {
-          models,
-          loading: false,
-          error: selectedUnavailable
-            ? `${config.model} was rejected by this ChatGPT workspace.`
-            : null,
-          recommended,
-          selectedUnavailable,
-        },
-      }));
-      if (recommended) {
-        setConfig((prev) => (prev.model.trim() ? prev : { ...prev, model: recommended }));
-      }
-    } catch (err: unknown) {
-      setModelCatalog((prev) => ({
-        ...prev,
-        [role]: {
-          models: [],
-          loading: false,
-          error: errorMessage(err, "Unable to load models."),
-          recommended: "",
-          selectedUnavailable: false,
-        },
-      }));
-    }
-  }, []);
-
-  useEffect(() => {
-    loadModels("conscious", llmConscious);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [llmConscious.provider, loadModels, oauthRefreshKey]);
-
-  useEffect(() => {
-    loadModels("subconscious", llmSubconscious);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [llmSubconscious.provider, loadModels, oauthRefreshKey]);
-
-  const updateLlmProvider = (role: LlmRole, provider: LlmProvider) => {
-    // Clear the model so the catalog fetch can supply the provider's default.
-    const patch = { provider, model: "", endpoint: providerMeta[provider].endpoint, apiKey: "" };
-    setConsentRecords((prev) => ({ ...prev, [role]: null }));
-    if (role === "conscious") {
-      setLlmConscious((prev) => ({ ...prev, ...patch }));
-    } else {
-      setLlmSubconscious((prev) => ({ ...prev, ...patch }));
-    }
-  };
-
-  const handleOAuthAuthenticated = useCallback(() => {
-    setOAuthRefreshKey((current) => current + 1);
-  }, []);
-
   // --- Handlers ---
 
-  const handleLlmSave = async () => {
-    setBusy(true);
+  const handleModelsSaved = (saved: SavedModels) => {
     setError(null);
-    try {
-      const missing: string[] = [];
-      const validateConfig = (label: string, config: LlmConfig) => {
-        if (!config.provider.trim()) missing.push(`${label} provider`);
-        if (!config.model.trim()) missing.push(`${label} model`);
-        if (config.provider === "openai_compatible" && !config.endpoint.trim())
-          missing.push(`${label} endpoint`);
-        const meta = providerMeta[config.provider];
-        if (meta?.apiKeyRequired && !config.apiKey.trim()) missing.push(`${label} API key`);
-      };
-      validateConfig("conscious", llmConscious);
-      validateConfig("subconscious", llmSubconscious);
-      const oauthProviders = Array.from(
-        new Set(
-          [llmConscious, llmSubconscious]
-            .filter((config) => providerMeta[config.provider].oauth)
-            .map((config) => persistedProvider(config.provider))
-        )
-      );
-      const oauthStatuses = await Promise.all(
-        oauthProviders.map(
-          async (provider) => [provider, await getOAuthStatus(provider, true)] as const
-        )
-      );
-      for (const [provider, authStatus] of oauthStatuses) {
-        if (!authStatus.configured) {
-          const selected = [llmConscious, llmSubconscious].find(
-            (config) => persistedProvider(config.provider) === provider
-          );
-          missing.push(
-            `${selected ? providerMeta[selected.provider].label : provider} authorization`
-          );
-        }
-      }
-      if (missing.length > 0) throw new Error(`Missing ${missing.join(" and ")}`);
-      await postJson("/api/init/llm", {
-        conscious: {
-          provider: persistedProvider(llmConscious.provider),
-          model: llmConscious.model,
-          endpoint: llmConscious.endpoint,
-          api_key: llmConscious.apiKey,
-        },
-        subconscious: {
-          provider: persistedProvider(llmSubconscious.provider),
-          model: llmSubconscious.model,
-          endpoint: llmSubconscious.endpoint,
-          api_key: llmSubconscious.apiKey,
-        },
-      });
-      setStage(status?.stage === "consent" ? "consent" : "choose_path");
-    } catch (err: unknown) {
-      setError(errorMessage(err, "Failed to save model configuration"));
-    } finally {
-      setBusy(false);
-    }
+    setConsentRecords({ conscious: null, subconscious: null });
+    setLlmConscious((prev) => llmConfigFromSaved(saved.config?.conscious, prev));
+    setLlmSubconscious((prev) => llmConfigFromSaved(saved.config?.subconscious, prev));
+    const nextStage = (saved.status as Record<string, unknown> | null)?.stage;
+    if (saved.status) setStatus(saved.status as InitStatus);
+    setStage(nextStage === "consent" ? "consent" : "choose_path");
   };
 
   const handleExpress = async () => {
@@ -1093,10 +824,9 @@ export default function Home() {
     const res = await postJson<ConsentRequestResult>("/api/init/consent/request", {
       role,
       llm: {
-        provider: persistedProvider(config.provider),
+        provider: config.provider,
         model: config.model,
         endpoint: config.endpoint,
-        api_key: config.apiKey,
       },
     });
     if (res?.consent_record) {
@@ -1127,8 +857,6 @@ export default function Home() {
 
   const handleChangeModel = () => {
     setStage("llm");
-    loadModels("conscious", llmConscious);
-    loadModels("subconscious", llmSubconscious);
   };
 
   // Owner override: activate even though the model didn't consent. It's the
@@ -1140,7 +868,7 @@ export default function Home() {
       await postJson<unknown>("/api/init/consent/override", {
         role: "conscious",
         llm: {
-          provider: persistedProvider(llmConscious.provider),
+          provider: llmConscious.provider,
           model: llmConscious.model,
           endpoint: llmConscious.endpoint,
         },
@@ -1269,11 +997,6 @@ export default function Home() {
   );
   const statusStage = (status?.stage as string) ?? "not_started";
 
-  const llmEntries = [
-    { role: "conscious" as const, label: "Conscious Model", config: llmConscious, setConfig: setLlmConscious },
-    { role: "subconscious" as const, label: "Subconscious Model", config: llmSubconscious, setConfig: setLlmSubconscious },
-  ];
-
   return (
     <div className="app-shell min-h-screen">
       <div className="relative z-10 mx-auto max-w-6xl px-6 py-12 lg:py-16">
@@ -1361,184 +1084,12 @@ export default function Home() {
                 <p className="text-base text-[var(--ink-soft)]">
                   Configure the models for the conscious and subconscious layers.
                 </p>
-                <div className="space-y-6">
-                  {llmEntries.map((entry) => {
-                    const meta = providerMeta[entry.config.provider];
-                    const catalog = modelCatalog[entry.role];
-                    const modelOptions = catalog.models;
-                    const showEndpoint =
-                      entry.config.provider === "openai_compatible";
-                    return (
-                      <fieldset
-                        key={entry.role}
-                        className="rounded-2xl border border-[var(--outline)] p-4"
-                      >
-                        <legend className="px-2 text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
-                          {entry.label}
-                        </legend>
-                        <div className="mt-3 grid gap-4">
-                          <div>
-                            <label
-                              htmlFor={`provider-${entry.role}`}
-                              className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]"
-                            >
-                              Provider
-                            </label>
-                            <select
-                              id={`provider-${entry.role}`}
-                              className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
-                              value={entry.config.provider}
-                              onChange={(e) =>
-                                updateLlmProvider(entry.role, e.target.value as LlmProvider)
-                              }
-                            >
-                              {providerOrder.map((value) => (
-                                <option key={value} value={value}>
-                                  {providerMeta[value].label}
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                          <div>
-                            <label
-                              htmlFor={`model-${entry.role}`}
-                              className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]"
-                            >
-                              Model
-                            </label>
-                            <input
-                              id={`model-${entry.role}`}
-                              className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
-                              list={`model-options-${entry.role}`}
-                              value={entry.config.model}
-                              onChange={(e) =>
-                                entry.setConfig((prev) => {
-                                  setConsentRecords((s) => ({ ...s, [entry.role]: null }));
-                                  return { ...prev, model: e.target.value };
-                                })
-                              }
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter" && !busy) handleLlmSave();
-                              }}
-                              placeholder="Model name"
-                            />
-                            {modelOptions.length > 0 ? (
-                              <datalist id={`model-options-${entry.role}`}>
-                                {modelOptions.map((m) => (
-                                  <option key={m} value={m} />
-                                ))}
-                              </datalist>
-                            ) : null}
-                            <p className="mt-2 text-xs text-[var(--ink-soft)]">
-                              {catalog.loading
-                                ? "Loading available models..."
-                                : catalog.error
-                                  ? catalog.error
-                                  : modelOptions.length > 0
-                                    ? `${modelOptions.length} models available — or type any model id.`
-                                    : "No models listed — type a model id."}
-                              {catalog.error ? (
-                                catalog.selectedUnavailable && catalog.recommended ? (
-                                  <button
-                                    type="button"
-                                    className="ml-2 text-[var(--accent-strong)] underline"
-                                    onClick={() => {
-                                      entry.setConfig((prev) => ({
-                                        ...prev,
-                                        model: catalog.recommended,
-                                      }));
-                                      setConsentRecords((prev) => ({
-                                        ...prev,
-                                        [entry.role]: null,
-                                      }));
-                                      setModelCatalog((prev) => ({
-                                        ...prev,
-                                        [entry.role]: {
-                                          ...prev[entry.role],
-                                          error: null,
-                                          selectedUnavailable: false,
-                                        },
-                                      }));
-                                    }}
-                                  >
-                                    Use {catalog.recommended}
-                                  </button>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    className="ml-2 text-[var(--accent-strong)] underline"
-                                    onClick={() => loadModels(entry.role, entry.config)}
-                                  >
-                                    Retry
-                                  </button>
-                                )
-                              ) : null}
-                            </p>
-                          </div>
-                          {showEndpoint ? (
-                            <div>
-                              <label
-                                htmlFor={`endpoint-${entry.role}`}
-                                className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]"
-                              >
-                                Endpoint
-                              </label>
-                              <input
-                                id={`endpoint-${entry.role}`}
-                                className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
-                                value={entry.config.endpoint}
-                                onChange={(e) =>
-                                  entry.setConfig((prev) => {
-                                    setConsentRecords((s) => ({ ...s, [entry.role]: null }));
-                                    return { ...prev, endpoint: e.target.value };
-                                  })
-                                }
-                                placeholder="https://..."
-                              />
-                            </div>
-                          ) : null}
-                          {meta.oauth ? (
-                            <OAuthControl
-                              provider={persistedProvider(entry.config.provider)}
-                              label={meta.label}
-                              refreshKey={oauthRefreshKey}
-                              onAuthenticated={handleOAuthAuthenticated}
-                            />
-                          ) : (
-                            <div>
-                              <label
-                                htmlFor={`apikey-${entry.role}`}
-                                className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]"
-                              >
-                                {meta.apiKeyLabel}
-                              </label>
-                              <input
-                                id={`apikey-${entry.role}`}
-                                className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm"
-                                type="password"
-                                value={entry.config.apiKey}
-                                onChange={(e) =>
-                                  entry.setConfig((prev) => ({ ...prev, apiKey: e.target.value }))
-                                }
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" && !busy) handleLlmSave();
-                                }}
-                                placeholder={meta.apiKeyRequired ? "Required" : "Optional"}
-                              />
-                            </div>
-                          )}
-                        </div>
-                      </fieldset>
-                    );
-                  })}
-                </div>
-                <button
-                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-                  onClick={handleLlmSave}
-                  disabled={busy}
-                >
-                  Save Models
-                </button>
+                <ModelsForm
+                  key={llmFormKey}
+                  initialConscious={llmConscious}
+                  initialSubconscious={llmSubconscious}
+                  onSaved={handleModelsSaved}
+                />
               </div>
             )}
 
@@ -2555,7 +2106,7 @@ export default function Home() {
                         </p>
                         <p className="mt-3">
                           Provider:{" "}
-                          <span className="text-[var(--foreground)]">{entry.config.provider}</span>
+                          <span className="text-[var(--foreground)]">{providerLabel(entry.config.provider)}</span>
                         </p>
                         <p>
                           Model:{" "}

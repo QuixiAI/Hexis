@@ -54,9 +54,12 @@ Configure `hexis-ui/.env.local`:
 
 ```bash
 DATABASE_URL=postgresql://hexis_user:hexis_password@127.0.0.1:43815/hexis_memory
-HEXIS_LLM_CONSCIOUS_API_KEY=...      # set during init wizard
-HEXIS_LLM_SUBCONSCIOUS_API_KEY=...   # optional
+HEXIS_API_URL=http://127.0.0.1:43817  # the Python API, which owns model setup
 ```
+
+API keys typed in the Models step are not written to `.env`: the Python API
+stores them in the auth store under `~/.hexis/auth`, which every service
+mounts, and the model config records only a reference to them.
 
 ```bash
 bun dev   # http://localhost:3477

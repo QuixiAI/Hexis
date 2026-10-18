@@ -359,6 +359,36 @@ class InitAuthCompleteRequest(BaseModel):
     authorization_input: str
 
 
+class InitAuthTokenRequest(BaseModel):
+    provider: str
+    token: str = Field(max_length=4096)
+
+
+class InitAuthForgetRequest(BaseModel):
+    provider: str
+
+
+class InitLlmRoleConfig(BaseModel):
+    provider: str = ""
+    model: str = ""
+    endpoint: str = ""
+    api_key: str = ""
+
+
+class InitLlmSetupRequest(BaseModel):
+    conscious: InitLlmRoleConfig
+    subconscious: InitLlmRoleConfig | None = None
+    reuse_primary: bool = False
+
+
+class InitLlmRoleRequest(BaseModel):
+    role: Literal["conscious", "subconscious"] = "conscious"
+    provider: str = ""
+    model: str = ""
+    endpoint: str = ""
+    api_key: str = ""
+
+
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
@@ -634,6 +664,106 @@ async def init_auth_complete(req: InitAuthCompleteRequest):
         )
     except AuthFlowError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/init/auth/setup-token")
+async def init_auth_setup_token(req: InitAuthTokenRequest):
+    """Store a pasted subscription token (a Claude Code setup token)."""
+    try:
+        return auth_flow_coordinator.save_token(req.provider, req.token)
+    except AuthFlowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/init/auth/forget")
+async def init_auth_forget(req: InitAuthForgetRequest):
+    """Delete a stored sign-in or token at the user's request."""
+    try:
+        return auth_flow_coordinator.forget(req.provider)
+    except AuthFlowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Model setup (the Python side owns keys and config; the UI only proxies)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/init/llm")
+async def init_llm_setup(req: InitLlmSetupRequest):
+    """Save both model roles: typed keys to the auth store, config to the DB."""
+    from core.init_api import save_llm_setup
+
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    roles = {
+        "conscious": req.conscious.model_dump(),
+        "subconscious": (req.subconscious or req.conscious).model_dump(),
+    }
+    try:
+        result = await save_llm_setup(pool, roles, reuse_primary=req.reuse_primary)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/init/llm/models")
+async def init_llm_models(req: InitLlmRoleRequest):
+    """Model ids the chosen endpoint lists with the resolved credential."""
+    from core.init_api import list_models
+
+    return JSONResponse(jsonable_encoder(await list_models(req.role, req.model_dump())))
+
+
+@app.post("/api/init/llm/test")
+async def init_llm_test(req: InitLlmRoleRequest):
+    """One tiny real call with the form's provider, model and credential."""
+    from core.init_api import test_llm_setup
+
+    return JSONResponse(jsonable_encoder(await test_llm_setup(req.role, req.model_dump())))
+
+
+class InitLlmCompleteRequest(BaseModel):
+    system: str = ""
+    user: str
+    temperature: float = 0.3
+    max_tokens: int = Field(default=4000, ge=1, le=32000)
+    json_mode: bool = False
+
+
+@app.post("/api/init/llm/complete")
+async def init_llm_complete(req: InitLlmCompleteRequest):
+    """One plain completion with the conscious model, for setup helpers such
+    as the character-card importer. The dashboard never holds a key."""
+    from core.llm import chat_completion
+    from core.llm_config import resolve_llm_config
+
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        config = await resolve_llm_config(pool, "llm.chat", fallback_key="llm.heartbeat")
+        if not config.get("model"):
+            return JSONResponse({"error": "LLM not configured. Complete the Models step first."}, status_code=400)
+        messages: list[dict[str, Any]] = []
+        if req.system.strip():
+            messages.append({"role": "system", "content": req.system})
+        messages.append({"role": "user", "content": req.user})
+        result = await chat_completion(
+            provider=config["provider"],
+            model=config["model"],
+            endpoint=config.get("endpoint"),
+            api_key=config.get("api_key"),
+            auth_mode=config.get("auth_mode"),
+            messages=messages,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+            response_format={"type": "json_object"} if req.json_mode else None,
+        )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc).strip() or type(exc).__name__}, status_code=502)
+    return JSONResponse({"content": result.get("content") or "", "provider": config["provider"], "model": config["model"]})
 
 
 @app.get("/api/init/models/openai-codex")
@@ -3499,6 +3629,7 @@ async def init_consent_request(req: InitConsentRequest):
 
     # Resolve OAuth (Codex) + check for existing records.
     existing: dict[str, Any] | None = None
+    auth_mode: str | None = None
     if provider == "openai-codex":
         async with pool.acquire() as conn:
             from core.auth.openai_codex import ensure_fresh_openai_codex_credentials
@@ -3530,16 +3661,26 @@ async def init_consent_request(req: InitConsentRequest):
                     )
                 )
     else:
-        # Resolve API key for non-OAuth providers
+        # Resolve the credential the way the running agent will: a typed key,
+        # else the key saved by setup, else the environment, else a sign-in
+        # or setup token.
+        from core.init_api import API_KEY_REQUIRED, OAUTH_PROVIDERS, resolve_setup_credentials
+
         if not api_key:
             api_key = _resolve_fallback_api_key(provider, role)
+        try:
+            resolved = await resolve_setup_credentials(role, {
+                "provider": provider, "model": model, "endpoint": endpoint or "", "api_key": api_key or "",
+            })
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        api_key = resolved.get("api_key") or api_key
+        auth_mode = resolved.get("auth_mode")
+        if provider in OAUTH_PROVIDERS:
+            endpoint = resolved.get("endpoint") or endpoint
 
         # Fail early if we need a key (unless mocked).
-        if (
-            not use_mock_consent
-            and provider in {"openai", "anthropic", "grok", "gemini"}
-            and not api_key
-        ):
+        if not use_mock_consent and provider in API_KEY_REQUIRED and not api_key:
             return JSONResponse({"error": "Missing API key"}, status_code=400)
 
         async with pool.acquire() as conn:
@@ -3640,6 +3781,7 @@ async def init_consent_request(req: InitConsentRequest):
                 model=model,
                 endpoint=endpoint,
                 api_key=api_key,
+                auth_mode=auth_mode,
                 messages=messages,
                 tools=[sign_consent_tool],
                 temperature=0.2,

@@ -38,7 +38,8 @@ async def test_authorization_code_flow_exchanges_without_exposing_secrets():
         patch("core.auth.openai_codex.save_openai_codex_credentials") as save,
         patch("core.auth.ui_flow._load_credentials", return_value=credentials),
     ):
-        started = await coordinator.start("openai-codex")
+        # The browser login is the fallback; the default is a one-time code.
+        started = await coordinator.start("openai-codex", {"flow": "browser"})
         completed = await coordinator.complete(
             started["session_id"],
             "http://localhost:1455/auth/callback?code=the-code&state=expected-state",
@@ -70,7 +71,8 @@ async def test_authorization_code_flow_rejects_state_from_another_attempt():
             new=AsyncMock(),
         ) as exchange,
     ):
-        started = await coordinator.start("openai-codex")
+        # The browser login is the fallback; the default is a one-time code.
+        started = await coordinator.start("openai-codex", {"flow": "browser"})
         with pytest.raises(AuthFlowError, match="does not match"):
             await coordinator.complete(
                 started["session_id"],

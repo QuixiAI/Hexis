@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 import { POST } from "./route";
 import { prisma } from "@/lib/prisma";
@@ -28,7 +29,7 @@ describe("/api/automations/decide", () => {
     ]);
 
     const response = await POST(
-      new Request("http://localhost/api/automations/decide", {
+      new NextRequest("http://localhost/api/automations/decide", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID, decision: "accept" }),
@@ -45,7 +46,7 @@ describe("/api/automations/decide", () => {
 
   it("rejects unknown decisions before touching the database", async () => {
     const response = await POST(
-      new Request("http://localhost/api/automations/decide", {
+      new NextRequest("http://localhost/api/automations/decide", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID, decision: "later" }),
@@ -71,7 +72,7 @@ describe("/api/automations/decide", () => {
     ]);
 
     const response = await POST(
-      new Request("http://localhost/api/automations/decide", {
+      new NextRequest("http://localhost/api/automations/decide", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID, decision: "dismiss" }),

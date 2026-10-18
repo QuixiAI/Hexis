@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 import { POST } from "./route";
 import { prisma } from "@/lib/prisma";
 
@@ -11,7 +12,7 @@ describe("/api/learning-review/decide", () => {
 
   it("records an explicit correction", async () => {
     query.mockResolvedValueOnce([{ result: { ok: true, status: "corrected" } }]);
-    const response = await POST(new Request("http://localhost/api/learning-review/decide", {
+    const response = await POST(new NextRequest("http://localhost/api/learning-review/decide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: ID, action: "correct", correction: "The call is Friday." }),
@@ -33,7 +34,7 @@ describe("/api/learning-review/decide", () => {
       error: "load_bearing_confirmation_required",
       message: "Nothing changed.",
     } }]);
-    const response = await POST(new Request("http://localhost/api/learning-review/decide", {
+    const response = await POST(new NextRequest("http://localhost/api/learning-review/decide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: ID, action: "forget" }),

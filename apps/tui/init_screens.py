@@ -59,6 +59,9 @@ _DEFAULT_MODELS: dict[str, str] = {
     "minimax-portal": "MiniMax-M1",
     "google-gemini-cli": "gemini-2.5-flash",
     "google-antigravity": "gemini-2.5-flash",
+    # The live catalog (models.dev) fills these in; nothing sensible to guess.
+    "xai-oauth": "", "openrouter": "", "deepseek": "", "zai": "", "qwen": "", "qwen_coding": "",
+    "meta": "", "minimax": "", "azure_openai": "", "bedrock": "", "vertex": "",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
@@ -73,7 +76,27 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "minimax-portal": "",
     "google-gemini-cli": "",
     "google-antigravity": "",
+    "xai-oauth": "",
+    "openrouter": "OPENROUTER_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+    "qwen_coding": "QWEN_API_KEY",
+    "meta": "META_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "azure_openai": "AZURE_OPENAI_API_KEY",
+    "bedrock": "AWS_BEARER_TOKEN_BEDROCK",
+    "vertex": "",
 }
+
+# Clouds whose target is a resource URL, a region, or a project/location.
+_CLOUD_TARGET: dict[str, tuple[str, str, str]] = {
+    # provider -> (field label, placeholder, default)
+    "azure_openai": ("Azure OpenAI resource URL (required)", "https://<resource>.openai.azure.com", ""),
+    "bedrock": ("AWS region", "us-east-1", "us-east-1"),
+    "vertex": ("Vertex AI target (required)", "projects/<project-id>/locations/<region>", ""),
+}
+_KEY_OPTIONAL: set[str] = {"bedrock", "vertex", "openai_compatible"}
 
 _PROVIDER_OPTIONS: list[tuple[str, str]] = [
     ("OpenAI Codex (ChatGPT OAuth)", "openai-codex"),
@@ -87,6 +110,17 @@ _PROVIDER_OPTIONS: list[tuple[str, str]] = [
     ("MiniMax Portal (OAuth)", "minimax-portal"),
     ("Google Gemini CLI (OAuth)", "google-gemini-cli"),
     ("Google Antigravity (OAuth)", "google-antigravity"),
+    ("xAI SuperGrok (OAuth)", "xai-oauth"),
+    ("OpenRouter (API key)", "openrouter"),
+    ("DeepSeek (API key)", "deepseek"),
+    ("Z.ai GLM (API key)", "zai"),
+    ("Qwen Model Studio (API key)", "qwen"),
+    ("Qwen Coding Plan (API key)", "qwen_coding"),
+    ("MiniMax (API key)", "minimax"),
+    ("Meta Muse (API key)", "meta"),
+    ("Azure OpenAI (API key + resource URL)", "azure_openai"),
+    ("Amazon Bedrock (API key or AWS credentials)", "bedrock"),
+    ("Google Vertex AI (service account or Google credentials)", "vertex"),
 ]
 
 _OAUTH_PROVIDERS: set[str] = {
@@ -97,6 +131,7 @@ _OAUTH_PROVIDERS: set[str] = {
     "minimax-portal",
     "google-gemini-cli",
     "google-antigravity",
+    "xai-oauth",
 }
 
 
@@ -114,6 +149,7 @@ def _normalize_provider(raw: str) -> str:
         "minimax_portal": "minimax-portal",
         "google_gemini_cli": "google-gemini-cli",
         "google_antigravity": "google-antigravity",
+        "xai_oauth": "xai-oauth",
     }
     return aliases.get(val, val)
 
@@ -179,7 +215,7 @@ class LLMConfigScreen(Screen):
 
     def compose(self) -> ComposeResult:
         provider_default = _normalize_provider(os.getenv("LLM_PROVIDER", "openai"))
-        if provider_default not in _DEFAULT_MODELS:
+        if provider_default not in _PROVIDER_ENV_VARS and provider_default not in _OAUTH_PROVIDERS:
             provider_default = "openai"
         model_default = os.getenv("LLM_MODEL", _DEFAULT_MODELS.get(provider_default, "gpt-4o"))
         endpoint_default = self._default_endpoint(provider_default)
@@ -207,7 +243,7 @@ class LLMConfigScreen(Screen):
             )
             yield ModelMenu(id="model-menu")
 
-            yield Label("Endpoint (blank for provider default)", classes="form-label")
+            yield Label("Endpoint (blank for provider default)", classes="form-label", id="endpoint-label")
             yield Input(
                 value=endpoint_default,
                 placeholder="https://...",
@@ -236,7 +272,7 @@ class LLMConfigScreen(Screen):
         value = provider_widget.value
         if isinstance(value, str):
             provider = _normalize_provider(value)
-            if provider in _DEFAULT_MODELS:
+            if provider in _PROVIDER_ENV_VARS or provider in _OAUTH_PROVIDERS:
                 return provider
         return "openai"
 
@@ -266,16 +302,34 @@ class LLMConfigScreen(Screen):
             else:
                 help_text.update("Next runs provider OAuth/device-code login.")
         else:
+            endpoint_label = self.query_one("#endpoint-label", Label)
             endpoint_input.disabled = False
-            endpoint_input.placeholder = "https://..."
-            if not preserve_endpoint:
-                endpoint_input.value = self._default_endpoint(provider)
+            if provider in _CLOUD_TARGET:
+                label, placeholder, default = _CLOUD_TARGET[provider]
+                endpoint_label.update(label)
+                endpoint_input.placeholder = placeholder
+                if not preserve_endpoint or not endpoint_input.value:
+                    endpoint_input.value = default
+            else:
+                endpoint_label.update("Endpoint (blank for provider default)")
+                endpoint_input.placeholder = "https://..."
+                if not preserve_endpoint:
+                    endpoint_input.value = self._default_endpoint(provider)
             key_input.disabled = False
-            key_input.placeholder = "e.g. OPENAI_API_KEY"
-            default_key = _PROVIDER_ENV_VARS.get(provider, "")
-            if default_key:
-                key_input.value = default_key
-            help_text.update("")
+            key_input.placeholder = (
+                "Optional — blank uses the server's cloud credentials"
+                if provider in ("bedrock", "vertex") else "e.g. OPENAI_API_KEY"
+            )
+            key_input.value = _PROVIDER_ENV_VARS.get(provider, "")
+            help_text.update(
+                "Bedrock serves Claude and other models; the key is optional with AWS credentials."
+                if provider == "bedrock"
+                else "Gemini and Claude models both work; paste a service-account key path in the env var, or leave blank for Application Default Credentials."
+                if provider == "vertex"
+                else "The model field holds the Azure deployment name."
+                if provider == "azure_openai"
+                else ""
+            )
 
     def on_mount(self) -> None:
         self._apply_provider_defaults(
@@ -309,6 +363,10 @@ class LLMConfigScreen(Screen):
         models = await model_catalog.fetch_models(provider, endpoint=endpoint or None)
         try:
             self.query_one("#model-menu", ModelMenu).populate(models)
+            # A provider with no guessable default takes the catalog's pick.
+            model_input = self.query_one("#model", Input)
+            if not model_input.value.strip() and models:
+                model_input.value = model_catalog.recommended_default(provider, models)
         except Exception:
             pass
 
@@ -427,6 +485,21 @@ class LLMConfigScreen(Screen):
             allow_manual_fallback=False,
         )
 
+    @staticmethod
+    def _missing_field(provider: str, model: str, endpoint: str, api_key_env: str) -> str | None:
+        """What stops this form from being saved, in the user's words."""
+        if not model:
+            return "Enter a model." if provider != "azure_openai" else "Enter the Azure deployment name."
+        if provider in ("openai_compatible", "azure_openai") and not endpoint:
+            return "Enter the endpoint." if provider == "openai_compatible" else "Enter the Azure OpenAI resource URL."
+        if provider == "vertex":
+            from core.llm import parse_vertex_endpoint
+            if not parse_vertex_endpoint(endpoint)[0]:
+                return "Enter the Vertex AI target as projects/<project-id>/locations/<region>."
+        if provider not in _OAUTH_PROVIDERS and provider not in _KEY_OPTIONAL and not api_key_env:
+            return "Enter the API key env var name."
+        return None
+
     def _test_connection(self) -> None:
         """Advisory: make one real call to check the current form's config works."""
         import os as _os
@@ -478,6 +551,11 @@ class LLMConfigScreen(Screen):
         if state.provider in _OAUTH_PROVIDERS:
             # OAuth providers don't use API key env vars in llm config.
             state.api_key_env = ""
+
+        problem = self._missing_field(state.provider, state.model, state.endpoint, state.api_key_env)
+        if problem:
+            self.query_one("#llm-status", Static).update(Text(problem, style=Style(color=COLORS["danger"])))
+            return
 
         # Subconscious defaults to same config
         state.sub_provider = state.provider

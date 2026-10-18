@@ -1,17 +1,34 @@
+/**
+ * The whole first-run journey, in a real browser: Models → Express → Consent
+ * → Complete, with the dashboard, the Python API and a fresh database.
+ *
+ * Prerequisites (the same ones `hexis up` provides):
+ *   - the compose `db` service running (COMPOSE_PROJECT_NAME / POSTGRES_* are
+ *     honoured, so an isolated test project works: see tests in CI)
+ *   - an embedding service the database can reach (the sidecar, or
+ *     ops/ci/fake_embeddings.py on port 42666)
+ *   - the Python venv at ../.venv (or HEXIS_PYTHON pointing at a python)
+ *
+ * Consent is mocked (HEXIS_CONSENT_MOCK=1), so no model is called. The API
+ * runs with its own HOME, so the test's API key never touches ~/.hexis.
+ */
 import { expect, test } from "@playwright/test";
 import { spawn, spawnSync } from "child_process";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { PrismaClient } from "@prisma/client";
 import { normalizeJsonValue } from "../lib/db";
 
-const uiPort = 3477;
+const uiPort = Number(process.env.HEXIS_UI_PORT || 3479);
+const apiPort = Number(process.env.HEXIS_E2E_API_PORT || 43819);
 const repoRoot = path.resolve(__dirname, "../..");
 const uiRoot = path.resolve(repoRoot, "hexis-ui");
 
-const envConfig = loadEnvConfig(repoRoot);
-const pgUser = envConfig.POSTGRES_USER || "postgres";
-const pgPassword = envConfig.POSTGRES_PASSWORD || "password";
+const envConfig = { ...loadEnvConfig(repoRoot), ...process.env } as Record<string, string | undefined>;
+// Compose defaults (docker-compose.yml), not generic Postgres ones.
+const pgUser = envConfig.POSTGRES_USER || "hexis_user";
+const pgPassword = envConfig.POSTGRES_PASSWORD || "hexis_password";
 const pgPort = envConfig.POSTGRES_PORT || "43815";
 const pgDatabase = envConfig.POSTGRES_DB || "hexis_memory";
 const bindAddress = envConfig.HEXIS_BIND_ADDRESS || "127.0.0.1";
@@ -20,212 +37,140 @@ const dbName = `hexis_ui_e2e_${Date.now()}`;
 const dbUrl = `postgresql://${encodeURIComponent(pgUser)}:${encodeURIComponent(
   pgPassword
 )}@${pgHost}:${pgPort}/${dbName}`;
+const pythonBin = process.env.HEXIS_PYTHON || path.join(repoRoot, ".venv", "bin", "python");
 
-let serverProcess: ReturnType<typeof spawn> | null = null;
+let uiProcess: ReturnType<typeof spawn> | null = null;
+let apiProcess: ReturnType<typeof spawn> | null = null;
 let prisma: PrismaClient | null = null;
-let serverLogs = "";
+let apiHome = "";
+let logs = "";
 
 test.beforeAll(async () => {
   await waitForPostgres();
   await waitForPostgresStable(pgDatabase);
-  await waitForEmbeddings();
   createDatabase(dbName);
   applySchema(dbName);
+  await waitForEmbeddings(dbName);
 
-  serverProcess = spawn("bun", ["run", "dev"], {
+  // The API owns model setup; its auth store lives under HOME, so give it one of its own.
+  apiHome = fs.mkdtempSync(path.join(os.tmpdir(), "hexis-e2e-home-"));
+  apiProcess = spawn(pythonBin, ["-m", "apps.hexis_api", "--port", String(apiPort)], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      HOME: apiHome,
+      POSTGRES_HOST: pgHost,
+      POSTGRES_PORT: pgPort,
+      POSTGRES_USER: pgUser,
+      POSTGRES_PASSWORD: pgPassword,
+      POSTGRES_DB: dbName,
+      HEXIS_CONSENT_MOCK: "1",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  capture(apiProcess, "api");
+
+  uiProcess = spawn(path.join(uiRoot, "node_modules", ".bin", "next"), ["dev", "-p", String(uiPort)], {
     cwd: uiRoot,
     env: {
       ...process.env,
       DATABASE_URL: dbUrl,
       HEXIS_DATABASE_URL: dbUrl,
-      OPENAI_API_KEY: "test",
-      OPENAI_MODEL: "gpt-4o-mini",
-      OPENAI_BASE_URL: "https://api.openai.com/v1",
-      HEXIS_CONSENT_MOCK: "1",
+      HEXIS_API_URL: `http://127.0.0.1:${apiPort}`,
       HEXIS_UI_PORT: String(uiPort),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  capture(uiProcess, "ui");
 
-  if (serverProcess.stdout) {
-    serverProcess.stdout.on("data", (chunk) => {
-      serverLogs += chunk.toString();
-    });
-  }
+  await waitForServer(`http://127.0.0.1:${apiPort}/api/init/auth/status?provider=openai-codex`, 90000);
+  await waitForServer(`http://127.0.0.1:${uiPort}/api/init/status`, 90000);
 
-  if (serverProcess.stderr) {
-    serverProcess.stderr.on("data", (chunk) => {
-      serverLogs += chunk.toString();
-    });
-  }
-
-  await waitForServer(`http://127.0.0.1:${uiPort}/api/init/status`, 60000);
-
-  prisma = new PrismaClient({
-    datasources: { db: { url: dbUrl } },
-  });
+  prisma = new PrismaClient({ datasources: { db: { url: dbUrl } } });
 });
 
 test.afterAll(async () => {
-  if (prisma) {
-    await prisma.$disconnect();
-  }
-
-  if (serverProcess) {
-    serverProcess.kill("SIGTERM");
-    await new Promise((resolve) => {
-      serverProcess?.once("exit", resolve);
-      setTimeout(resolve, 5000);
-    });
-  }
-
+  await prisma?.$disconnect();
+  await stop(uiProcess);
+  await stop(apiProcess);
+  if (apiHome) fs.rmSync(apiHome, { recursive: true, force: true });
   dropDatabase(dbName);
 });
 
-test("completes the initialization ritual and persists data", async ({ page }) => {
+test("sets up models, applies express defaults, gains consent, and persists it all", async ({ page }) => {
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "Models" })).toBeVisible();
-  const apiKeyFields = page.getByPlaceholder("Required");
-  await apiKeyFields.nth(0).fill("test-key");
-  await apiKeyFields.nth(1).fill("test-key");
+  // --- Models: one entry per vendor; OpenAI with an API key. ---
+  await expect(page.getByText("Configure the models for the conscious and subconscious layers.")).toBeVisible();
+  await expect(page.getByLabel("Provider")).toHaveValue("openai");
+  // Codex is the login inside the OpenAI form, not a provider of its own.
+  await expect(page.getByRole("option", { name: /Codex/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Log in with ChatGPT" })).toBeVisible();
+  await page.getByRole("textbox", { name: "API key" }).fill("test-key");
+  await page.getByRole("textbox", { name: "Model", exact: true }).fill("gpt-4o");
   await page.getByRole("button", { name: "Save Models" }).click();
-  await expect(page.getByRole("heading", { name: "Welcome" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Begin Initialization" }).click();
-  await expect(page.getByRole("heading", { name: "Mode" })).toBeVisible();
+  // --- Choose a path: Express. ---
+  await expect(page.getByRole("button", { name: /Express/ })).toBeVisible();
+  await page.getByRole("button", { name: /Express/ }).click();
+  await page.getByLabel("What should Hexis call you?").fill("Erin");
+  await page.getByRole("button", { name: "Go" }).click();
 
+  // --- Consent: both models are asked; the mock answers yes. ---
+  await expect(page.getByRole("button", { name: "Request Consent" })).toBeVisible();
+  await page.getByRole("button", { name: "Request Consent" }).click();
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Heartbeat" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Enter Hexis" })).toBeVisible();
 
-  await page.getByPlaceholder("60").fill("45");
-  await page.getByPlaceholder("2048").fill("1500");
-  await page.getByPlaceholder("10").fill("8");
-  await page.getByPlaceholder("20").fill("30");
-  await page.getByRole("checkbox", { name: "Reach Out Public" }).click();
-  await page.getByRole("checkbox", { name: "Queue User Message" }).click();
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Name and Voice" })).toBeVisible();
-
-  await page.getByPlaceholder("Hexis").fill("Astra");
-  await page.getByPlaceholder("they/them").fill("she/her");
-  await page.getByPlaceholder("thoughtful and curious").fill("bright and steady");
-  await page
-    .getByPlaceholder("A brief, humane description of who they are.")
-    .fill("A steadfast companion in discovery.");
-  await page
-    .getByPlaceholder("To be helpful, to learn, to grow.")
-    .fill("To explore, to build, to refine.");
-  await page.getByPlaceholder("Your name").fill("Erin");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Personality" })).toBeVisible();
-
-  await page.getByPlaceholder("Thoughtful, playful, direct.").fill("Warm and direct.");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Values" })).toBeVisible();
-
-  await page.getByPlaceholder(/honesty/i).fill("truth\ncuriosity\ncare");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Worldview" })).toBeVisible();
-
-  await page.getByPlaceholder("I am metaphysics...").fill("Reality is relational.");
-  await page.getByPlaceholder("I am human nature...").fill("Humans seek meaning.");
-  await page
-    .getByPlaceholder("I am epistemology...")
-    .fill("Knowledge grows through inquiry.");
-  await page.getByPlaceholder("I am ethics...").fill("Care before control.");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Boundaries" })).toBeVisible();
-
-  await page
-    .getByPlaceholder("I will not deceive people or falsify evidence.")
-    .fill("I will not cause harm.");
-  await page
-    .getByPlaceholder("Trigger patterns (one per line)")
-    .fill("harm\nviolence");
-  await page.getByPlaceholder("Response template (optional)").fill("I cannot assist with harm.");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Interests" })).toBeVisible();
-
-  await page.getByPlaceholder(/philosophy/i).fill("philosophy\nsystems\nart");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Goals and Purpose" })).toBeVisible();
-
-  await page
-    .getByPlaceholder("Help the user grow, learn, and build.")
-    .fill("Help build Hexis with care.");
-  await page.getByPlaceholder("Short goal title").fill("Stabilize memory core");
-  await page.getByPlaceholder("Optional description").fill("Anchor early experiences.");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Relationship" })).toBeVisible();
-
-  await page.getByPlaceholder("User").fill("Erin");
-  await page.getByPlaceholder("partner").fill("collaborator");
-  await page.getByPlaceholder("Co-develop, learn, build.").fill("Build together.");
-  await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: "Consent" })).toBeVisible();
-
-  await page.getByRole("button", { name: "Request Consent (Both)" }).click();
-  const continueButton = page.getByRole("button", { name: "Continue" });
-  await expect(continueButton).toBeVisible();
-  await continueButton.click();
-  await expect(page.getByRole("heading", { name: "Complete" })).toBeVisible();
-
+  // --- What the database and the auth store hold afterwards. ---
   expect(prisma).not.toBeNull();
-  if (!prisma) {
-    return;
-  }
+  if (!prisma) return;
 
-  const statusRows = await prisma.$queryRaw<{ status: unknown }[]>`
-    SELECT get_init_status() as status
-  `;
+  const statusRows = await prisma.$queryRaw<{ status: unknown }[]>`SELECT get_init_status() as status`;
   const status = normalizeJsonValue(statusRows[0]?.status) as { stage?: string } | null;
   expect(status?.stage).toBe("complete");
 
   const configuredRows = await prisma.$queryRaw<{ configured: unknown }[]>`
     SELECT get_config('agent.is_configured') as configured
   `;
-  const configured = normalizeJsonValue(configuredRows[0]?.configured);
-  expect(Boolean(configured)).toBe(true);
+  expect(Boolean(normalizeJsonValue(configuredRows[0]?.configured))).toBe(true);
 
   const profileRows = await prisma.$queryRaw<{ profile: unknown }[]>`
     SELECT get_config('agent.init_profile') as profile
   `;
-  const profile = normalizeJsonValue(profileRows[0]?.profile) as {
-    agent?: { name?: string; tools?: string[] };
-    user?: { name?: string };
-    heartbeat?: {
-      interval_minutes?: number;
-      decision_max_tokens?: number;
-      base_regeneration?: number;
-      max_energy?: number;
-      allowed_actions?: string[];
-      action_costs?: Record<string, number>;
-    };
-  } | null;
-  expect(profile?.agent?.name).toBe("Astra");
+  const profile = normalizeJsonValue(profileRows[0]?.profile) as { user?: { name?: string } } | null;
   expect(profile?.user?.name).toBe("Erin");
-  expect(profile?.heartbeat?.interval_minutes).toBe(45);
-  expect(profile?.heartbeat?.decision_max_tokens).toBe(1500);
-  expect(profile?.heartbeat?.base_regeneration).toBe(8);
-  expect(profile?.heartbeat?.max_energy).toBe(30);
-  expect(profile?.heartbeat?.allowed_actions).not.toContain("reach_out_public");
-  expect(profile?.heartbeat?.action_costs?.reflect).toBe(2);
-  expect(profile?.agent?.tools).not.toContain("queue_user_message");
 
   const consentRows = await prisma.$queryRaw<{ decision: string }[]>`
     SELECT decision FROM consent_log ORDER BY decided_at DESC LIMIT 1
   `;
   expect(consentRows[0]?.decision).toBe("consent");
 
-  const memoryRows = await prisma.$queryRaw<{ count: bigint }[]>`
-    SELECT COUNT(*)::bigint as count
-    FROM memories
-    WHERE type = 'worldview'
-      AND content = 'My name is Astra.'
-  `;
-  expect(Number(memoryRows[0]?.count ?? 0)).toBeGreaterThan(0);
+  // The key went to the API's auth store; the config holds only a reference.
+  const llmRows = await prisma.$queryRaw<{ llm: unknown }[]>`SELECT get_config('llm.chat') as llm`;
+  const llm = normalizeJsonValue(llmRows[0]?.llm) as Record<string, unknown> | null;
+  expect(llm).toMatchObject({ provider: "openai", model: "gpt-4o", api_key_ref: "llm.conscious" });
+  expect(llm).not.toHaveProperty("api_key");
+  const stored = JSON.parse(fs.readFileSync(path.join(apiHome, ".hexis", "auth", "llm.conscious.json"), "utf-8"));
+  expect(stored.api_key).toBe("test-key");
+  for (const envFile of [path.join(repoRoot, ".env"), path.join(uiRoot, ".env.local")]) {
+    if (fs.existsSync(envFile)) expect(fs.readFileSync(envFile, "utf-8")).not.toContain("test-key");
+  }
 });
+
+function capture(proc: ReturnType<typeof spawn>, name: string) {
+  proc.stdout?.on("data", (chunk) => { logs += `[${name}] ${chunk}`; });
+  proc.stderr?.on("data", (chunk) => { logs += `[${name}] ${chunk}`; });
+}
+
+async function stop(proc: ReturnType<typeof spawn> | null) {
+  if (!proc) return;
+  proc.kill("SIGTERM");
+  await new Promise((resolve) => {
+    proc.once("exit", resolve);
+    setTimeout(resolve, 5000);
+  });
+}
 
 function loadEnvConfig(rootDir: string) {
   const envPath = [".env.local", ".env"].map((name) => path.join(rootDir, name)).find(fs.existsSync);
@@ -236,13 +181,9 @@ function loadEnvConfig(rootDir: string) {
   const entries: Record<string, string> = {};
   for (const rawLine of content.split("\n")) {
     const line = rawLine.trim();
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
+    if (!line || line.startsWith("#")) continue;
     const idx = line.indexOf("=");
-    if (idx <= 0) {
-      continue;
-    }
+    if (idx <= 0) continue;
     const key = line.slice(0, idx).trim();
     let value = line.slice(idx + 1).trim();
     if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
@@ -253,20 +194,22 @@ function loadEnvConfig(rootDir: string) {
   return entries;
 }
 
+function composeExecDb(args: string[], input?: string) {
+  // COMPOSE_PROJECT_NAME in the environment selects the compose project.
+  return spawnSync("docker", ["compose", "exec", "-T", "db", ...args], {
+    cwd: repoRoot,
+    encoding: "utf-8",
+    input,
+  });
+}
+
 async function waitForPostgres(timeoutMs = 60000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const result = spawnSync(
-      "docker",
-      ["compose", "exec", "-T", "db", "pg_isready", "-U", pgUser],
-      { cwd: repoRoot, encoding: "utf-8" }
-    );
-    if (result.status === 0) {
-      return;
-    }
+    if (composeExecDb(["pg_isready", "-U", pgUser]).status === 0) return;
     await delay(1000);
   }
-  throw new Error("Postgres did not become ready in time.");
+  throw new Error("Postgres did not become ready in time. Is the compose db service running?");
 }
 
 async function waitForPostgresStable(database: string, timeoutMs = 120000) {
@@ -274,64 +217,34 @@ async function waitForPostgresStable(database: string, timeoutMs = 120000) {
   let stableCount = 0;
   let lastStart = "";
   while (Date.now() - start < timeoutMs) {
-    const result = spawnSync(
-      "docker",
-      [
-        "compose",
-        "exec",
-        "-T",
-        "db",
-        "psql",
-        "-U",
-        pgUser,
-        "-d",
-        database,
-        "-t",
-        "-A",
-        "-c",
-        "SELECT pg_postmaster_start_time()::text;",
-      ],
-      { cwd: repoRoot, encoding: "utf-8" }
-    );
+    const result = composeExecDb([
+      "psql", "-U", pgUser, "-d", database, "-t", "-A", "-c", "SELECT pg_postmaster_start_time()::text;",
+    ]);
     if (result.status === 0) {
       const currentStart = result.stdout.trim();
-      if (currentStart && currentStart === lastStart) {
-        stableCount += 1;
-      } else {
-        stableCount = 0;
-        lastStart = currentStart;
-      }
-      if (stableCount >= 3) {
-        return;
-      }
+      if (currentStart && currentStart === lastStart) stableCount += 1;
+      else { stableCount = 0; lastStart = currentStart; }
+      if (stableCount >= 3) return;
     }
     await delay(1000);
   }
   throw new Error("Postgres did not reach a stable ready state.");
 }
 
-async function waitForEmbeddings(timeoutMs = 120000) {
+// The database embeds memories itself; ask it, rather than any one container,
+// whether its embedding service answers.
+async function waitForEmbeddings(database: string, timeoutMs = 120000) {
   const start = Date.now();
+  let last = "";
   while (Date.now() - start < timeoutMs) {
-    const result = spawnSync(
-      "docker",
-      [
-        "compose",
-        "exec",
-        "-T",
-        "embeddings",
-        "curl",
-        "-f",
-        "http://localhost:80/health",
-      ],
-      { cwd: repoRoot, encoding: "utf-8" }
-    );
-    if (result.status === 0) {
-      return;
-    }
+    const result = composeExecDb([
+      "psql", "-U", pgUser, "-d", database, "-t", "-A", "-c", "SELECT check_embedding_service_health();",
+    ]);
+    last = (result.stdout || result.stderr || "").trim();
+    if (result.status === 0 && last.startsWith("t")) return;
     await delay(1000);
   }
-  throw new Error("Embedding service did not become ready in time.");
+  throw new Error(`The embedding service did not become ready in time (${last}).`);
 }
 
 function createDatabase(name: string) {
@@ -340,30 +253,13 @@ function createDatabase(name: string) {
 
 function applySchema(name: string) {
   const schemaDir = path.resolve(repoRoot, "db");
-  const schemaFiles = fs
+  const schemaSql = fs
     .readdirSync(schemaDir)
     .filter((file) => file.endsWith(".sql"))
-    .sort();
-  const schemaSql = schemaFiles
+    .sort()
     .map((file) => fs.readFileSync(path.join(schemaDir, file), "utf-8"))
     .join("\n\n");
-  const result = spawnSync(
-    "docker",
-    [
-      "compose",
-      "exec",
-      "-T",
-      "db",
-      "psql",
-      "-U",
-      pgUser,
-      "-d",
-      name,
-      "-v",
-      "ON_ERROR_STOP=1",
-    ],
-    { cwd: repoRoot, encoding: "utf-8", input: schemaSql }
-  );
+  const result = composeExecDb(["psql", "-U", pgUser, "-d", name, "-v", "ON_ERROR_STOP=1"], schemaSql);
   if (result.status !== 0) {
     throw new Error(`Schema apply failed: ${result.stderr || result.stdout}`);
   }
@@ -378,25 +274,7 @@ function dropDatabase(name: string) {
 }
 
 function runDockerPsql(sql: string, database: string) {
-  const result = spawnSync(
-    "docker",
-    [
-      "compose",
-      "exec",
-      "-T",
-      "db",
-      "psql",
-      "-U",
-      pgUser,
-      "-d",
-      database,
-      "-v",
-      "ON_ERROR_STOP=1",
-      "-t",
-      "-A",
-    ],
-    { cwd: repoRoot, input: sql, encoding: "utf-8" }
-  );
+  const result = composeExecDb(["psql", "-U", pgUser, "-d", database, "-v", "ON_ERROR_STOP=1", "-t", "-A"], sql);
   if (result.status !== 0) {
     throw new Error(`psql failed: ${result.stderr || result.stdout}`);
   }
@@ -408,15 +286,13 @@ async function waitForServer(url: string, timeoutMs: number) {
   while (Date.now() - start < timeoutMs) {
     try {
       const res = await fetch(url, { cache: "no-store" });
-      if (res.ok) {
-        return;
-      }
+      if (res.ok) return;
     } catch {
-      // ignore
+      // not up yet
     }
     await delay(500);
   }
-  throw new Error(`UI server did not start. Logs:\n${serverLogs}`);
+  throw new Error(`Server at ${url} did not start. Logs:\n${logs}`);
 }
 
 function delay(ms: number) {
