@@ -2359,3 +2359,32 @@ class TestActionClaimGuardrail:
                 await conn.execute(
                     "UPDATE config SET value = 'false'::jsonb WHERE key = 'guardrails.action_claims.llm_verifier_enabled'"
                 )
+
+
+class TestHeartbeatYieldsToChat:
+    @patch("core.agent_loop.chat_completion")
+    async def test_heartbeat_calls_wait_for_a_live_chat_turn(self, mock_llm, monkeypatch):
+        calls = []
+
+        async def _wait(pool, *, max_wait_seconds=None):
+            calls.append(max_wait_seconds)
+            return 0.0
+
+        monkeypatch.setattr("core.chat_priority.wait_for_chat_idle", _wait)
+        mock_llm.return_value = _text_response("done")
+        agent = AgentLoop(_make_config(tool_context=ToolContext.HEARTBEAT, heartbeat_id=str(uuid.uuid4())))
+        await agent.run("Heartbeat")
+        assert calls == [60.0]
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_chat_never_waits_for_itself(self, mock_llm, monkeypatch):
+        calls = []
+
+        async def _wait(pool, *, max_wait_seconds=None):
+            calls.append(max_wait_seconds)
+            return 0.0
+
+        monkeypatch.setattr("core.chat_priority.wait_for_chat_idle", _wait)
+        mock_llm.return_value = _text_response("hi")
+        await AgentLoop(_make_config()).run("Hello")
+        assert calls == []

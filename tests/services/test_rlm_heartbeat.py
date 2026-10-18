@@ -11,6 +11,7 @@ from services.hexis_rlm import (
     find_final_answer,
     format_execution_result,
     format_iteration,
+    observed_part,
     resolve_final_answer,
 )
 from services.rlm_repl import HexisLocalREPL, REPLResult
@@ -18,6 +19,33 @@ from services.rlm_repl import HexisLocalREPL, REPLResult
 
 class TestParsing:
     """Unit tests for vendored parsing utilities."""
+
+    def test_observed_part_drops_invented_output_and_guessed_final(self):
+        text = (
+            "Let me look.\n```repl\nprint(context.keys())\n```\n\n"
+            "**Result:**\n```\n['goals', 'energy']\n```\n"
+            "```repl\nescalate('ADV-1')\n```\n"
+            'FINAL({"reasoning": "escalated", "actions": []})'
+        )
+        kept = observed_part(text)
+        assert kept == "Let me look.\n```repl\nprint(context.keys())\n```"
+        assert find_code_blocks(kept) == ["print(context.keys())"]
+        assert find_final_answer(kept) is None
+
+    def test_observed_part_keeps_final_var_naming_the_block_variable(self):
+        text = "```repl\nanswer = '{}'\n```\nFINAL_VAR(answer)\nmore guessing"
+        assert observed_part(text) == "```repl\nanswer = '{}'\n```\nFINAL_VAR(answer)"
+
+    def test_continue_prompt_states_the_step_budget(self):
+        from services.hexis_rlm import _build_user_prompt
+
+        prompt = _build_user_prompt(3, max_iterations=10)["content"]
+        assert prompt.startswith("Step 4 of 10.")
+        assert "FINAL" in prompt
+
+    def test_observed_part_leaves_responses_without_code_alone(self):
+        text = 'Done.\nFINAL({"actions": []})'
+        assert observed_part(text) == text
 
     def test_find_code_blocks_single(self):
         text = "Here is code:\n```repl\nprint('hello')\n```\nDone."
@@ -308,7 +336,8 @@ class TestReplToolBridge:
 
         tools = await asyncio.to_thread(bridge.list_tools)
 
-        assert tools == [{
+        # work_on_goal is the bridge's own entry, not a registry tool.
+        assert [tool for tool in tools if tool["name"] != "work_on_goal"] == [{
             "name": "get_procedures",
             "description": "get_procedures description",
             "energy_cost": 2,
@@ -342,7 +371,7 @@ class TestReplToolBridge:
 
         tools = bridge.list_tools()
 
-        assert [tool["name"] for tool in tools] == ["self_repair"]
+        assert [tool["name"] for tool in tools] == ["self_repair", "work_on_goal"]
         assert tools[0]["parameters"]["required"] == ["task"]
 
     def test_tool_call_record_to_action_taken(self):
@@ -514,3 +543,38 @@ class TestTotalLlmFailure:
                 loop=asyncio.get_running_loop(),
                 max_iterations=1,
             )
+
+
+async def test_scheduled_heartbeats_get_the_persons_shell_permission(monkeypatch):
+    """The hourly heartbeat used to be refused the shell even with heartbeat
+    commands switched on; it now gets the same permissions as a manual one."""
+    import services.hexis_rlm as hexis_rlm
+    from core.tools.config import ContextOverrides
+
+    seen: dict = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_bridge(**kwargs):
+        seen.update(kwargs)
+        raise Stop
+
+    class Config:
+        def get_context_overrides(self, context):
+            return ContextOverrides(allow_shell=True, allow_file_write=False)
+
+    class Registry:
+        async def get_config(self):
+            return Config()
+
+    monkeypatch.setattr(hexis_rlm, "MemoryRepo", lambda dsn: object())
+    monkeypatch.setattr(hexis_rlm, "ReplToolBridge", fake_bridge)
+    with pytest.raises(Stop):
+        await hexis_rlm.run_heartbeat_decision(
+            heartbeat_id="hb", turn_snapshot={"energy": {"current": 5}},
+            llm_config={"provider": "openai", "model": "stub"}, dsn="postgresql://unused",
+            tool_registry=Registry(), loop=asyncio.get_running_loop(),
+            max_iterations=1, timeout_seconds=10,
+        )
+    assert seen["allow_shell"] is True and seen["allow_file_write"] is False

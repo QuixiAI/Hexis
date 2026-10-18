@@ -65,6 +65,8 @@ SELECT set_config('agent.name', '"MyAgent"'::jsonb);
 | `heartbeat.outcome_regen_score_scale` | float | Regeneration multiplier added per outcome-score point (default `0.5`) |
 | `heartbeat.outcome_regen_ceiling_multiplier` | float | Maximum outcome-sensitive regeneration multiplier (default `1.5`) |
 | `heartbeat.task_energy_multiplier` | float | Maximum reserve multiple an actionable backlog beat may draw from the bank (default `2`) |
+| `rlm.heartbeat.user_goal_max_iterations` / `rlm.heartbeat.user_goal_timeout_seconds` | int | Steps and seconds a heartbeat may take while a goal the user set is active (defaults `40` / `1800`; otherwise `rlm.heartbeat.max_iterations` / `timeout_seconds`) |
+| `heartbeat.free_work_daily_token_cap` | int | Heartbeat model tokens per day after which work on the user's goals spends energy again; until then, tool calls serving a goal the user set cost nothing (default `5000000`, `0` = no cap) |
 | `heartbeat.cadence_min_minutes` | float | Shortest urgency-adjusted cadence (default `15`) |
 | `heartbeat.cadence_max_minutes` | float | Longest urgency-adjusted cadence (default `120`) |
 | `heartbeat.cadence_idle_multiplier` | float | Base-cadence multiplier at zero drive urgency (default `1.5`) |

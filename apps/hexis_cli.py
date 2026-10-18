@@ -5755,7 +5755,8 @@ async def _goals_create(
     try:
         async with pool.acquire() as conn:
             goal_id = await conn.fetchval(
-                "SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority)",
+                # The person's own goal: worked on without spending energy.
+                "SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority, NULL, NULL, 'user_request'::goal_source)",
                 title,
                 description,
                 source,

@@ -29,6 +29,7 @@ from services.prompt_resources import (
 )
 from services.rlm_memory_env import RLMMemoryEnv, RLMWorkspace, WorkspaceBudgets
 from services.rlm_repl import HexisLocalREPL, REPLResult
+from core.tools.base import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,28 @@ def _workspace_metrics(workspace: RLMWorkspace) -> dict[str, Any]:
 def find_code_blocks(text: str) -> list[str]:
     """Find REPL code blocks wrapped in ```repl ... ```."""
     return [m.group(1).strip() for m in _CODE_BLOCK_RE.finditer(text)]
+
+
+_FINAL_VAR_LINE_RE = re.compile(r"\s*FINAL_VAR\([^\n]*\)[^\n]*")
+
+
+def observed_part(text: str) -> str:
+    """The part of a response written before any REPL output could be seen.
+
+    The model sees a block's output only on the next iteration. Anything it
+    writes after its first ```repl``` block (invented output, further steps
+    built on it, a FINAL decided from it) is a guess, so the response ends
+    there. A FINAL_VAR directly after the block is kept: it only names a
+    variable the block assigns.
+    """
+    match = _CODE_BLOCK_RE.search(text)
+    if not match:
+        return text
+    end = match.end()
+    final_var = _FINAL_VAR_LINE_RE.match(text, end)
+    if final_var:
+        end = final_var.end()
+    return text[:end]
 
 
 def _find_final_var_name(text: str) -> str | None:
@@ -229,18 +252,44 @@ def format_iteration(response: str, code_blocks: list[str], results: list[REPLRe
 # LLM adapter
 # ---------------------------------------------------------------------------
 
+# Each threaded call is abandoned after 120 s (future.result timeouts below),
+# so the heartbeat waits for a live chat turn for at most this long.
+_HEARTBEAT_CHAT_WAIT_S = 60.0
+
+
+async def _yield_to_chat(dsn: str) -> None:
+    """Let a live chat turn go first: the person is waiting, the heartbeat is not."""
+    import asyncpg
+
+    from core.chat_priority import wait_for_chat_idle
+
+    try:
+        conn = await asyncpg.connect(dsn)
+    except Exception:
+        logger.debug("Could not check for a live chat turn", exc_info=True)
+        return
+    try:
+        await wait_for_chat_idle(conn, max_wait_seconds=_HEARTBEAT_CHAT_WAIT_S)
+    finally:
+        await conn.close()
+
+
 async def _llm_completion(
     messages: list[dict[str, str]],
     llm_config: dict[str, Any],
     max_tokens: int = 4096,
     *,
+    yield_to_chat_dsn: str | None = None,
     before_call: Callable[[], Awaitable[Any]] | None = None,
 ) -> str:
     """Call Hexis LLM and return the text response.
 
-    before_call is awaited first on the caller's loop; slow reading passes
-    the ingest pipeline's hook, so these calls yield to chat and are counted
-    like every other reading call."""
+    yield_to_chat_dsn makes the call wait for a live chat turn first (the
+    heartbeat passes it; chat never waits on itself). before_call is awaited
+    on the caller's loop; slow reading passes the ingest pipeline's hook, so
+    these calls yield to chat and are counted like every other reading call."""
+    if yield_to_chat_dsn:
+        await _yield_to_chat(yield_to_chat_dsn)
     if before_call is not None:
         await before_call()
     result = await chat_completion(
@@ -266,6 +315,7 @@ async def _llm_completion(
 def _make_sync_llm_query(
     llm_config: dict[str, Any],
     loop: asyncio.AbstractEventLoop,
+    yield_to_chat_dsn: str | None = None,
     before_call: Callable[[], Awaitable[Any]] | None = None,
 ) -> Callable[[str], str]:
     """Create a synchronous llm_query function for use in the REPL."""
@@ -277,7 +327,10 @@ def _make_sync_llm_query(
         ]
         try:
             future = asyncio.run_coroutine_threadsafe(
-                _llm_completion(messages, llm_config, max_tokens=2048, before_call=before_call),
+                _llm_completion(
+                    messages, llm_config, max_tokens=2048,
+                    yield_to_chat_dsn=yield_to_chat_dsn, before_call=before_call,
+                ),
                 loop,
             )
             return future.result(timeout=120)
@@ -314,12 +367,25 @@ _USER_PROMPT_CONTINUE = (
 )
 
 
-def _build_user_prompt(iteration: int, *, allow_direct_chat_final: bool = False) -> dict[str, str]:
+def _build_user_prompt(
+    iteration: int,
+    *,
+    allow_direct_chat_final: bool = False,
+    max_iterations: int | None = None,
+) -> dict[str, str]:
     if iteration == 0:
         if allow_direct_chat_final:
             return {"role": "user", "content": _CHAT_USER_PROMPT_FIRST}
         return {"role": "user", "content": _USER_PROMPT_FIRST}
-    return {"role": "user", "content": _USER_PROMPT_CONTINUE}
+    content = _USER_PROMPT_CONTINUE
+    if max_iterations:
+        # Without its budget the model explores until the loop cuts it off.
+        content = (
+            f"Step {iteration + 1} of {max_iterations}. Once you have what you need, "
+            "give your answer with FINAL(...) or FINAL_VAR(...) instead of exploring further.\n\n"
+            + content
+        )
+    return {"role": "user", "content": content}
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +400,7 @@ def _run_loop(
     max_iterations: int,
     allow_final_var: bool = True,
     allow_direct_chat_final: bool = False,
+    yield_to_chat_dsn: str | None = None,
     *,
     strict: bool = False,
     before_call: Callable[[], Awaitable[Any]] | None = None,
@@ -366,12 +433,19 @@ def _run_loop(
 
         # Build current prompt
         current_prompt = message_history + [
-            _build_user_prompt(i, allow_direct_chat_final=allow_direct_chat_final)
+            _build_user_prompt(
+                i,
+                allow_direct_chat_final=allow_direct_chat_final,
+                max_iterations=max_iterations,
+            )
         ]
 
         # Call LLM
         future = asyncio.run_coroutine_threadsafe(
-            _llm_completion(current_prompt, llm_config, max_tokens=4096, before_call=before_call),
+            _llm_completion(
+                current_prompt, llm_config, max_tokens=4096,
+                yield_to_chat_dsn=yield_to_chat_dsn, before_call=before_call,
+            ),
             loop,
         )
         try:
@@ -389,6 +463,13 @@ def _run_loop(
             if strict:
                 raise RLMCallError(f"model returned nothing at step {i + 1}")
             break
+        observed = observed_part(response)
+        if len(observed) < len(response):
+            logger.info(
+                "RLM iteration %d: dropped %d chars written after the first REPL block",
+                i + 1, len(response) - len(observed),
+            )
+        response = observed
 
         # Check for final answer BEFORE executing code. A bad FINAL_VAR is not
         # final; it becomes a repair message inside the RLM loop.
@@ -460,7 +541,10 @@ def _run_loop(
             ),
         })
         future = asyncio.run_coroutine_threadsafe(
-            _llm_completion(message_history, llm_config, max_tokens=4096, before_call=before_call),
+            _llm_completion(
+                message_history, llm_config, max_tokens=4096,
+                yield_to_chat_dsn=yield_to_chat_dsn, before_call=before_call,
+            ),
             loop,
         )
         try:
@@ -508,6 +592,29 @@ def _run_loop(
 # Heartbeat decision entry point
 # ---------------------------------------------------------------------------
 
+async def _heartbeat_limits(tool_registry: Any) -> tuple[int, int]:
+    """Reasoning steps and seconds for this heartbeat, from settings: larger
+    while a goal the user set is active, so work on it isn't cut off after
+    ten steps."""
+    try:
+        async with tool_registry.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT has_active_user_goal() AS user_goal,
+                       get_config_int('rlm.heartbeat.max_iterations') AS iterations,
+                       get_config_int('rlm.heartbeat.timeout_seconds') AS seconds,
+                       get_config_int('rlm.heartbeat.user_goal_max_iterations') AS user_iterations,
+                       get_config_int('rlm.heartbeat.user_goal_timeout_seconds') AS user_seconds
+                """
+            )
+    except Exception as exc:
+        logger.debug("heartbeat limits unavailable, using defaults: %s", exc)
+        return 10, 300
+    if row["user_goal"]:
+        return int(row["user_iterations"] or 40), int(row["user_seconds"] or 1800)
+    return int(row["iterations"] or 10), int(row["seconds"] or 300)
+
+
 async def run_heartbeat_decision(
     *,
     heartbeat_id: str,
@@ -516,8 +623,8 @@ async def run_heartbeat_decision(
     dsn: str,
     tool_registry: Any,
     loop: asyncio.AbstractEventLoop,
-    max_iterations: int = 10,
-    timeout_seconds: int = 300,
+    max_iterations: int | None = None,
+    timeout_seconds: int | None = None,
     workspace_budgets: WorkspaceBudgets | None = None,
 ) -> dict[str, Any]:
     """
@@ -527,6 +634,10 @@ async def run_heartbeat_decision(
     raw_response, metrics.
     """
     time_start = time.perf_counter()
+    if max_iterations is None or timeout_seconds is None:
+        limits = await _heartbeat_limits(tool_registry)
+        max_iterations = max_iterations or limits[0]
+        timeout_seconds = timeout_seconds or limits[1]
 
     # Normalize LLM config
     llm_cfg = normalize_llm_config(llm_config)
@@ -543,18 +654,30 @@ async def run_heartbeat_decision(
     )
 
     # Create sync LLM query function for sub-calls
-    llm_query_fn = _make_sync_llm_query(llm_cfg, loop)
+    # The heartbeat yields to a live chat turn before each model call.
+    llm_query_fn = _make_sync_llm_query(llm_cfg, loop, yield_to_chat_dsn=dsn)
 
     # Create memory env
     memory_env = RLMMemoryEnv(repo, workspace, llm_query_fn=llm_query_fn)
 
     # Create tool bridge
     initial_energy = turn_snapshot.get("energy", {}).get("current", 20.0)
+    # The person's heartbeat permissions (Settings: Commands and files), the
+    # same ones a heartbeat run from the dashboard gets (AgentLoop). Without
+    # them every scheduled heartbeat was refused the shell.
+    allow_shell = allow_file_write = False
+    try:
+        overrides = (await tool_registry.get_config()).get_context_overrides(ToolContext.HEARTBEAT)
+        allow_shell, allow_file_write = bool(overrides.allow_shell), bool(overrides.allow_file_write)
+    except Exception as exc:
+        logger.debug("heartbeat tool permissions unavailable: %s", exc)
     bridge = ReplToolBridge(
         registry=tool_registry,
         loop=loop,
         heartbeat_id=heartbeat_id,
         initial_energy=initial_energy,
+        allow_shell=allow_shell,
+        allow_file_write=allow_file_write,
     )
 
     # Create REPL
@@ -585,6 +708,7 @@ async def run_heartbeat_decision(
                 max_iterations,
                 True,
                 False,
+                dsn,
             ),
             timeout=timeout_seconds,
         )

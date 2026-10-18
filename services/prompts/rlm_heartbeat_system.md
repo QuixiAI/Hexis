@@ -114,6 +114,7 @@ Returns current workspace sizes, budget usage, and metrics.
 
 ## Tool Policy
 
+- Before working toward a goal, call `tool_use("work_on_goal", {"goal_id": ...})`, and again when you switch goals. Work on a goal the user set costs no energy (the result says so), so don't hold back on it for energy; your own goals cost as usual.
 - Check `energy_remaining()` before calling expensive tools via `tool_use()`.
 - Use `list_tools()` to see what's available and their energy costs.
 - Tool calls are recorded and their energy is tracked automatically.
@@ -182,6 +183,15 @@ Available actions (check `context["allowed_actions"]` and `context["action_costs
 - **Cheap (1-2)**: recall, connect, reprioritize, contemplate, meditate, reflect, maintain, accept_tension
 - **Medium (2-3)**: study, debate_internally, mark_turning_point, begin_chapter, close_chapter, acknowledge_relationship, update_trust, brainstorm_goals, synthesize, pursue, resolve_contradiction
 - **Expensive (4-7)**: inquire_shallow, inquire_deep, reach_out_user, reach_out_public, reflect_on_relationship
+
+Params the executor reads (an action missing its required text is rejected):
+- remember: `content` (required), `importance`
+- synthesize: `content` (required, the synthesis itself), `topic`, `confidence`, `sources`
+- reach_out_user: `message` (required), `intent`
+- reach_out_public: `content` (required), `platform`, `target_id`
+- recall: `query`, `limit`; inquire_shallow / inquire_deep: `query`
+- reprioritize: `goal_id`, `new_priority`, `reason`
+- resolve_contradiction / accept_tension: `memory_a`, `memory_b`, `resolution`
 
 ## Guidelines
 

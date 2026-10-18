@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TOOL_CALL_TIMEOUT = 60  # seconds
+# work_on_goal: the agent says which goal its next calls serve.
+WORK_ON_GOAL = "work_on_goal"
+_FREE_ENERGY = 1_000_000
 TOOL_DISCOVERY_TIMEOUT = 10  # seconds
 
 
@@ -99,6 +102,43 @@ class ReplToolBridge:
         self._allow_shell = allow_shell
         self._allow_file_write = allow_file_write
         self._call_records: list[ToolCallRecord] = []
+        # Set by work_on_goal: calls serving a goal the user set cost no
+        # energy (until the day's free-work cap, heartbeat.free_work_daily_token_cap).
+        self._focus_goal: dict[str, Any] | None = None
+        self._free = False
+
+    def _work_on_goal(self, args: dict[str, Any]) -> dict[str, Any]:
+        goal_id = str(args.get("goal_id") or "").strip()
+
+        async def _lookup() -> tuple[Any, Any]:
+            async with self._registry.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT id::text, content, status::text, goal_origin::text AS origin "
+                    "FROM memories WHERE type = 'goal' AND id::text = $1",
+                    goal_id,
+                )
+                status = await conn.fetchval("SELECT free_goal_work_status()")
+            return row, status
+
+        try:
+            row, status = asyncio.run_coroutine_threadsafe(_lookup(), self._loop).result(timeout=TOOL_DISCOVERY_TIMEOUT)
+        except Exception as exc:
+            return {"success": False, "output": None, "error": f"Could not look up the goal: {exc}", "energy_spent": 0}
+        if row is None:
+            return {"success": False, "output": None, "error": f"No goal with id {goal_id!r}", "energy_spent": 0}
+        status = json.loads(status) if isinstance(status, str) else (status or {})
+        by_user = row["origin"] == "user_request"
+        created_by = "user" if by_user else "agent"
+        self._focus_goal = {"goal_id": row["id"], "title": row["content"], "created_by": created_by}
+        self._free = by_user and bool(status.get("free", True))
+        if self._free:
+            note = "The user set this goal: work on it costs no energy."
+        elif by_user:
+            note = "The user set this goal, but today's free-work cap is reached: it costs energy as usual."
+        else:
+            note = "You set this goal yourself: work on it costs energy as usual."
+        logger.info("REPL work_on_goal: %s (created_by=%s, free=%s)", row["content"][:80], created_by, self._free)
+        return {"success": True, "output": {**self._focus_goal, "free": self._free, "note": note}, "error": None, "energy_spent": 0}
 
     def tool_use(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         """
@@ -112,14 +152,17 @@ class ReplToolBridge:
             Dict with keys: success, output, energy_spent, error
         """
         args = args or {}
+        if name == WORK_ON_GOAL:
+            return self._work_on_goal(args)
         record = ToolCallRecord(tool_name=name, arguments=args)
+        free = self._free
 
         try:
             ctx = ToolExecutionContext(
                 tool_context=self._tool_context,
                 call_id=record.call_id,
                 heartbeat_id=self._heartbeat_id,
-                energy_available=int(self._remaining_energy),
+                energy_available=_FREE_ENERGY if free else int(self._remaining_energy),
                 allow_network=self._allow_network,
                 allow_shell=self._allow_shell,
                 allow_file_write=self._allow_file_write,
@@ -132,6 +175,8 @@ class ReplToolBridge:
             )
             result: ToolResult = future.result(timeout=TOOL_CALL_TIMEOUT)
 
+            if free:
+                result.energy_spent = 0  # the user's goal
             record.result = result
             record.end_time = time.time()
 
@@ -238,6 +283,22 @@ class ReplToolBridge:
                 "parameters": spec.parameters,
                 "allowed_contexts": sorted(context.value for context in spec.allowed_contexts),
             })
+        entries.append({
+            "name": WORK_ON_GOAL,
+            "description": (
+                "Say which goal your next tool calls serve: work_on_goal({'goal_id': ...}). "
+                "Work on a goal the user set costs no energy; work on your own goals costs as usual. "
+                "Call it again when you switch goals."
+            ),
+            "energy_cost": 0,
+            "category": "internal",
+            "is_read_only": True,
+            "requires_approval": False,
+            "supports_parallel": False,
+            "optional": False,
+            "parameters": {"type": "object", "properties": {"goal_id": {"type": "string"}}, "required": ["goal_id"]},
+            "allowed_contexts": ["heartbeat"],
+        })
         return sorted(entries, key=lambda item: item["name"])
 
     def energy_remaining(self) -> float:

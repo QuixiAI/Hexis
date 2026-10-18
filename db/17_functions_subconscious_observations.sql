@@ -917,6 +917,17 @@ BEGIN
         END IF;
     END IF;
 
+    -- An action missing its text fails alone instead of reaching a NOT NULL
+    -- insert and rolling back every action in the heartbeat.
+    IF p_action IN ('synthesize', 'reach_out_public')
+       AND NULLIF(btrim(COALESCE(p_params->>'content', '')), '') IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'error', p_action || ' requires params.content', 'action', p_action);
+    END IF;
+    IF p_action = 'reach_out_user'
+       AND NULLIF(btrim(COALESCE(p_params->>'message', '')), '') IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'error', 'reach_out_user requires params.message', 'action', p_action);
+    END IF;
+
     IF p_action IN ('reach_out_user', 'reach_out_public') THEN
         IF p_action = 'reach_out_public'
            AND (

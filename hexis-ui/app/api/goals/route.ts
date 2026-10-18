@@ -70,7 +70,8 @@ export async function POST(req: NextRequest) {
     }
 
     const rows = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
-      `SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority) AS id`,
+      // Goals made here are the person's: the agent works on them without spending energy.
+      `SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority, NULL, NULL, 'user_request'::goal_source) AS id`,
       title.trim(),
       description?.trim() || null,
       source || "user_request",

@@ -588,6 +588,13 @@ class AgentLoop:
         cfg = self.config
         llm = cfg.llm_config
 
+        if cfg.heartbeat_id and cfg.tool_context == ToolContext.HEARTBEAT:
+            # The person in chat is waiting; the heartbeat is not. Bounded so
+            # a busy chat cannot use up the heartbeat's own time limit.
+            from core.chat_priority import wait_for_chat_idle
+
+            await wait_for_chat_idle(cfg.pool, max_wait_seconds=60.0)
+
         model_messages = _model_safe_messages(messages)
         await self._emit(
             AgentEvent.LLM_REQUEST,
