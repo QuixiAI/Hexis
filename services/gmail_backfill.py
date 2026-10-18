@@ -35,6 +35,21 @@ class GmailBackfillError(RuntimeError):
     """Expected, DB-recorded Gmail backfill failure."""
 
 
+class GmailPermissionError(GmailBackfillError):
+    """Google didn't grant mail access; retrying can't help, only signing in again."""
+
+
+GMAIL_READ_SCOPES = {
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
+}
+NO_MAIL_PERMISSION = (
+    "Google didn't give Hexis permission to read this mailbox. Sign in to Gmail again "
+    "(Connections → Gmail), and on Google's screen make sure the box to read your email is ticked."
+)
+
+
 def _json(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
 
@@ -224,6 +239,8 @@ async def _gmail_get(
             max_delay=20.0,
         )
     except IntegrationHttpError as exc:
+        if exc.status_code == 403 and "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in (exc.response_body or ""):
+            raise GmailPermissionError(NO_MAIL_PERMISSION) from exc
         raise GmailBackfillError(format_provider_error("Gmail", exc)) from exc
     if not isinstance(payload, dict):
         raise GmailBackfillError("Gmail API returned an invalid payload.")
@@ -344,10 +361,50 @@ async def _complete_job(
     return _json(raw) or {}
 
 
-async def _fail_job(pool: Any, job_id: str, error: str) -> dict[str, Any]:
+async def _fail_job(pool: Any, job_id: str, error: str, *, final: bool = False) -> dict[str, Any]:
     async with pool.acquire() as conn:
+        if final:  # no retries left, so it is marked failed now instead of spinning
+            await conn.execute(
+                "UPDATE connector_backfill_jobs SET attempts = GREATEST(attempts, max_attempts) WHERE id = $1::uuid",
+                job_id,
+            )
         raw = await conn.fetchval("SELECT fail_connector_backfill_job($1::uuid, $2)", job_id, error[:2000])
     return _json(raw) or {}
+
+
+# What Gmail itself files as not worth reading: spam, trash and the
+# Promotions, Social and Forums tabs. Asked of the search, so they're never fetched.
+_SKIP_QUERY = "-in:spam -in:trash -category:promotions -category:social -category:forums"
+_SKIP_LABELS = {"SPAM", "TRASH", "CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS"}
+
+
+def worth_reading(message: dict[str, Any]) -> bool:
+    """Whether an email is worth turning into memories.
+
+    Gmail's own sorting decides: mail it marks important, mail the person
+    starred or sent, and Primary mail are read; spam, promotions, social and
+    forum mail are not, nor are automated updates and mailing-list mail
+    (alerts, receipts, newsletters) unless Gmail marks them important.
+    """
+    labels = {str(label) for label in (message.get("labelIds") or [])}
+    if labels & {"SPAM", "TRASH"}:
+        return False
+    if labels & {"STARRED", "SENT"}:
+        return True
+    if labels & _SKIP_LABELS:
+        return False
+    if "IMPORTANT" in labels:
+        return True
+    if "CATEGORY_UPDATES" in labels:
+        return False
+    payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+    headers = {str(h.get("name") or "").lower(): str(h.get("value") or "").lower()
+               for h in payload.get("headers") or [] if isinstance(h, dict)}
+    if "list-unsubscribe" in headers or "list-id" in headers:
+        return False
+    if headers.get("precedence") in {"bulk", "list", "junk"}:
+        return False
+    return True
 
 
 def _request_options(job: dict[str, Any], cursor_value: dict[str, Any]) -> dict[str, Any]:
@@ -361,15 +418,22 @@ def _request_options(job: dict[str, Any], cursor_value: dict[str, Any]) -> dict[
     elif not isinstance(labels, list):
         labels = []
 
+    query = str(requested.get("query") or "").strip() or None
+    skip_unimportant = bool(requested.get("skip_unimportant", True))
+    search = " ".join(part for part in (query, _SKIP_QUERY if skip_unimportant else None) if part) or None
+    # A page token only continues the search that produced it.
+    same_search = cursor_value.get("search", cursor_value.get("query")) == search
     return {
-        "query": str(requested.get("query") or "").strip() or None,
+        "query": query,
+        "search": search,
+        "skip_unimportant": skip_unimportant,
         "label_ids": [str(label).strip() for label in labels if str(label).strip()],
         "include_spam_trash": bool(requested.get("include_spam_trash", False)),
         "max_messages": _coerce_int(requested.get("max_messages"), 100, minimum=1, maximum=500),
         "page_size": _coerce_int(requested.get("page_size"), 100, minimum=1, maximum=100),
         "page_token": (
             str(requested.get("page_token") or "").strip()
-            or str(cursor_value.get("page_token") or "").strip()
+            or (str(cursor_value.get("page_token") or "").strip() if same_search else "")
             or None
         ),
     }
@@ -386,6 +450,9 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
 
     try:
         credentials = await refresh_default_credentials_if_needed()
+        granted = credentials.get("scopes")
+        if isinstance(granted, list) and granted and not GMAIL_READ_SCOPES.intersection(granted):
+            raise GmailPermissionError(NO_MAIL_PERMISSION)
         account_email = await _connected_account_email(credentials)
         account_key = str(job.get("account_key") or "").strip().lower()
         if account_email and account_key and account_email != account_key:
@@ -402,6 +469,7 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
         pages = 0
         items_seen = 0
         items_stored = 0
+        items_skipped = 0
         high_watermark: datetime | None = None
         last_message_id: str | None = None
         last_history_id: Any = cursor_value.get("history_id")
@@ -411,8 +479,8 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
                 "maxResults": min(page_size, max_messages - items_seen),
                 "includeSpamTrash": options["include_spam_trash"],
             }
-            if options["query"]:
-                params["q"] = options["query"]
+            if options["search"]:
+                params["q"] = options["search"]
             if page_token:
                 params["pageToken"] = page_token
             label_ids = options["label_ids"]
@@ -435,9 +503,14 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
                     f"/users/me/messages/{stub['id']}",
                     params={"format": "full"},
                 )
-                source = gmail_message_to_source_item(message)
-                await _upsert_source_item(pool, job, source)
                 items_seen += 1
+                if options["skip_unimportant"] and not worth_reading(message):
+                    items_skipped += 1
+                    continue
+                source = gmail_message_to_source_item(message)
+                # Imported mail is history, not news: no alerts (connector_cognition).
+                source["metadata"]["acquisition"] = "import"
+                await _upsert_source_item(pool, job, source)
                 items_stored += 1
                 last_message_id = source["provider_item_id"]
                 last_history_id = source["metadata"].get("gmail_history_id") or last_history_id
@@ -453,6 +526,7 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
                 "page_token": page_token,
                 "history_id": last_history_id,
                 "query": options["query"],
+                "search": options["search"],
                 "label_ids": label_ids,
                 "last_message_id": last_message_id,
             }
@@ -463,6 +537,7 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
                     "pages": pages,
                     "items_seen": items_seen,
                     "items_stored": items_stored,
+                    "items_skipped": items_skipped,
                     "truncated": bool(page_token),
                 },
                 next_cursor,
@@ -479,6 +554,7 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
             "page_token": page_token,
             "history_id": last_history_id,
             "query": options["query"],
+            "search": options["search"],
             "label_ids": options["label_ids"],
             "last_message_id": last_message_id,
         }
@@ -489,12 +565,22 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
                 "pages": pages,
                 "items_seen": items_seen,
                 "items_stored": items_stored,
+                "items_skipped": items_skipped,
                 "truncated": bool(page_token),
                 "next_page_token": page_token,
             },
             final_cursor,
             high_watermark,
         )
+    except GmailPermissionError as exc:
+        logger.warning("Gmail backfill job %s can't read mail: %s", job_id, exc)
+        async with pool.acquire() as conn:  # brings "Start Google sign-in" back to the Connections page
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'needs_reauth', updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = $1::uuid AND status = 'connected'",
+                str(job.get("connection_id") or ""),
+            )
+        return await _fail_job(pool, job_id, str(exc), final=True)
     except (GmailBackfillError, GmailOAuthError) as exc:
         logger.warning("Gmail backfill job %s failed: %s", job_id, exc)
         return await _fail_job(pool, job_id, str(exc))

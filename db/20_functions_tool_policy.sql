@@ -49,6 +49,32 @@ RETURNS BOOLEAN AS $$
     );
 $$ LANGUAGE sql STABLE;
 
+-- Pre-approving a tool (Settings: "Without asking") changed only config, so
+-- the agent kept acting on what it remembered: refused once for lack of
+-- approval, later heartbeats recorded "blocked on approval" and never tried
+-- again. Granting or revoking an approval now also leaves it an episodic
+-- memory of the change.
+CREATE OR REPLACE FUNCTION note_tool_approval_change(p_tool_name TEXT, p_granted BOOLEAN)
+RETURNS VOID AS $$
+BEGIN
+    PERFORM create_episodic_memory(
+        CASE WHEN p_granted
+            THEN format('The user now lets me use the %s tool without asking for approval, in chat and heartbeats. Anything I set aside because %s needed approval can go ahead now.', p_tool_name, p_tool_name)
+            ELSE format('The user now requires approval again before I use the %s tool; each use waits for them to approve it.', p_tool_name)
+        END,
+        jsonb_build_object('kind', 'tool_approval', 'tool', p_tool_name, 'granted', p_granted),
+        jsonb_build_object('source', 'user_settings'),
+        NULL,
+        0.0,
+        CURRENT_TIMESTAMP,
+        0.8
+    );
+EXCEPTION WHEN OTHERS THEN
+    -- The setting itself must never fail because a memory couldn't be written.
+    RAISE WARNING 'could not record tool approval change for %: %', p_tool_name, SQLERRM;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION grant_tool_approval(p_tool_name TEXT)
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -73,6 +99,7 @@ BEGIN
         updated_at = NOW()
     WHERE NOT config.value ? p_tool_name;
 
+    PERFORM note_tool_approval_change(p_tool_name, TRUE);
     RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql;
@@ -90,7 +117,11 @@ BEGIN
     WHERE key = 'tools.approvals'
       AND value ? p_tool_name;
 
-    RETURN FOUND;
+    IF FOUND THEN
+        PERFORM note_tool_approval_change(p_tool_name, FALSE);
+        RETURN TRUE;
+    END IF;
+    RETURN FALSE;
 END;
 $$ LANGUAGE plpgsql;
 

@@ -560,6 +560,30 @@ def parse_authorization_response(value: str) -> tuple[str, str | None]:
     return code, state
 
 
+_IDENTITY_SCOPES = {"openid", "email", "profile",
+                    "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile"}
+
+
+def missing_google_scopes(requested: list[str], granted: list[str]) -> list[str]:
+    """Scopes asked for that Google left out of the grant, identity scopes aside.
+
+    Google can sign someone in while granting only some of what was asked
+    (each permission is its own checkbox), so a sign-in that "worked" may
+    still be unable to read anything.
+    """
+    have = set(granted)
+    return [s for s in requested if s not in _IDENTITY_SCOPES and s not in have]
+
+
+def _missing_scopes_message(connector_id: str) -> str:
+    what = "see your Google Drive files" if connector_id == "google_drive" else "read your email"
+    return (
+        f"Google signed you in but didn't give Hexis permission to {what}. "
+        f"Start Google sign-in again, and on Google's screen make sure the box to {what} is ticked."
+    )
+
+
 async def _exchange_code(
     *,
     code: str,
@@ -699,6 +723,9 @@ async def complete_gmail_oauth(
         access_token = token_data["access_token"]
         scopes = token_data.get("scope")
         granted_scopes = scopes.split() if isinstance(scopes, str) and scopes.strip() else list(pending.get("scopes") or [])
+        missing = missing_google_scopes(pending.get("scopes") or [], granted_scopes)
+        if missing:
+            raise GmailOAuthError(_missing_scopes_message(connector_id))
         account_email = await _fetch_account_email(access_token)
         account_key = account_email or f"gmail:{attempt_id}"
         expires_in = int(token_data.get("expires_in") or 3600)

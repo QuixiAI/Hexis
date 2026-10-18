@@ -169,7 +169,7 @@ async def _upsert_source_item(pool: Any, job: dict[str, Any], source: dict[str, 
             source["labels"],
             _json_dumps(source["participants"]),
             _json_dumps(source["attachments"]),
-            _json_dumps(source["metadata"]),
+            _json_dumps({**source["metadata"], "acquisition": "import"}),  # history, not news: no alerts
             source.get("sensitivity", "shared"),
         )
     return _json(raw) or {}

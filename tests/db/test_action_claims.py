@@ -350,3 +350,21 @@ async def test_correction_claim_requires_revision_not_just_any_write(db_pool):
             assert "memory_correction" not in _kinds(report)
         finally:
             await tr.rollback()
+
+
+async def test_bare_reminder_confirmations_are_claims(db_pool):
+    """"Scheduled." and "I'll remind you" claim a reminder exists; without a
+    scheduling tool call behind them they are flagged."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            turn_id = await _start_turn(conn)
+            for text in ("Scheduled. I'll remind you here on November 10 at 9:00 a.m.", "Reminder set."):
+                report = await _detect(conn, turn_id, text)
+                assert report["flagged"], text
+            await _apply_call(conn, turn_id, "manage_schedule", {"action": "create", "schedule": "2026-11-10T09:00:00+09:00"})
+            report = await _detect(conn, turn_id, "Scheduled. I'll remind you on November 10.")
+            assert report["flagged"] == []
+        finally:
+            await tr.rollback()

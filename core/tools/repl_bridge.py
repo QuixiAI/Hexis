@@ -228,11 +228,11 @@ class ReplToolBridge:
             return self._registered_tool_entries("called from owning event loop thread")
 
         future = asyncio.run_coroutine_threadsafe(
-            self._registry.get_enabled_tools(self._tool_context),
+            self._enabled_tools_and_approvals(),
             self._loop,
         )
         try:
-            handlers = future.result(timeout=TOOL_DISCOVERY_TIMEOUT)
+            handlers, approved = future.result(timeout=TOOL_DISCOVERY_TIMEOUT)
         except TimeoutError:
             future.cancel()
             return self._registered_tool_entries(
@@ -241,7 +241,21 @@ class ReplToolBridge:
         except Exception as exc:
             return self._registered_tool_entries(f"registry discovery failed: {exc}")
 
-        return self._tool_entries(handlers)
+        return self._tool_entries(handlers, approved)
+
+    async def _enabled_tools_and_approvals(self) -> tuple[list[Any], set[str]]:
+        handlers = await self._registry.get_enabled_tools(self._tool_context)
+        approved: set[str] = set()
+        pool = getattr(self._registry, "pool", None)
+        if pool is not None:
+            try:
+                async with pool.acquire() as conn:
+                    raw = await conn.fetchval("SELECT value FROM config WHERE key = 'tools.approvals'")
+                value = json.loads(raw) if isinstance(raw, str) else raw
+                approved = {str(name) for name in value or []}
+            except Exception:
+                logger.debug("REPL list_tools could not read tool approvals", exc_info=True)
+        return handlers, approved
 
     def _registered_tool_entries(self, reason: str) -> list[dict[str, Any]]:
         """Fallback to context-filtered in-process registry entries."""
@@ -267,17 +281,22 @@ class ReplToolBridge:
         return self._tool_entries(handlers)
 
     @staticmethod
-    def _tool_entries(handlers: list[Any]) -> list[dict[str, Any]]:
+    def _tool_entries(handlers: list[Any], approved: set[str] | None = None) -> list[dict[str, Any]]:
+        # A tool the user pre-approved needs no approval now; say so, so the
+        # agent doesn't hold back from it on an old refusal.
+        approved = approved or set()
         entries = []
         for handler in handlers:
             spec = handler.spec
+            pre_approved = spec.requires_approval and spec.name in approved
             entries.append({
                 "name": spec.name,
                 "description": spec.description,
                 "energy_cost": spec.energy_cost,
                 "category": spec.category.value,
                 "is_read_only": spec.is_read_only,
-                "requires_approval": spec.requires_approval,
+                "requires_approval": spec.requires_approval and not pre_approved,
+                **({"pre_approved": True} if pre_approved else {}),
                 "supports_parallel": spec.supports_parallel,
                 "optional": spec.optional,
                 "parameters": spec.parameters,
