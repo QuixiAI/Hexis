@@ -6,11 +6,17 @@ import {
   CheckCircle2,
   ClipboardPaste,
   FilePlus2,
+  FolderUp,
   Globe,
   Loader2,
+  Lock,
+  LockOpen,
+  MessageSquare,
   UploadCloud,
   X,
 } from "lucide-react";
+import Link from "next/link";
+import { type IngestMode, useBackgroundUploadQueue } from "../components/nav/background-activity";
 import { Card } from "../components/ui/card";
 import { PageHeader } from "../components/ui/page-header";
 import { Spinner } from "../components/ui/spinner";
@@ -29,10 +35,16 @@ type PendingFile = {
   file: File;
   name: string;
   size: number;
+  // "private" keeps the ingested memories out of group-channel recall and
+  // exports; toggled per file before upload.
+  sensitivity: "private" | null;
   state: PendingFileState;
   detail?: string;
   jobId?: string;
 };
+
+const PRIVATE_HINT = "Private: kept out of group conversations and exports.";
+const SHAREABLE_HINT = "Shareable. Click to mark private.";
 
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -40,15 +52,19 @@ function formatBytes(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const MODES = ["fast", "slow", "hybrid"] as const;
+const MODES: readonly IngestMode[] = ["fast", "slow", "hybrid"];
 
 export default function IngestPage() {
-  const [pending, setPending] = useState<PendingFile[]>([]);
-  const [mode, setMode] = useState<(typeof MODES)[number]>("fast");
-  const [uploading, setUploading] = useState(false);
+  // The queue lives in the app shell so uploads keep going after the user
+  // leaves this page; the local state is only for a page rendered without it.
+  const bgQueue = useBackgroundUploadQueue();
+  const [localPending, setLocalPending] = useState<PendingFile[]>([]);
+  const [mode, setMode] = useState<IngestMode>("fast");
+  const [localUploading, setLocalUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [pasteTitle, setPasteTitle] = useState("");
+  const [pastePrivate, setPastePrivate] = useState(false);
   const [pasteBusy, setPasteBusy] = useState(false);
   const [url, setUrl] = useState("");
   const [urlBusy, setUrlBusy] = useState(false);
@@ -58,9 +74,23 @@ export default function IngestPage() {
   const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
   const trackedJobIdsRef = useRef(trackedJobIds);
   const jobsFetchInFlightRef = useRef(false);
-  const hasActiveJobs = trackedJobIds.length > 0 || jobs.some(isActiveIngestJob);
+  const pending: PendingFile[] = bgQueue
+    ? bgQueue.uploads.map((item) => ({
+        id: item.id,
+        file: item.file,
+        name: item.name,
+        size: item.size,
+        sensitivity: item.sensitivity,
+        state: item.state,
+        detail: item.detail,
+        jobId: item.jobId,
+      }))
+    : localPending;
+  const uploading = bgQueue ? bgQueue.uploading : localUploading;
+  const hasActiveJobs = trackedJobIds.length > 0 || jobs.some(isActiveIngestJob) || uploading;
 
   useEffect(() => {
     trackedJobIdsRef.current = trackedJobIds;
@@ -72,6 +102,21 @@ export default function IngestPage() {
       setTrackedJobIds((prev) => (prev.includes(job.id) ? prev : [job.id, ...prev]));
     }
   }, []);
+
+  // Each accepted upload's job is added to the list once; after that, polling owns its status.
+  const handedOffJobIds = useRef(new Set<string>());
+  useEffect(() => {
+    if (!bgQueue) return;
+    for (const item of bgQueue.uploads) {
+      if (item.state !== "accepted" || !item.jobId || handedOffJobIds.current.has(item.jobId)) continue;
+      handedOffJobIds.current.add(item.jobId);
+      const job = normalizeIngestJob(
+        { id: item.jobId, kind: "artifact", status: "pending", title: item.name, result: null, payload: {} },
+        { title: item.name }
+      );
+      if (job) trackAcceptedJob(job);
+    }
+  }, [bgQueue, trackAcceptedJob]);
 
   const fetchJobs = useCallback(async () => {
     if (jobsFetchInFlightRef.current) return;
@@ -145,31 +190,65 @@ export default function IngestPage() {
     if (!files) return;
     const items = Array.from(files).filter((file) => file.size > 0);
     if (!items.length) return;
-    setPending((prev) => [
+    if (bgQueue) {
+      bgQueue.enqueueFiles(items, { mode });
+      return;
+    }
+    setLocalPending((prev) => [
       ...prev,
       ...items.map((file) => ({
         id: crypto.randomUUID(),
         file,
         name: file.name,
         size: file.size,
+        sensitivity: null,
         state: "queued" as const,
       })),
     ]);
   };
 
+  const togglePrivate = (id: string) => {
+    if (bgQueue) {
+      bgQueue.toggleSensitivity(id);
+      return;
+    }
+    setLocalPending((prev) =>
+      prev.map((p) =>
+        p.id === id ? { ...p, sensitivity: p.sensitivity === "private" ? null : "private" } : p
+      )
+    );
+  };
+
+  const removePending = (id: string) => {
+    if (bgQueue) {
+      bgQueue.removeUpload(id);
+      return;
+    }
+    setLocalPending((prev) => prev.filter((p) => p.id !== id));
+  };
+
+  const acceptedNotice = (accepted: number) =>
+    `${accepted} file(s) accepted — originals preserved; extraction runs in the background below.`;
+
   const uploadAll = async () => {
     if (uploading || !pending.some((p) => p.state === "queued")) return;
-    setUploading(true);
     setNotice(null);
     setErrorNotice(null);
+    if (bgQueue) {
+      const accepted = await bgQueue.startQueuedUploads(mode);
+      if (accepted) setNotice(acceptedNotice(accepted));
+      return;
+    }
+    setLocalUploading(true);
     let accepted = 0;
-    for (const item of pending) {
+    for (const item of localPending) {
       if (item.state !== "queued") continue;
-      setPending((prev) => prev.map((p) => (p.id === item.id ? { ...p, state: "uploading" } : p)));
+      setLocalPending((prev) => prev.map((p) => (p.id === item.id ? { ...p, state: "uploading" } : p)));
       try {
         const form = new FormData();
         form.append("file", item.file, item.name);
         form.append("mode", mode);
+        if (item.sensitivity) form.append("sensitivity", item.sensitivity);
         const res = await fetch("/api/ingest/file", { method: "POST", body: form });
         if (res.ok) {
           const body = await res.json();
@@ -186,7 +265,7 @@ export default function IngestPage() {
           );
           if (job) trackAcceptedJob(job);
           accepted += 1;
-          setPending((prev) =>
+          setLocalPending((prev) =>
             prev.map((p) =>
               p.id === item.id ? { ...p, state: "accepted", jobId: job?.id } : p
             )
@@ -199,12 +278,12 @@ export default function IngestPage() {
           } catch {
             // non-JSON error body
           }
-          setPending((prev) =>
+          setLocalPending((prev) =>
             prev.map((p) => (p.id === item.id ? { ...p, state: "failed", detail } : p))
           );
         }
       } catch (err) {
-        setPending((prev) =>
+        setLocalPending((prev) =>
           prev.map((p) =>
             p.id === item.id
               ? { ...p, state: "failed", detail: err instanceof Error ? err.message : "network error" }
@@ -213,13 +292,11 @@ export default function IngestPage() {
         );
       }
     }
-    setUploading(false);
+    setLocalUploading(false);
     if (accepted) {
-      setNotice(
-        `${accepted} file(s) accepted — originals preserved; extraction runs in the background below.`
-      );
+      setNotice(acceptedNotice(accepted));
       window.setTimeout(() => {
-        setPending((prev) => prev.filter((p) => p.state !== "accepted"));
+        setLocalPending((prev) => prev.filter((p) => p.state !== "accepted"));
       }, 2500);
     }
   };
@@ -238,6 +315,7 @@ export default function IngestPage() {
           content,
           title: pasteTitle.trim() || undefined,
           mode,
+          sensitivity: pastePrivate ? "private" : undefined,
         }),
       });
       if (!res.ok) {
@@ -246,6 +324,7 @@ export default function IngestPage() {
       }
       setPasteText("");
       setPasteTitle("");
+      setPastePrivate(false);
       const body = await res.json();
       const job = normalizeIngestJob({
         id: body.job_id,
@@ -335,6 +414,21 @@ export default function IngestPage() {
         subtitle="Put files, text, and web pages into the filing cabinet — originals are preserved, memories are distilled in the background."
       />
 
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--teal)]/30 bg-[var(--teal)]/5 px-4 py-3 text-sm">
+        <div>
+          <p className="font-semibold text-[var(--foreground)]">Reading continues in the background</p>
+          <p className="mt-0.5 text-xs text-[var(--ink-soft)]">
+            Large batches take a while. Uploads keep going if you leave this page, and you can chat while the documents are read.
+          </p>
+        </div>
+        <Link
+          href="/chat"
+          className="inline-flex items-center gap-1.5 rounded-md bg-[var(--foreground)] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[var(--teal)]"
+        >
+          <MessageSquare size={13} /> Go to chat
+        </Link>
+      </div>
+
       {notice ? (
         <div className="rounded-md border border-[var(--teal)]/40 bg-[var(--teal)]/5 px-3 py-2 text-sm text-[var(--foreground)]">
           {notice}
@@ -369,9 +463,27 @@ export default function IngestPage() {
 
       <div className="grid gap-6 lg:grid-cols-2">
         <Card className="p-4">
-          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold">
-            <UploadCloud size={16} className="text-[var(--teal)]" /> Upload files
-          </h2>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="flex items-center gap-2 text-sm font-semibold">
+              <UploadCloud size={16} className="text-[var(--teal)]" /> Upload files
+            </h2>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center gap-1 rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium hover:border-[var(--teal)]"
+              >
+                <FilePlus2 size={13} /> Select files
+              </button>
+              <button
+                type="button"
+                onClick={() => folderInputRef.current?.click()}
+                className="inline-flex items-center gap-1 rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium hover:border-[var(--teal)]"
+              >
+                <FolderUp size={13} /> Select folder
+              </button>
+            </div>
+          </div>
           <div
             role="button"
             tabIndex={0}
@@ -414,6 +526,20 @@ export default function IngestPage() {
               event.target.value = "";
             }}
           />
+          <input
+            ref={folderInputRef}
+            type="file"
+            multiple
+            // @ts-expect-error non-standard folder selection attribute supported by modern browsers
+            webkitdirectory=""
+            className="hidden"
+            aria-hidden="true"
+            tabIndex={-1}
+            onChange={(event) => {
+              addFiles(event.target.files);
+              event.target.value = "";
+            }}
+          />
 
           {pending.length > 0 ? (
             <div className="mt-3 space-y-2">
@@ -433,9 +559,27 @@ export default function IngestPage() {
                   </span>
                   <button
                     type="button"
+                    aria-label={
+                      item.sensitivity === "private"
+                        ? `Make ${item.name} shareable`
+                        : `Mark ${item.name} private`
+                    }
+                    title={item.sensitivity === "private" ? PRIVATE_HINT : SHAREABLE_HINT}
+                    disabled={item.state !== "queued"}
+                    onClick={() => togglePrivate(item.id)}
+                    className={`flex-none rounded p-0.5 disabled:opacity-40 ${
+                      item.sensitivity === "private"
+                        ? "text-[var(--teal)]"
+                        : "text-[var(--ink-soft)] hover:text-[var(--foreground)]"
+                    }`}
+                  >
+                    {item.sensitivity === "private" ? <Lock size={12} /> : <LockOpen size={12} />}
+                  </button>
+                  <button
+                    type="button"
                     aria-label={`Remove ${item.name}`}
                     title="Remove"
-                    onClick={() => setPending((prev) => prev.filter((p) => p.id !== item.id))}
+                    onClick={() => removePending(item.id)}
                     className="flex-none rounded p-0.5 text-[var(--ink-soft)] hover:text-[var(--foreground)]"
                   >
                     <X size={12} />
@@ -482,6 +626,14 @@ export default function IngestPage() {
               >
                 {pasteBusy ? "Submitting…" : "Ingest text"}
               </button>
+              <label className="flex items-center gap-1.5 text-xs text-[var(--ink-soft)]">
+                <input
+                  type="checkbox"
+                  checked={pastePrivate}
+                  onChange={(event) => setPastePrivate(event.target.checked)}
+                />
+                Private (kept out of group conversations and exports)
+              </label>
             </div>
           </Card>
 
