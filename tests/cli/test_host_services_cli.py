@@ -107,7 +107,7 @@ def test_explicit_migration_installs_before_stopping_docker(monkeypatch, tmp_pat
     assert events == [
         ("install", False),
         ("compose", ["stop", "heartbeat_worker", "maintenance_worker"]),
-        ("control", ("start", ["heartbeat", "maintenance"])),
+        ("control", ("start", ["heartbeat", "maintenance", "ingest"])),
     ]
 
 
@@ -162,8 +162,8 @@ def test_failed_host_start_safely_restores_docker_workers(
     assert rc == 1
     assert events == [
         ("compose", ["stop", "heartbeat_worker"]),
-        ("control", ("start", ["heartbeat", "maintenance"])),
-        ("control", ("stop", ["heartbeat", "maintenance"])),
+        ("control", ("start", ["heartbeat", "maintenance", "ingest"])),
+        ("control", ("stop", ["heartbeat", "maintenance", "ingest"])),
         ("compose", ["up", "-d", "heartbeat_worker"]),
     ]
     assert "provider rejected start" in capsys.readouterr().err

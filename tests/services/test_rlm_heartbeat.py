@@ -415,7 +415,7 @@ class TestTotalLlmFailure:
         import services.hexis_rlm as rlm
         from services.rlm_repl import HexisLocalREPL
 
-        async def always_fails(messages, llm_config, max_tokens=4096):
+        async def always_fails(messages, llm_config, max_tokens=4096, **_kwargs):
             raise ConnectionError("[Errno -2] Name or service not known")
 
         monkeypatch.setattr(rlm, "_llm_completion", always_fails)
@@ -446,7 +446,7 @@ class TestTotalLlmFailure:
 
         calls = {"n": 0}
 
-        async def fails_then_recovers(messages, llm_config, max_tokens=4096):
+        async def fails_then_recovers(messages, llm_config, max_tokens=4096, **_kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise ConnectionError("[Errno -2] Name or service not known")
@@ -478,7 +478,7 @@ class TestTotalLlmFailure:
         still answer the user -- honestly, not with a fabricated decision."""
         import services.hexis_rlm as rlm
 
-        async def always_fails(messages, llm_config, max_tokens=4096):
+        async def always_fails(messages, llm_config, max_tokens=4096, **_kwargs):
             raise ConnectionError("[Errno -2] Name or service not known")
 
         monkeypatch.setattr(rlm, "_llm_completion", always_fails)
@@ -499,7 +499,7 @@ class TestTotalLlmFailure:
         failure propagate as a real exception rather than swallow it."""
         import services.hexis_rlm as rlm
 
-        async def always_fails(messages, llm_config, max_tokens=4096):
+        async def always_fails(messages, llm_config, max_tokens=4096, **_kwargs):
             raise ConnectionError("[Errno -2] Name or service not known")
 
         monkeypatch.setattr(rlm, "_llm_completion", always_fails)

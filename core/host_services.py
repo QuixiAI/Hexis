@@ -25,7 +25,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 MANAGED_MARKER = "Managed by Hexis host services"
 STATE_VERSION = 1
-CORE_SERVICE_NAMES = ("heartbeat", "maintenance")
+CORE_SERVICE_NAMES = ("heartbeat", "maintenance", "ingest")
 ALL_SERVICE_NAMES = (*CORE_SERVICE_NAMES, "channels")
 
 
@@ -59,6 +59,14 @@ SERVICE_DEFINITIONS = {
         arguments=("--mode", "maintenance"),
         launchd_label="ai.hexis.worker.maintenance",
         systemd_unit="hexis-maintenance.service",
+    ),
+    "ingest": HostServiceDefinition(
+        name="ingest",
+        description="Hexis ingest worker (reads queued documents)",
+        module="apps.worker",
+        arguments=("--mode", "ingest"),
+        launchd_label="ai.hexis.worker.ingest",
+        systemd_unit="hexis-ingest.service",
     ),
     "channels": HostServiceDefinition(
         name="channels",

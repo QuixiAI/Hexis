@@ -17,7 +17,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from core.llm import chat_completion, normalize_llm_config
 from core.memory_repo import MemoryRepo
@@ -49,6 +49,12 @@ class FinalAnswerResolution:
 
     answer: str | None
     error: str | None = None
+
+
+class RLMCallError(RuntimeError):
+    """A strict RLM loop could not get an answer from the model (error,
+    timeout, or empty reply). Raised instead of guessing an answer, so a
+    caller that persists the result (slow reading) fails and retries."""
 
 
 class RlmLoopFailure(RuntimeError):
@@ -227,8 +233,16 @@ async def _llm_completion(
     messages: list[dict[str, str]],
     llm_config: dict[str, Any],
     max_tokens: int = 4096,
+    *,
+    before_call: Callable[[], Awaitable[Any]] | None = None,
 ) -> str:
-    """Call Hexis LLM and return the text response."""
+    """Call Hexis LLM and return the text response.
+
+    before_call is awaited first on the caller's loop; slow reading passes
+    the ingest pipeline's hook, so these calls yield to chat and are counted
+    like every other reading call."""
+    if before_call is not None:
+        await before_call()
     result = await chat_completion(
         provider=llm_config["provider"],
         model=llm_config["model"],
@@ -252,6 +266,7 @@ async def _llm_completion(
 def _make_sync_llm_query(
     llm_config: dict[str, Any],
     loop: asyncio.AbstractEventLoop,
+    before_call: Callable[[], Awaitable[Any]] | None = None,
 ) -> Callable[[str], str]:
     """Create a synchronous llm_query function for use in the REPL."""
 
@@ -262,7 +277,7 @@ def _make_sync_llm_query(
         ]
         try:
             future = asyncio.run_coroutine_threadsafe(
-                _llm_completion(messages, llm_config, max_tokens=2048),
+                _llm_completion(messages, llm_config, max_tokens=2048, before_call=before_call),
                 loop,
             )
             return future.result(timeout=120)
@@ -319,12 +334,19 @@ def _run_loop(
     max_iterations: int,
     allow_final_var: bool = True,
     allow_direct_chat_final: bool = False,
+    *,
+    strict: bool = False,
+    before_call: Callable[[], Awaitable[Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Synchronous RLM iteration loop (Algorithm 1).
 
     Runs in a thread pool executor to avoid blocking the async event loop.
     LLM calls bridge back to the async loop via run_coroutine_threadsafe.
+
+    strict: a failed or empty model call raises RLMCallError instead of
+    ending the loop with a stand-in answer. Chat and heartbeat keep the
+    stand-in; slow reading must not mistake an outage for an empty read.
     """
     message_history: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
@@ -349,18 +371,23 @@ def _run_loop(
 
         # Call LLM
         future = asyncio.run_coroutine_threadsafe(
-            _llm_completion(current_prompt, llm_config, max_tokens=4096),
+            _llm_completion(current_prompt, llm_config, max_tokens=4096, before_call=before_call),
             loop,
         )
         try:
             response = future.result(timeout=120)
         except Exception as e:
             logger.error("LLM call failed at iteration %d: %s", i, e)
+            if strict:
+                future.cancel()
+                raise RLMCallError(f"model call failed at step {i + 1}: {e}") from e
             loop_error = str(e)
             break
 
         if not response:
             logger.warning("Empty LLM response at iteration %d", i)
+            if strict:
+                raise RLMCallError(f"model returned nothing at step {i + 1}")
             break
 
         # Check for final answer BEFORE executing code. A bad FINAL_VAR is not
@@ -433,11 +460,13 @@ def _run_loop(
             ),
         })
         future = asyncio.run_coroutine_threadsafe(
-            _llm_completion(message_history, llm_config, max_tokens=4096),
+            _llm_completion(message_history, llm_config, max_tokens=4096, before_call=before_call),
             loop,
         )
         try:
             response = future.result(timeout=120)
+            if strict and not response:
+                raise RLMCallError("model returned nothing for the final answer")
             final_resolution = resolve_final_answer(
                 response,
                 repl,
@@ -454,6 +483,11 @@ def _run_loop(
                 else:
                     final_answer = response
         except Exception as repair_exc:
+            if strict:
+                future.cancel()
+                if isinstance(repair_exc, RLMCallError):
+                    raise
+                raise RLMCallError(f"model call failed for the final answer: {repair_exc}") from repair_exc
             # Both the main loop AND the repair call failed to get any real
             # LLM response -- a total failure, not a decision. Raising here
             # (rather than fabricating a well-formed-looking decision, #111)

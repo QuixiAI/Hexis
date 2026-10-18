@@ -227,6 +227,50 @@ services:
       - private
       - public
 
+  # Reads queued documents (uploads, pasted text, imported mail and chats)
+  # the moment they are queued. Scale with `docker compose up -d --scale ingest_worker=N`
+  # after removing container_name.
+  ingest_worker:
+    image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: ops/Dockerfile.worker
+    container_name: hexis_ingest_worker
+    restart: unless-stopped
+    develop:
+      watch: *dev-watch
+    command: ["hexis-worker", "--mode", "ingest"]
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
+      POSTGRES_USER: ${POSTGRES_USER:-hexis_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hexis_password}
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
+      RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
+      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
+    volumes:
+      # OAuth credential store (openai-codex, anthropic, ...): token refresh
+      # writes back, so this is read-write; the store's .lock files serialize
+      # host/container access. Also exposes user skills (~/.hexis/skills).
+      - ~/.hexis:/root/.hexis
+    networks:
+      - private
+      - public
+
   api:
     image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     build:

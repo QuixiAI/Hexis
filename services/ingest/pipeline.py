@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import hashlib
 import json
 import mimetypes
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 
 from core.integration_reliability import (
@@ -67,6 +68,17 @@ from .readers import (
 from .sectioning import CHUNKER_VERSION, Sectioner
 from .store import MemoryStore
 
+logger = logging.getLogger(__name__)
+
+
+class IngestSectionError(RuntimeError):
+    """Some sections of a document could not be read; the rest were kept."""
+
+    def __init__(self, message: str, causes: list[BaseException] | None = None):
+        super().__init__(message)
+        self.causes = list(causes or [])
+
+
 # =========================================================================
 # INGESTION PIPELINE
 # =========================================================================
@@ -104,6 +116,10 @@ class IngestionPipeline:
         self.store = MemoryStore(config)
         self.stats = {"files_processed": 0, "memories_created": 0, "errors": 0}
         self.last_result: dict[str, Any] = {}
+        # Units of work as they happen, for the ingestion view: set by the job
+        # runner, called with the document's counters after each change.
+        self.on_progress: Callable[[dict[str, int]], Awaitable[Any]] | None = None
+        self.progress: dict[str, int] = {}
         # DB-owned spreadsheet row cap; capping always warns (readers.py).
         XlsxReader.MAX_ROWS_PER_SHEET = max(1, int(config.xlsx_max_rows_per_sheet or 5000))
 
@@ -450,8 +466,13 @@ class IngestionPipeline:
         source_type: str = "pasted_text",
         path: str | None = None,
         file_type: str = ".md",
+        content_hash: str | None = None,
     ) -> int:
-        """Ingest raw text (pasted documents, job payloads) — no file needed."""
+        """Ingest raw text (pasted documents, job payloads) — no file needed.
+
+        content_hash names a document already stored for this text (a
+        connector item), so reading updates that row instead of adding a copy.
+        """
         self.last_result = {}
         metrics = IngestionMetrics(start_time=time.time())
         metrics.source_size_bytes = len(content.encode("utf-8"))
@@ -462,7 +483,7 @@ class IngestionPipeline:
         doc = DocumentInfo(
             title=title,
             source_type=source_type,
-            content_hash=_hash_text(content),
+            content_hash=content_hash or _hash_text(content),
             word_count=_word_count(content),
             path=path or f"text:{_hash_text(content)[:12]}",
             file_type=file_type,
@@ -483,6 +504,11 @@ class IngestionPipeline:
     ) -> int:
         """The single ingestion core (#89): every entry point — file, URL,
         raw text, stdin — reduces to a reader over this."""
+        from .textclean import clean_document_text
+
+        # Invisible characters and stray whitespace never reach the reader
+        # or the embedder (code keeps its spacing).
+        content = clean_document_text(content, doc.file_type)
         llm_calls_start = self.llm.call_count
         mode = self.config.mode
         metrics.word_count = doc.word_count
@@ -605,7 +631,7 @@ class IngestionPipeline:
         # only for non-deep docs) so a small document's encounter memory
         # gets its own real appraisal instead of a neutral default.
         sample = self._sample_content(content)
-        overall_appraisal = await self.appraiser.appraise(content=sample, context=base_context, mode=mode)
+        overall_appraisal = await self._appraise_or_default(sample, base_context, mode)
         metrics.appraisal_valence = overall_appraisal.valence
         metrics.appraisal_arousal = overall_appraisal.arousal
         metrics.appraisal_emotion = overall_appraisal.primary_emotion
@@ -634,10 +660,18 @@ class IngestionPipeline:
         if _should_cancel(self.config):
             raise RuntimeError("Ingestion cancelled")
         max_items = self.config.max_facts_per_section
+        self.progress = {"sections": 0, "appraised": 0, "extracted": 0, "facts": 0, "saved": 0, "merged": 0}
+        # A long document is appraised once, up front.
+        await self._progress(sections=len(active_sections), appraised=0 if use_deep else len(active_sections))
 
         # Bounded LLM fan-out (#90): the rate-limit stampede bound — a large
         # document no longer launches every section's calls at once.
         llm_slots = asyncio.Semaphore(max(1, self.config.max_parallel_llm))
+
+        # One section's failure never discards the others: every section that
+        # extracted is persisted and receipted first, then the failed ones are
+        # reported together so the job retries only what is still missing.
+        failed_sections: list[tuple[Section, BaseException]] = []
 
         if use_deep:
             # Small docs: each section gets its own appraisal + extraction,
@@ -645,16 +679,22 @@ class IngestionPipeline:
             async def _appraise_and_extract(s: Section) -> tuple[Appraisal, list[Extraction]]:
                 async with llm_slots:
                     sample = self._sample_content(s.content)
-                    apr = await self.appraiser.appraise(content=sample, context=base_context, mode=mode)
+                    apr = await self._appraise_or_default(sample, base_context, mode)
+                    await self._progress(appraised=1)
                     exts = await self.extractor.extract(
                         section=s, doc=doc, appraisal=apr, mode=mode, max_items=max_items,
                     )
+                    await self._progress(extracted=1, facts=len(exts))
                     return apr, exts
 
             deep_results = await asyncio.gather(
-                *[_appraise_and_extract(s) for s in active_sections]
+                *[_appraise_and_extract(s) for s in active_sections], return_exceptions=True,
             )
-            for section, (appraisal, extractions) in zip(active_sections, deep_results):
+            for section, outcome in zip(active_sections, deep_results):
+                if isinstance(outcome, BaseException):
+                    failed_sections.append((section, outcome))
+                    continue
+                appraisal, extractions = outcome
                 # #86: per-section appraisals still shape extraction/decay
                 # (below) and metrics, but no longer overwrite live
                 # affective state -- that was the "30 times in quick
@@ -673,20 +713,26 @@ class IngestionPipeline:
                     section_hash=s_hash, chunk_index=section.index)
                 dedup_count += len(extractions) - len(new_memories)
                 created_ids.extend(new_memories)
+                await self._progress(saved=len(new_memories), merged=len(extractions) - len(new_memories))
         else:
             # Larger docs: shared appraisal, parallel extraction only
             appraisal = overall_appraisal if overall_appraisal is not None else Appraisal()
 
             async def _bounded_extract(s: Section) -> list[Extraction]:
                 async with llm_slots:
-                    return await self.extractor.extract(
+                    exts = await self.extractor.extract(
                         section=s, doc=doc, appraisal=appraisal, mode=mode, max_items=max_items,
                     )
+                    await self._progress(extracted=1, facts=len(exts))
+                    return exts
 
             section_extractions = await asyncio.gather(
-                *[_bounded_extract(s) for s in active_sections]
+                *[_bounded_extract(s) for s in active_sections], return_exceptions=True,
             )
             for section, extractions in zip(active_sections, section_extractions):
+                if isinstance(extractions, BaseException):
+                    failed_sections.append((section, extractions))
+                    continue
                 s_hash = section_hash_by_id[id(section)]
                 if not extractions:
                     await self.store.record_receipt(doc_ref, s_hash, source_path=doc.path)
@@ -697,9 +743,22 @@ class IngestionPipeline:
                     section_hash=s_hash, chunk_index=section.index)
                 dedup_count += len(extractions) - len(new_memories)
                 created_ids.extend(new_memories)
+                await self._progress(saved=len(new_memories), merged=len(extractions) - len(new_memories))
 
         if self.config.verbose:
             _emit(self.config, f"  Created {len(created_ids)} semantic memories")
+
+        if failed_sections:
+            for section, exc in failed_sections:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc
+                logger.warning("ingest: section %r of %r failed: %s", section.title, doc.title, exc)
+            titles = ", ".join(repr(sec.title) for sec, _ in failed_sections[:3])
+            raise IngestSectionError(
+                f"{len(failed_sections)} of {len(active_sections)} sections failed"
+                f" ({len(created_ids)} memories kept): {titles}: {failed_sections[0][1]}",
+                causes=[exc for _, exc in failed_sections],
+            )
 
         self.stats["files_processed"] += 1
         self.stats["memories_created"] += len(created_ids) + (1 if encounter_id else 0)
@@ -790,6 +849,15 @@ class IngestionPipeline:
             pass
         return ctx
 
+    async def _progress(self, **changes: int) -> None:
+        for key, value in changes.items():
+            self.progress[key] = self.progress.get(key, 0) + value
+        if self.on_progress is not None:
+            try:
+                await self.on_progress(dict(self.progress))
+            except Exception as exc:  # progress is for display; never fail ingestion over it
+                logger.debug("ingest progress report failed: %s", exc)
+
     def _source_payload(
         self,
         doc: DocumentInfo,
@@ -849,6 +917,17 @@ class IngestionPipeline:
         )
         await self._apply_decay(encounter_id, intensity=0.0)
         return encounter_id
+
+    async def _appraise_or_default(self, sample: str, context: dict[str, Any], mode: IngestionMode) -> Appraisal:
+        """Appraisal is colour, not knowledge: when the model cannot produce one,
+        the document still gets read, with a neutral appraisal."""
+        try:
+            return await self.appraiser.appraise(content=sample, context=context, mode=mode)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("ingest: appraisal failed, using neutral default: %s", exc)
+            return Appraisal()
 
     async def _create_encounter_memory(self, doc: DocumentInfo, appraisal: Appraisal | None, mode: IngestionMode) -> str | None:
         source = self._source_payload(doc)

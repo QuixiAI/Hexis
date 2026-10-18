@@ -9,7 +9,7 @@ section: operations
 
 # Workers
 
-Hexis has three independent background workers that drive autonomous behavior.
+Hexis has four independent background workers that drive autonomous behavior.
 
 ## Worker Types
 
@@ -17,6 +17,7 @@ Hexis has three independent background workers that drive autonomous behavior.
 |--------|---------|----------|
 | **Heartbeat** (conscious) | Polls `external_calls`, triggers heartbeats | `should_run_heartbeat()` |
 | **Maintenance** (subconscious) | Substrate upkeep, outbox/inbox bridging | `should_run_maintenance()` |
+| **Ingest** (reading) | Reads queued documents (uploads, pasted text, imported mail and chats) into memory | Woken by `NOTIFY ingestion_jobs`; rechecks every 30 s |
 | **Channel** | Bridges messaging platforms to RabbitMQ | Persistent connections |
 
 All workers are **stateless** -- they can be killed and restarted without losing anything. All state lives in Postgres.
@@ -90,7 +91,7 @@ docker compose restart heartbeat_worker maintenance_worker
 ### Via CLI
 
 ```bash
-hexis up       # start DB, queue, heartbeat worker, and maintenance worker
+hexis up       # start DB, queue, heartbeat, maintenance and ingest workers
 hexis start    # start workers manually if they were stopped
 hexis stop     # stop workers
 ```
@@ -105,7 +106,8 @@ Run workers on the host machine (connects to Postgres over TCP):
 ```bash
 hexis worker -- --mode heartbeat
 hexis worker -- --mode maintenance
-hexis worker -- --mode both
+hexis worker -- --mode ingest
+hexis worker -- --mode both   # all three in one process
 
 # For a specific instance
 hexis worker -- --instance myagent --mode heartbeat
@@ -116,6 +118,7 @@ Or directly:
 ```bash
 hexis-worker --mode heartbeat
 hexis-worker --mode maintenance
+hexis-worker --mode ingest
 ```
 
 ## Heartbeat Worker
@@ -143,6 +146,28 @@ UPDATE heartbeat_state SET is_paused = TRUE WHERE id = 1;
 
 -- Resume
 UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1;
+```
+
+## Ingest Worker
+
+The ingest worker reads queued documents into memory and does nothing else, so
+a document never waits behind the maintenance steps. It `LISTEN`s on the
+`ingestion_jobs` channel (a trigger on the job table sends `NOTIFY` for every
+pending job) and keeps `ingest.job_batch_size` documents in flight until the
+queue is empty, then rechecks every 30 seconds for retries coming due and jobs
+left in progress by a worker that stopped (`ingest.job_claim_timeout_s`).
+Several can run at once; claims use `SKIP LOCKED`.
+
+Each document is cleaned before it is read (invisible characters, odd spaces,
+blank-line runs; email also loses markup, entities and tracking links). Every
+reading call declares its output schema, a truncated answer is re-asked with a
+larger budget, and one section's failure never discards the others: the
+sections that read are kept and receipted, and the retry re-reads only what is
+missing. A model or embedding outage does not use up a document's attempts.
+Every reading call waits for a live chat turn to finish first (`chat.priority_max_wait_s`).
+
+```bash
+docker compose logs ingest_worker -f
 ```
 
 ## Maintenance Worker

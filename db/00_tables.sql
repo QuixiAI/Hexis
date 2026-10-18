@@ -538,7 +538,7 @@ CREATE TABLE embedding_cache (
 
 CREATE TABLE IF NOT EXISTS worker_instances (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    mode TEXT NOT NULL CHECK (mode IN ('heartbeat', 'maintenance', 'both', 'channel', 'unknown')),
+    mode TEXT NOT NULL CHECK (mode IN ('heartbeat', 'maintenance', 'both', 'channel', 'ingest', 'unknown')),
     instance_name TEXT,
     process_id INT,
     host_name TEXT,

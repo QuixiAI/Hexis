@@ -35,6 +35,7 @@ def _make_pipeline(plan: list[dict[str, Any]]) -> MagicMock:
     """The pipeline's store is fully async now (#88) — AsyncMock throughout."""
     pipeline = MagicMock()
     pipeline._skip_section.return_value = False
+    pipeline.config.cancel_check = None
     pipeline._source_payload.return_value = {
         "kind": "document",
         "ref": "test-doc.md",

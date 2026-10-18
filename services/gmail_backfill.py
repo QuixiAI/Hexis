@@ -7,7 +7,6 @@ I/O and message-to-source-document conversion.
 from __future__ import annotations
 
 import base64
-import html
 import json
 import logging
 import re
@@ -78,11 +77,8 @@ def _decode_body_data(data: Any) -> str:
         return ""
 
 
-def _strip_html(value: str) -> str:
-    cleaned = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
-    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
-    cleaned = html.unescape(cleaned)
-    return re.sub(r"\s+", " ", cleaned).strip()
+# Shared with every other document read into memory.
+from services.ingest.textclean import clean_email_text, strip_html as _strip_html  # noqa: E402
 
 
 def _walk_payload_parts(payload: dict[str, Any]):
@@ -103,9 +99,9 @@ def extract_message_body(payload: dict[str, Any]) -> str:
         if not data:
             continue
         if mime_type == "text/plain":
-            plain_parts.append(data)
+            plain_parts.append(clean_email_text(data))
         elif mime_type == "text/html":
-            html_parts.append(_strip_html(data))
+            html_parts.append(clean_email_text(_strip_html(data)))
 
     if plain_parts:
         return "\n\n".join(part.strip() for part in plain_parts if part.strip())
@@ -163,7 +159,7 @@ def gmail_message_to_source_item(message: dict[str, Any]) -> dict[str, Any]:
     labels = [str(label) for label in (message.get("labelIds") or []) if str(label).strip()]
     attachments = extract_message_attachments(payload)
     date_header = _header(headers, "Date")
-    snippet = str(message.get("snippet") or "")
+    snippet = clean_email_text(str(message.get("snippet") or ""))
 
     content_lines = [
         f"Subject: {subject}",

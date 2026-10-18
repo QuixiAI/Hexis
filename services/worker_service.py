@@ -903,7 +903,6 @@ class MaintenanceWorker:
             ("channel_backfill", self._run_channel_backfill_jobs),
             ("connector_cognition", self._run_connector_cognition),
             ("belief_update_retention", self._prune_belief_update_log),
-            ("ingestion_jobs", self._run_ingestion_jobs),
         ]
 
     async def _prune_belief_update_log(self) -> dict[str, Any]:
@@ -1148,18 +1147,6 @@ class MaintenanceWorker:
         if not result.get("skipped"):
             logger.info("Contradiction review digest: %s", result)
         return result
-
-    async def _run_ingestion_jobs(self) -> dict[str, Any]:
-        """Durable ingestion jobs (#87): the queue table is the state — no
-        state-doc gate, matching outbox delivery."""
-        if not self.pool:
-            return {"skipped": True, "reason": "no_pool"}
-        from services.ingest.jobs import run_ingestion_jobs_step
-
-        handled = await run_ingestion_jobs_step(self.pool)
-        if handled:
-            return {"handled": handled}
-        return {"skipped": True, "reason": "no_due_ingestion_jobs"}
 
     async def _run_gmail_backfill_jobs(self) -> dict[str, Any]:
         if not self.pool:
@@ -1556,9 +1543,16 @@ async def _amain(mode: str, instance: str | None = None) -> None:
     # Build the gateway consumer
     consumer = GatewayConsumer(consumer_pool, poll_interval=POLL_INTERVAL)
 
+    from services.ingest_worker import IngestWorker
+
+    # Reading has its own loop: it LISTENs for queued documents and reads them
+    # as they arrive, so a document never waits behind the maintenance steps.
+    ingest_worker = IngestWorker(instance)
+
     def _stop_all():
         hb_timer.stop()
         maint_worker.stop()
+        ingest_worker.stop()
         consumer.stop()
 
     heartbeat_handler = create_heartbeat_handler(
@@ -1588,10 +1582,14 @@ async def _amain(mode: str, instance: str | None = None) -> None:
             await asyncio.gather(hb_timer.run(), consumer.run())
         elif mode == "maintenance":
             await maint_worker.run()
+        elif mode == "ingest":
+            await ingest_worker.run()
         elif mode == "both":
-            await asyncio.gather(hb_timer.run(), consumer.run(), maint_worker.run())
+            await asyncio.gather(
+                hb_timer.run(), consumer.run(), maint_worker.run(), ingest_worker.run()
+            )
         else:
-            raise ValueError("mode must be one of: heartbeat, maintenance, both")
+            raise ValueError("mode must be one of: heartbeat, maintenance, ingest, both")
     finally:
         # Cleanup consumer resources
         if mcp_manager:
@@ -1614,7 +1612,7 @@ def main() -> int:
     )
     p.add_argument(
         "--mode",
-        choices=["heartbeat", "maintenance", "both"],
+        choices=["heartbeat", "maintenance", "ingest", "both"],
         default=os.getenv("HEXIS_WORKER_MODE", "both"),
         help="Which worker to run.",
     )

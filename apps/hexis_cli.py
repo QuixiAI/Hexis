@@ -741,7 +741,7 @@ def build_parser() -> argparse.ArgumentParser:
         service_control.add_argument(
             "services",
             nargs="*",
-            choices=["heartbeat", "maintenance", "channels", "all"],
+            choices=["heartbeat", "maintenance", "ingest", "channels", "all"],
             help="Services to control (default: all installed)",
         )
         service_control.set_defaults(func=f"service_{action}")
@@ -754,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_logs.add_argument(
         "services",
         nargs="*",
-        choices=["heartbeat", "maintenance", "channels", "all"],
+        choices=["heartbeat", "maintenance", "ingest", "channels", "all"],
         help="Services to read (default: all installed)",
     )
     service_logs.add_argument("--follow", "-f", action="store_true", help="Follow logs")
@@ -770,7 +770,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_uninstall.add_argument(
         "services",
         nargs="*",
-        choices=["heartbeat", "maintenance", "channels", "all"],
+        choices=["heartbeat", "maintenance", "ingest", "channels", "all"],
         help="Services to remove (default: all installed)",
     )
     service_uninstall.add_argument(
@@ -3259,7 +3259,7 @@ def _running_container_workers(
     )
     if rc != 0:
         return None, compose_cmd
-    worker_names = {"heartbeat_worker", "maintenance_worker", "channel_worker"}
+    worker_names = {"heartbeat_worker", "maintenance_worker", "ingest_worker", "channel_worker"}
     running = sorted({part for part in out.split() if part in worker_names})
     return running, compose_cmd
 
@@ -3303,6 +3303,7 @@ def _host_managed_compose_workers() -> set[str]:
         mapping = {
             "heartbeat": "heartbeat_worker",
             "maintenance": "maintenance_worker",
+            "ingest": "ingest_worker",
             "channels": "channel_worker",
         }
         return {mapping[name] for name in installed_host_services() if name in mapping}
@@ -3428,7 +3429,7 @@ def _handle_host_service_command(
     func = str(getattr(args, "func", "service_status"))
     try:
         if func == "service_install":
-            requested = ["heartbeat", "maintenance"]
+            requested = ["heartbeat", "maintenance", "ingest"]
             if args.channels:
                 requested.append("channels")
             running_workers, compose_cmd = _running_container_workers(
@@ -6942,7 +6943,7 @@ def _handle_ui_container(
         host_workers_ok, _host_error = _ensure_installed_host_services_running()
     docker_worker_targets = [
         name
-        for name in ("heartbeat_worker", "maintenance_worker")
+        for name in ("heartbeat_worker", "maintenance_worker", "ingest_worker")
         if name not in host_managed_workers
     ]
     docker_workers_ok = True
@@ -7635,7 +7636,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         "reset",
         "upgrade",
     }
-    if {"heartbeat_worker", "maintenance_worker"} <= host_managed_workers:
+    if {"heartbeat_worker", "maintenance_worker", "ingest_worker"} <= host_managed_workers:
         docker_cmds -= {"start", "stop"}
     docker_bin: str | None = None
     compose_cmd: list[str] | None = None
@@ -8151,11 +8152,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return 1
         docker_targets = [
             name
-            for name in ("heartbeat_worker", "maintenance_worker")
+            for name in ("heartbeat_worker", "maintenance_worker", "ingest_worker")
             if name not in host_managed_workers
         ]
         if not docker_targets:
-            print("Started heartbeat and maintenance host services.")
+            print("Started heartbeat, maintenance and ingest host services.")
             return 0
         return run_compose(
             compose_cmd or [],
@@ -8172,11 +8173,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return 1
         docker_targets = [
             name
-            for name in ("heartbeat_worker", "maintenance_worker")
+            for name in ("heartbeat_worker", "maintenance_worker", "ingest_worker")
             if name not in host_managed_workers
         ]
         if not docker_targets:
-            print("Stopped heartbeat and maintenance host services.")
+            print("Stopped heartbeat, maintenance and ingest host services.")
             return 0
         return run_compose(
             compose_cmd or [],

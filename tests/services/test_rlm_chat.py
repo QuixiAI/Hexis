@@ -79,7 +79,7 @@ class TestRLMChatLoop:
             "FINAL(Hi hon.)",
         ])
 
-        async def fake_completion(messages, llm_config, max_tokens=4096):
+        async def fake_completion(messages, llm_config, max_tokens=4096, **_kwargs):
             return next(responses)
 
         monkeypatch.setattr(rlm, "_llm_completion", fake_completion)
@@ -110,7 +110,7 @@ class TestRLMChatLoop:
         import services.hexis_rlm as rlm
         from services.rlm_repl import HexisLocalREPL
 
-        async def fake_completion(messages, llm_config, max_tokens=4096):
+        async def fake_completion(messages, llm_config, max_tokens=4096, **_kwargs):
             return """```repl
 response = "Hi hon."
 ```

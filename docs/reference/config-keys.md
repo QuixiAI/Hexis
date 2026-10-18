@@ -376,7 +376,12 @@ separately and cannot be cleared by any setting below.
 | `ingest.artifact_max_db_bytes` | int | Originals up to this size are stored in-DB; larger go to `$HEXIS_ARTIFACT_DIR` (default `26214400`) |
 | `ingest.xlsx_max_rows_per_sheet` | int | Spreadsheet row cap per sheet — capping always emits a `truncated_rows` warning (default `5000`) |
 | `ingest.upload_max_bytes` | int | Upload API file-size cap; larger files use the CLI (default `104857600`) |
-| `ingest.job_*` | various | Durable ingestion-job queue: content cap, claim timeout, retry backoff, batch size |
+| `ingest.job_batch_size` | int | Documents the ingest worker reads at once (default `4`) |
+| `ingest.job_claim_timeout_s` | int | Seconds without a progress refresh before another worker may reclaim a reading job; a restarted worker's documents resume after this (default `120`) |
+| `ingest.job_step_budget_s` | int | Seconds a shared-loop caller (CLI, tests) keeps claiming queued documents before handing control back (default `120`) |
+| `ingest.job_max_content_chars` / `ingest.job_retry_base_seconds` | int | Durable ingestion-job queue: content cap and retry backoff base |
+| `ingest.llm_max_tokens` | int | Output token budget per reading call, including a reasoning model's thinking; a truncated answer is re-asked with double the budget (default `8000`) |
+| `ingest.llm_reasoning_effort` | string | Reasoning effort sent with reading calls (`none`, `low`, …); unset leaves the model's default |
 
 ## Chat Turn Limits
 

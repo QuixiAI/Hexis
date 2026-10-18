@@ -930,7 +930,7 @@ async def doctor_payload(
                 if mode not in latest_by_mode:
                     latest_by_mode[mode] = row
 
-            expected_modes = ("heartbeat", "maintenance")
+            expected_modes = ("heartbeat", "maintenance", "ingest")
             missing = [m for m in expected_modes if m not in latest_by_mode]
             stale = [
                 m

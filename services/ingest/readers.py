@@ -801,7 +801,7 @@ class EmailReader(DocumentReader):
                     if ct == "text/html":
                         payload = part.get_payload(decode=True)
                         if payload:
-                            body = re.sub(r"<[^>]+>", "", payload.decode("utf-8", errors="replace"))
+                            body = payload.decode("utf-8", errors="replace")
                             break
         else:
             payload = msg.get_payload(decode=True)
@@ -810,8 +810,11 @@ class EmailReader(DocumentReader):
             elif isinstance(msg.get_payload(), str):
                 body = msg.get_payload()
 
+        from .textclean import clean_email_text
+
         header = f"[Email]\n[Subject: {subject}]\n[From: {from_addr}]\n[To: {to_addr}]\n[Date: {date}]"
-        return f"{header}\n\n{body.strip()}"
+        # Same cleanup as imported Gmail: markup, entities, padding, tracking links.
+        return f"{header}\n\n{clean_email_text(body)}"
 
 
 class EpubReader(DocumentReader):
