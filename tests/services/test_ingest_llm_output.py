@@ -32,13 +32,33 @@ def test_extraction_parse_defaults_bad_scores_without_guessing(caplog):
         items = KnowledgeExtractor._parse(raw, max_items=20)
     assert [i.content for i in items] == ["Jen owns Aflac dashboard access.", "Tinybox does 151 tok/s."]
     first, second = items
-    # A word is not a score; it gets the default, not a lookup table.
-    assert first.importance == 0.5
-    assert first.confidence == 1.0  # numbers are clamped, never rescaled
+    # A server that ignored the schema may answer with a word from a small
+    # scale or a 1-10 score; both are read honestly rather than defaulted.
+    assert first.importance == 0.25
+    assert first.confidence == 0.7
     assert first.category == "fact"
+    # A fraction past the range is an overshoot, not a 1-10 score: clamped.
     assert second.importance == 1.0 and second.confidence == 0.0
     assert second.connections == ["a"] and second.supports is None and second.concepts == ["tinybox"]
-    assert "importance='low'" in caplog.text
+    assert "importance=" not in caplog.text
+
+
+def test_scores_read_words_numeric_strings_and_ten_point_scales(caplog):
+    from services.ingest.llm import _float_in, _unit
+
+    assert _unit("High", 0.0, field="x") == 0.75
+    assert _unit(" 0.4 ", 0.0, field="x") == 0.4
+    assert _unit(7, 0.0, field="x") == 0.7
+    assert _unit(1.4, 0.0, field="x") == 1.0
+    assert _unit(10, 0.0, field="x") == 1.0
+    assert _unit(11, 0.0, field="x") == 1.0
+    assert _float_in(-3, -1.0, 1.0, 0.0, field="valence") == -1.0
+    with caplog.at_level(logging.WARNING):
+        assert _unit("positive", 0.3, field="arousal") == 0.3
+        assert _unit(True, 0.3, field="arousal") == 0.3
+        assert _unit(None, 0.3, field="arousal") == 0.3
+    assert "arousal='positive' is not a score" in caplog.text
+    assert "arousal=None" not in caplog.text
 
 
 def test_extraction_parse_respects_max_items_and_missing_items():
@@ -54,8 +74,8 @@ def test_appraisal_parse_defaults_everything_unusable():
         "worldview_tension": True, "summary": 42,
     })
     assert apr == Appraisal(
-        valence=0.0, arousal=1.0, primary_emotion="neutral", intensity=0.0,
-        goal_relevance=[{"goal": "sell", "strength": 0.5}], worldview_tension=0.0, curiosity=0.0, summary="",
+        valence=0.0, arousal=0.5, primary_emotion="neutral", intensity=0.0,
+        goal_relevance=[{"goal": "sell", "strength": 0.75}], worldview_tension=0.0, curiosity=0.0, summary="",
     )
 
 

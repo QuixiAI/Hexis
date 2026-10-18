@@ -170,6 +170,35 @@ Every reading call waits for a live chat turn to finish first (`chat.priority_ma
 docker compose logs ingest_worker -f
 ```
 
+### Reading speed and load on the model
+
+Imported history is read in the background with the background model. Chat
+always comes first: while someone is chatting, reading waits before each model
+call. Three settings control the rest:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `ingest.job_batch_size` | 4 | Documents read at the same time |
+| `ingest.max_parallel_llm` | 4 | Model calls at the same time per document |
+| `ingest.llm_reasoning_effort` | not set | Thinking for reading calls: `none`, `low`, `medium`, `high`; not set leaves the model's default |
+
+At most `job_batch_size × max_parallel_llm` reading calls (16 by default) run at
+once. Lower them for a hosted API with rate limits or a small GPU. A thinking
+model reads much faster with less thinking; the effect on what it remembers
+depends on the model. In one measurement (GLM-5.3-Flash reading 20 days of
+chat history) the default read 3.2 documents a minute; `none` read 8.3 a minute
+with the same judged coverage, and `low` found 41% fewer facts. Compare on your
+own model before changing it. A server that does not accept the setting is
+asked without it. Change a setting with:
+
+```bash
+docker exec hexis_brain psql -U hexis_user -d hexis_memory \
+  -c "SELECT set_config('ingest.llm_reasoning_effort', '\"none\"'::jsonb)"
+```
+
+(Use your `POSTGRES_USER` and `POSTGRES_DB` if you changed them.) It applies to
+documents that start reading after the change.
+
 ## Maintenance Worker
 
 The maintenance worker handles subconscious upkeep:

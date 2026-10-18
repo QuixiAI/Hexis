@@ -930,7 +930,8 @@ CREATE OR REPLACE FUNCTION heartbeat_in_progress() RETURNS BOOLEAN
            AND (last_heartbeat_at IS NULL
                 OR last_heartbeat_at > CURRENT_TIMESTAMP - make_interval(secs => GREATEST(
                     COALESCE(get_config_int('heartbeat.claim_timeout_s'), 1800),
-                    COALESCE(get_config_int('rlm.heartbeat.timeout_seconds'), 300) + 600)))
+                    COALESCE(get_config_int('rlm.heartbeat.timeout_seconds'), 300) + 600,
+                    COALESCE(get_config_int('rlm.heartbeat.user_goal_timeout_seconds'), 1800) + 600)))
         FROM heartbeat_state WHERE id = 1
     ), FALSE);
 $$;

@@ -111,13 +111,35 @@ def response_format_for(name: str, schema: dict[str, Any]) -> dict[str, Any]:
 # VALIDATION
 # =========================================================================
 
+_WORD_SCORES = {
+    "none": 0.0, "very low": 0.1, "low": 0.25, "medium": 0.5, "moderate": 0.5,
+    "high": 0.75, "very high": 0.9,
+}
+
+
 def _float_in(value: Any, low: float, high: float, default: float, *, field: str) -> float:
-    """A score the schema already bounded; anything else is defaulted, not guessed."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """A score the schema bounded, or the nearest honest reading of what a
+    server that ignored the schema sent back: a word from a small scale
+    ("low"), a numeric string, or a 1-10 score (rescaled to the unit range).
+    Anything else is defaulted, not guessed."""
+    if isinstance(value, str) and value.strip().lower() in _WORD_SCORES:
+        return min(max(_WORD_SCORES[value.strip().lower()], low), high)
+    if isinstance(value, bool):
+        number = None
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        try:
+            number = float(value.strip()) if isinstance(value, str) and value.strip() else None
+        except ValueError:
+            number = None
+    if number is None:
         if value is not None:
-            logger.warning("ingest: %s=%r is not a number; using %.2f", field, value, default)
+            logger.warning("ingest: %s=%r is not a score; using %.2f", field, value, default)
         return default
-    return min(max(float(value), low), high)
+    if number > high and number <= 10 and number.is_integer():
+        number = number / 10  # a whole number past the range is a 1-10 score
+    return min(max(number, low), high)
 
 
 def _unit(value: Any, default: float, *, field: str) -> float:

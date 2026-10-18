@@ -19,6 +19,7 @@ async def test_fresh_claim_blocks_and_stale_claim_does_not(db_pool):
         try:
             await conn.execute("SELECT set_config('heartbeat.claim_timeout_s', '1800'::jsonb)")
             await conn.execute("SELECT set_config('rlm.heartbeat.timeout_seconds', '300'::jsonb)")
+            await conn.execute("SELECT set_config('rlm.heartbeat.user_goal_timeout_seconds', '300'::jsonb)")
             await _claim(conn, "5 minutes")
             assert await conn.fetchval("SELECT heartbeat_in_progress()") is True
 
@@ -39,10 +40,31 @@ async def test_a_long_heartbeat_still_counts_as_running(db_pool):
             # The RLM heartbeat may run 30 minutes: 35 minutes in it may still be finishing.
             await conn.execute("SELECT set_config('heartbeat.claim_timeout_s', '1800'::jsonb)")
             await conn.execute("SELECT set_config('rlm.heartbeat.timeout_seconds', '1800'::jsonb)")
+            await conn.execute("SELECT set_config('rlm.heartbeat.user_goal_timeout_seconds', '300'::jsonb)")
             await _claim(conn, "35 minutes")
             assert await conn.fetchval("SELECT heartbeat_in_progress()") is True
             await _claim(conn, "41 minutes")
             assert await conn.fetchval("SELECT heartbeat_in_progress()") is False  # abandoned
+        finally:
+            await tx.rollback()
+
+
+async def test_a_heartbeat_on_the_users_goal_still_counts_as_running(db_pool):
+    async with db_pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            # A heartbeat working on the user's goal may run user_goal_timeout_seconds
+            # (30 minutes by default), longer than an ordinary one and the claim timeout.
+            await conn.execute("SELECT set_config('heartbeat.claim_timeout_s', '600'::jsonb)")
+            await conn.execute("SELECT set_config('rlm.heartbeat.timeout_seconds', '300'::jsonb)")
+            await conn.execute("SELECT set_config('rlm.heartbeat.user_goal_timeout_seconds', '1800'::jsonb)")
+            await _claim(conn, "25 minutes")
+            assert await conn.fetchval("SELECT heartbeat_in_progress()") is True
+            await _claim(conn, "39 minutes")
+            assert await conn.fetchval("SELECT heartbeat_in_progress()") is True
+            await _claim(conn, "41 minutes")
+            assert await conn.fetchval("SELECT heartbeat_in_progress()") is False
         finally:
             await tx.rollback()
 

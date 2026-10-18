@@ -166,6 +166,39 @@ async def test_listing_asks_the_endpoint_with_the_resolved_key(monkeypatch):
     assert await init_api.list_models("conscious", {"provider": "anthropic", "api_key": "k"}) == {"models": [], "key_source": "typed"}
 
 
+async def test_listing_models_never_sends_another_providers_saved_key(monkeypatch):
+    # A key saved for one provider must not reach a different provider's
+    # endpoint when the user switches provider in the form without typing a key.
+    store.save_auth("llm.conscious", {"api_key": "old-anthropic-key", "provider": "anthropic"})
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"data": [{"id": "local-model"}]}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, headers=None):
+            seen.update(url=url, headers=headers or {})
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    result = await init_api.list_models("conscious", {
+        "provider": "openai_compatible", "endpoint": "https://new-provider.invalid/v1",
+    })
+    assert result["models"] == ["local-model"]
+    assert result["key_source"] is None
+    assert "Authorization" not in seen["headers"]
+    cfg = init_api.resolve_setup_config("conscious", {"provider": "openai", "model": "m"})
+    assert cfg["api_key"] is None
+    monkeypatch.setenv("OPENAI_API_KEY", "new-provider-env-key")
+    cfg = init_api.resolve_setup_config("conscious", {"provider": "openai", "model": "m"})
+    assert cfg["api_key"] == "new-provider-env-key"
+    assert cfg["key_source"] == "env"
+
+
 # ---------------------------------------------------------------------------
 # The HTTP surface the dashboard proxies to
 # ---------------------------------------------------------------------------

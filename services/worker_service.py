@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import socket
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -1256,18 +1257,39 @@ class MaintenanceWorker:
         the pipeline never blocks on the embedding sidecar)."""
         if not self.pool:
             return {"skipped": True, "reason": "no_pool"}
-        async with self.pool.acquire() as conn:
-            result = await run_source_chunk_embed_step(conn)
+        result = await self._drain(run_source_chunk_embed_step)
         if not result.get("skipped"):
             logger.info("Source chunk embed step: %s", result)
         return result
+
+    async def _drain(self, step, budget_seconds: float = 60.0) -> dict[str, Any]:
+        """Run an embed step until its backlog is empty or the time budget is
+        spent, so new memories become searchable as fast as they are created
+        instead of one batch per maintenance tick."""
+        totals: dict[str, Any] = {}
+        deadline = time.monotonic() + budget_seconds
+        batches = 0
+        while True:
+            async with self.pool.acquire() as conn:
+                result = await step(conn)
+            if result.get("skipped"):
+                break
+            batches += 1
+            for key, value in result.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    totals[key] = totals.get(key, 0) + value
+            if not result.get("claimed") or time.monotonic() >= deadline:
+                break
+        if not batches:
+            return result
+        totals["batches"] = batches
+        return totals
 
     async def _run_memory_embedding(self) -> dict[str, Any]:
         """Embed pending durable memories off the memory-creation path."""
         if not self.pool:
             return {"skipped": True, "reason": "no_pool"}
-        async with self.pool.acquire() as conn:
-            result = await run_memory_embed_step(conn)
+        result = await self._drain(run_memory_embed_step)
         if not result.get("skipped"):
             logger.info("Memory embed step: %s", result)
         return result

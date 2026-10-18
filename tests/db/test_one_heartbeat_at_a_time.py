@@ -37,6 +37,7 @@ async def test_a_claim_counts_until_the_longest_run_plus_ten_minutes(db_pool):
         try:
             await conn.execute("SELECT set_config('heartbeat.claim_timeout_s', '60'::jsonb)")
             await conn.execute("SELECT set_config('rlm.heartbeat.timeout_seconds', '1200'::jsonb)")
+            await conn.execute("SELECT set_config('rlm.heartbeat.user_goal_timeout_seconds', '300'::jsonb)")
             await _reset(conn, "00000000-0000-0000-0000-0000000000aa", "CURRENT_TIMESTAMP - interval '25 minutes'")
             assert await conn.fetchval("SELECT heartbeat_in_progress()") is True
             await _reset(conn, "00000000-0000-0000-0000-0000000000aa", "CURRENT_TIMESTAMP - interval '31 minutes'")
