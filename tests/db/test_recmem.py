@@ -359,6 +359,17 @@ async def test_recmem_route_merge_raw_only_and_create_paths(db_pool):
         try:
             await conn.execute("SELECT set_config('memory.recmem_theta_count', '3'::jsonb)")
             target_mem = await _insert_memory(conn, "existing apple episode", axis=1)
+            # The episode is of a conversation with the same speaker ("User").
+            earlier = await _insert_embedded_unit(conn, "earlier apple talk", axis=9, route_status="episode_created")
+            await conn.fetchval("SELECT link_memory_to_source_unit($1, $2, 'source')", target_mem, earlier)
+
+            # Someone else's similar turn is never merged into it.
+            other = await _insert_embedded_unit(conn, "apple from ken", axis=1, route_status="routing")
+            await conn.execute(
+                "UPDATE subconscious_units SET content = 'Ken: apple from ken\n\nAssistant: ok' WHERE id = $1", other)
+            other_result = _json(await conn.fetchval("SELECT recmem_route_unit($1::uuid)", other))
+            assert other_result["status"] != "merge_queued"
+
             merge_unit = await _insert_embedded_unit(conn, "apple recurrence", axis=1, route_status="routing")
 
             merge_result = _json(await conn.fetchval("SELECT recmem_route_unit($1::uuid)", merge_unit))

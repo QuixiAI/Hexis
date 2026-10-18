@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, TYPE_CHECKING
@@ -47,6 +48,70 @@ logger = logging.getLogger(__name__)
 _SUBCONSCIOUS_MEMORY_CONTEXT_CHARS = 4000
 _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS = 7000
 _MAX_VISUAL_ATTACHMENTS_PER_TURN = 8
+
+
+# Scripts a message can be written in. Kana marks Japanese and Hangul Korean
+# (kanji alone may be a name); Latin words mark a Latin-script language.
+_SCRIPTS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("Japanese", re.compile(r"[\u3040-\u30ff]")),
+    ("Korean", re.compile(r"[\uac00-\ud7af]")),
+    ("Cyrillic", re.compile(r"[\u0400-\u04ff]")),
+    ("Arabic", re.compile(r"[\u0600-\u06ff]")),
+    ("Hebrew", re.compile(r"[\u0590-\u05ff]")),
+    ("Thai", re.compile(r"[\u0e00-\u0e7f]")),
+    ("Devanagari", re.compile(r"[\u0900-\u097f]")),
+    ("Greek", re.compile(r"[\u0370-\u03ff]")),
+]
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uff00-\uffef]")
+_LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
+
+
+def _reply_language(user_message: str) -> str | None:
+    """A script name, "latin" for a Latin-script language, or None when the
+    message can't tell (names, numbers or code only)."""
+    for name, pattern in _SCRIPTS:
+        if pattern.search(user_message):
+            return name
+    words = len(_LATIN_WORD.findall(user_message))
+    if words >= 3 or (words >= 2 and not _CJK.search(user_message)):
+        return "latin"
+    return None
+
+
+# A system-prompt rule alone lost to a context full of another language:
+# after one Japanese turn, with Japanese memories recalled, or once foreign
+# tool results came back, English questions got answers in that language. So
+# each turn states its language twice: in the system prompt, which stays in
+# view through every tool round, and right after the message.
+def _reply_language_note(user_message: str) -> str | None:
+    lang = _reply_language(user_message)
+    if lang is None:
+        return None
+    if lang == "latin":
+        return (
+            "[REPLY LANGUAGE] The language the user wrote this message in, "
+            "even if earlier turns, recalled memories or tool results are in another language."
+        )
+    return f"[REPLY LANGUAGE] {lang}: the user wrote this message in {lang}."
+
+
+def _reply_language_addendum(user_message: str) -> list[str]:
+    lang = _reply_language(user_message)
+    if lang is None:
+        return []
+    written = "the language of the user's latest message" if lang == "latin" else lang
+    return [
+        "## Reply language (this turn)\n"
+        f"Write everything you say this turn in {written}: the answer and any text before "
+        "or between tool calls, even when tool results, recalled memories or earlier turns "
+        "are in another language. Quote sources in their original language when quoting."
+    ]
+
+
+def _with_reply_language(user_message: str) -> str:
+    """The person's message, followed by the language to answer it in."""
+    note = _reply_language_note(user_message)
+    return user_message + (f"\n\n{note}" if note else "")
 
 
 def _visual_attachment_parts(
@@ -1041,6 +1106,7 @@ async def run_agent(
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
+        prompt_addenda=_reply_language_addendum(user_message) if mode == "chat" else None,
     )
 
     # 5. Build enriched user message
@@ -1059,7 +1125,7 @@ async def run_agent(
 
     # Add the actual user message
     if mode == "chat":
-        enriched_parts.append(f"[USER MESSAGE]\n{user_message}")
+        enriched_parts.append(f"[USER MESSAGE]\n{_with_reply_language(user_message)}")
     else:
         enriched_parts.append(user_message)
 
@@ -1329,7 +1395,7 @@ async def stream_agent(
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
-        prompt_addenda=prompt_addenda,
+        prompt_addenda=[*(prompt_addenda or []), *(_reply_language_addendum(user_message) if mode == "chat" else [])],
     )
 
     # Build enriched user message (signals were rendered by the DB in-scope)
@@ -1340,7 +1406,7 @@ async def stream_agent(
         enriched_parts.append(continuity_context)
     if memory_context:
         enriched_parts.append(memory_context)
-    enriched_parts.append(f"[USER MESSAGE]\n{user_message}")
+    enriched_parts.append(f"[USER MESSAGE]\n{_with_reply_language(user_message)}")
     enriched_user_message = "\n\n".join(enriched_parts)
     enriched_user_content = _user_content_with_visuals(
         enriched_user_message,

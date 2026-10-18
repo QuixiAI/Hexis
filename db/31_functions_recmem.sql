@@ -912,6 +912,14 @@ RETURNS INT AS $$
     WHERE status IN ('pending','in_progress');
 $$ LANGUAGE sql STABLE;
 
+-- The speaker a raw turn starts with ("Mia Tanaka (Slack user U…): …").
+-- Episodes stay within one person's conversations: a turn of Ken's is never
+-- merged into Mia's episode, and recurrence is one person coming back to
+-- something.
+CREATE OR REPLACE FUNCTION _recmem_speaker(p_content TEXT) RETURNS TEXT
+    LANGUAGE sql IMMUTABLE
+    AS $f$ SELECT btrim(split_part(COALESCE(p_content, ''), ':', 1)) $f$;
+
 CREATE OR REPLACE FUNCTION recmem_route_unit(
     p_unit_id UUID
 ) RETURNS JSONB AS $$
@@ -947,6 +955,14 @@ BEGIN
       AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
       AND m.type = 'episodic'
       AND m.embedding IS NOT NULL
+      -- Only an episode of a conversation with the same person: a turn of
+      -- Ken's must never be merged into Mia's private episode.
+      AND EXISTS (
+          SELECT 1 FROM memory_source_units msu
+          JOIN subconscious_units su ON su.id = msu.subconscious_unit_id
+          WHERE msu.memory_id = m.id
+            AND _recmem_speaker(su.content) = _recmem_speaker(unit_row.content)
+      )
     ORDER BY m.embedding <=> unit_row.embedding
     LIMIT 1;
 
@@ -1029,6 +1045,13 @@ BEGIN
         WHERE s.status = 'active'
           AND s.embedding_status = 'embedded'
           AND s.embedding IS NOT NULL
+          -- Recurrence is about one person coming back to something, and it
+          -- must not retell turns that are already part of an episode.
+          AND _recmem_speaker(s.content) = _recmem_speaker(unit_row.content)
+          AND (s.id = unit_row.id OR NOT EXISTS (
+              SELECT 1 FROM memory_source_units msu
+              WHERE msu.subconscious_unit_id = s.id
+                AND msu.role IN ('source', 'direct_promotion', 'merge_addition')))
         ORDER BY s.embedding <=> unit_row.embedding
         LIMIT GREATEST(top_k, theta_count)
     ),

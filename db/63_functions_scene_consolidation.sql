@@ -45,6 +45,7 @@ BEGIN
       -- was consolidated — the scene still needs to exist.
       AND NOT EXISTS (
           SELECT 1 FROM memory_source_units msu
+          JOIN memories em ON em.id = msu.memory_id AND em.type = 'episodic'
           WHERE msu.subconscious_unit_id = s.id
             AND msu.role IN ('source', 'direct_promotion', 'merge_addition')
       )

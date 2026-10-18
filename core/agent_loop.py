@@ -360,6 +360,7 @@ class AgentLoop:
         self._tool_calls_made: list[dict[str, Any]] = []
         self._tool_results: list[dict[str, Any]] = []
         self._last_text: str = ""
+        self._streamed_text: bool = False
         self._visible_text_parts: list[str] = []
         self._streaming: bool = False
         self._continuations_used: int = 0
@@ -577,8 +578,17 @@ class AgentLoop:
         )
 
         if self._streaming:
+            first_token = True
 
             async def _on_text_delta(token: str) -> None:
+                nonlocal first_token
+                # Text from a later model call (after tool results) is a new
+                # paragraph; joined as-is it ran into the previous sentence.
+                if first_token and self._streamed_text and token.strip():
+                    token = "\n\n" + token.lstrip()
+                if token.strip():
+                    first_token = False
+                    self._streamed_text = True
                 await self._emit(AgentEvent.TEXT_DELTA, {
                     "text": token,
                     "iteration": self._iteration_count,

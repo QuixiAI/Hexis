@@ -895,6 +895,7 @@ class MaintenanceWorker:
             ("memory_summarization", self._run_memory_rest_if_enabled),
             ("retention_surface", self._run_retention_surface),
             ("conscious_extraction", self._run_extraction_if_enabled),
+            ("transcript_retention", self._run_transcript_retention_if_due),
             ("origin_seed", self._run_origin_seed_if_enabled),
             ("skill_improvement", self._run_skill_improvement_if_due),
             ("learning_skill_application", self._run_approved_learning_skill),
@@ -1307,6 +1308,31 @@ class MaintenanceWorker:
             return {"skipped": True, "reason": "no_pool"}
         async with self.pool.acquire() as conn:
             return await publish_retention_surface(conn)
+
+    async def _run_transcript_retention_if_due(self) -> dict[str, Any]:
+        """Once a day, delete raw transcripts past their retention limits
+        (db: run_transcript_retention; memories are not affected)."""
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        async with self.pool.acquire() as conn:
+            due = await conn.fetchval(
+                """
+                SELECT COALESCE(
+                    (SELECT (value #>> '{}')::timestamptz FROM config
+                     WHERE key = 'retention.transcripts_last_run'),
+                    '-infinity'::timestamptz) < CURRENT_TIMESTAMP - INTERVAL '1 day'
+                """
+            )
+            if not due:
+                return {"skipped": True, "reason": "ran_today"}
+            raw = await conn.fetchval("SELECT run_transcript_retention()")
+            result = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            await conn.execute(
+                "SELECT set_config('retention.transcripts_last_run', to_jsonb(CURRENT_TIMESTAMP::text))"
+            )
+        if isinstance(result, dict) and any(isinstance(v, int) and v for v in result.values()):
+            logger.info("Transcript retention: %s", result)
+        return result if isinstance(result, dict) else {}
 
     async def _run_extraction_if_enabled(self) -> dict[str, Any]:
         """Sweep conscious episodes (chat turns + heartbeat episodes) into

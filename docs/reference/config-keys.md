@@ -325,10 +325,10 @@ separately and cannot be cleared by any setting below.
 | Key | Type | Description |
 |-----|------|-------------|
 | `extraction.enabled` | bool | Sweep chat turns + heartbeat episodes into selective durable memories (default `true`; kill switch) |
-| `extraction.min_importance` | float | Units below this importance never earn an LLM pass (default `0.6`) |
+| `extraction.min_importance` | float | Units below this importance never earn an LLM pass (default `0.4`; turns are recorded at 0.5, and the encoder itself is selective) |
 | `extraction.batch_size` | int | Units claimed per extraction sweep (default `8`) |
 | `extraction.min_confidence` | float | Extracted facts below this confidence are dropped (default `0.55`) |
-| `extraction.max_facts_per_batch` | int | Soft cost cap on facts per sweep (default `5`) |
+| `extraction.max_facts_per_batch` | int | Soft cost cap on facts per sweep (default `16`; one claim per fact, scaled to substance) |
 
 ## Memory Budgets
 
@@ -377,6 +377,18 @@ separately and cannot be cleared by any setting below.
 | `ingest.xlsx_max_rows_per_sheet` | int | Spreadsheet row cap per sheet — capping always emits a `truncated_rows` warning (default `5000`) |
 | `ingest.upload_max_bytes` | int | Upload API file-size cap; larger files use the CLI (default `104857600`) |
 | `ingest.job_*` | various | Durable ingestion-job queue: content cap, claim timeout, retry backoff, batch size |
+
+## Transcript Retention
+
+Raw transcripts are deleted after a set time; memories are not affected (they fade on the rules below). `run_transcript_retention()` runs once a day in the maintenance worker, in batches, and the Settings page's Retention tab edits these.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `retention.transcripts_enabled` | bool | Delete raw transcripts past the limits below (default `true`) |
+| `retention.turn_trace_days` | int | Days to keep per-turn traces: full prompts, tool calls and results (default `30`; `0` keeps forever) |
+| `retention.conversation_days` | int | Days to keep a web-chat or channel conversation after its last activity, with its per-message documents (default `365`; `0` keeps forever) |
+| `retention.raw_turn_days` | int | Days to keep raw turns the memory system has finished with and that are not pinned (default `365`; `0` keeps forever) |
+| `retention.transcript_batch_size` | int | Rows of each kind deleted per pass (default `500`) |
 
 ## Memory and Source Retention
 

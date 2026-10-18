@@ -4,8 +4,8 @@
 SET search_path = public, ag_catalog, "$user";
 
 INSERT INTO config_defaults (key, value, description) VALUES
-    ('channel.source_artifacts_enqueue_inbound', 'true'::jsonb,
-     'Whether inbound channel messages automatically queue source-document ingestion jobs')
+    ('channel.source_artifacts_enqueue_inbound', 'false'::jsonb,
+     'Whether inbound channel messages also queue source-document ingestion jobs (the conversation already records each turn for the memory encoder; ingesting them too wrote an encounter memory per message)')
 ON CONFLICT (key) DO NOTHING;
 
 CREATE OR REPLACE FUNCTION _channel_message_sensitivity(p_metadata JSONB)

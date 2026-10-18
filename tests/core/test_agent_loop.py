@@ -1111,6 +1111,34 @@ class TestStreaming:
         assert registry.execute.await_count == 0
 
 
+class TestParagraphs:
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_text_after_a_tool_round_starts_a_new_paragraph(self, mock_stream_llm):
+        """Joined as streamed, text from two model calls ran together ("…sources.Found it")."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 1
+        registry = _mock_registry(execute_results={"recall": tool_result})
+        call_count = 0
+
+        async def _fake_stream(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            cb = kwargs.get("on_text_delta")
+            if call_count == 1:
+                await cb("Let me check the sources.")
+                return _tool_response("Let me check the sources.", [_tool_call("recall", {"q": "x"})])
+            await cb("Found ")
+            await cb("it.")
+            return _text_response("Found it.")
+
+        mock_stream_llm.side_effect = _fake_stream
+        agent = AgentLoop(_make_config(registry=registry))
+        text = "".join(
+            [e.data["text"] async for e in agent.stream("Find it") if e.event == AgentEvent.TEXT_DELTA]
+        )
+        assert text == "Let me check the sources.\n\nFound it."
+
+
 # ============================================================================
 # Unit: error handling
 # ============================================================================

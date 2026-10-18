@@ -479,10 +479,11 @@ class RememberHandler(ToolHandler):
         return ToolSpec(
             name="remember",
             description=(
-                "Store a durable memory. Equivalent recent writes in the same "
-                "chat session reuse the existing memory. Use this to save important "
-                "information, "
-                "events, or learnings for future recall. When the memory comes "
+                "Store a durable memory: one fact or conclusion per call, never a "
+                "bundle. What people say in conversation is encoded automatically "
+                "afterwards, so use this when asked to remember something or for "
+                "your own conclusions. Equivalent recent writes in the same chat "
+                "session reuse the existing memory. When the memory comes "
                 "from a document, conversation, or other source, cite it in "
                 "`sources` — provenance is what makes a belief revisable and "
                 "explainable later."

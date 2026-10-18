@@ -977,7 +977,7 @@ INSERT INTO config_defaults (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
     ('heartbeat.use_rlm', 'true'::jsonb, 'Enable RLM loop for heartbeat decisions'),
-    ('chat.use_rlm', 'true'::jsonb, 'Enable RLM loop for chat'),
+    ('chat.use_rlm', 'false'::jsonb, 'Route chat turns through the RLM REPL loop instead of the agent loop (the REPL prompt carries no persona or memory context)'),
     ('rlm.chat.streaming_enabled', 'false'::jsonb, 'Use native RLM chat path for streaming transports; false keeps UI/CLI token streaming through AgentLoop until RLM supports incremental final output'),
     ('rlm.heartbeat.max_iterations', '10'::jsonb, 'Max RLM iterations for heartbeat'),
     ('rlm.chat.max_iterations', '15'::jsonb, 'Max RLM iterations for chat'),

@@ -14,13 +14,13 @@ SET search_path = public, ag_catalog, "$user";
 INSERT INTO config_defaults (key, value, description) VALUES
     ('extraction.enabled', 'true'::jsonb,
      'Sweep conscious episodes (chat turns + heartbeat episodes) into selective durable memories (kill switch)'),
-    ('extraction.min_importance', '0.6'::jsonb,
-     'Units below this importance are skipped without an LLM pass'),
+    ('extraction.min_importance', '0.4'::jsonb,
+     'Units below this importance are skipped without an LLM pass (turns are recorded at 0.5; the encoder itself is selective)'),
     ('extraction.batch_size', '8'::jsonb,
      'Units claimed per extraction sweep'),
     ('extraction.min_confidence', '0.55'::jsonb,
      'Extracted facts below this confidence are dropped by the ingest router'),
-    ('extraction.max_facts_per_batch', '5'::jsonb,
+    ('extraction.max_facts_per_batch', '16'::jsonb,
      'Soft cost cap on facts per sweep — a budget, not a knowledge limit'),
     ('care.checkins_enabled', 'true'::jsonb,
      'Inferred care check-ins (#98): extraction notices dated events in the user''s life and schedules a gentle follow-up after — a person who notices your interview and asks how it went'),
@@ -96,7 +96,7 @@ CREATE OR REPLACE FUNCTION claim_conscious_extraction_batch(p_limit INT DEFAULT 
 RETURNS SETOF subconscious_units AS $$
 DECLARE
     lim INT := COALESCE(p_limit, get_config_int('extraction.batch_size'), 8);
-    imp_floor FLOAT := COALESCE(get_config_float('extraction.min_importance'), 0.6);
+    imp_floor FLOAT := COALESCE(get_config_float('extraction.min_importance'), 0.4);
 BEGIN
     UPDATE subconscious_units
     SET extraction_status = 'skipped', updated_at = CURRENT_TIMESTAMP
@@ -130,7 +130,7 @@ CREATE OR REPLACE FUNCTION apply_conscious_extraction(
 ) RETURNS JSONB AS $$
 DECLARE
     min_conf FLOAT := COALESCE(get_config_float('extraction.min_confidence'), 0.55);
-    max_facts INT := COALESCE(get_config_int('extraction.max_facts_per_batch'), 5);
+    max_facts INT := COALESCE(get_config_int('extraction.max_facts_per_batch'), 16);
     facts JSONB;
     plan JSONB;
     fact JSONB;
