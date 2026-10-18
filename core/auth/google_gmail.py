@@ -24,6 +24,9 @@ GMAIL_DEFAULT_CREDENTIAL_REF = "integration.gmail.default"
 GMAIL_CLIENT_SECRET_REF = "integration.gmail.client"
 GMAIL_PENDING_PREFIX = "integration.gmail.pending."
 GMAIL_CALLBACK_PATH = "/api/integrations/gmail/callback"
+# Connectors that sign in with the same Google client and callback. Each keeps
+# its own token at integration.<id>.default, so Drive never sees Gmail's scopes.
+GOOGLE_CONNECTOR_IDS = ("gmail", "google_drive")
 GMAIL_DEFAULT_API_BASE_URL = "http://127.0.0.1:43817"
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -82,18 +85,30 @@ class GmailOAuthComplete:
     granted_scopes: list[str]
     capabilities: list[str]
     credential_payload: dict[str, Any]
+    connector_id: str = GMAIL_CONNECTOR_ID
 
 
 def _json_arg(value: Any) -> str:
     return json.dumps(value)
 
 
-async def prepare_gmail_connection_attempt(pool: Any, capabilities: Any = None) -> dict[str, Any]:
+def credential_ref_for(connector_id: str) -> str:
+    return f"integration.{connector_id}.default"
+
+
+def pending_prefix_for(connector_id: str) -> str:
+    return f"integration.{connector_id}.pending."
+
+
+async def prepare_gmail_connection_attempt(
+    pool: Any, capabilities: Any = None, *, connector_id: str = GMAIL_CONNECTOR_ID
+) -> dict[str, Any]:
     """Ask the database to normalize capabilities and derive OAuth scopes."""
     try:
         async with pool.acquire() as conn:
             raw = await conn.fetchval(
-                "SELECT prepare_connection_attempt('gmail', $1::jsonb)",
+                "SELECT prepare_connection_attempt($1, $2::jsonb)",
+                connector_id,
                 _json_arg(capabilities) if capabilities is not None else None,
             )
     except Exception as exc:
@@ -294,8 +309,8 @@ def save_gmail_client_secret_payload(payload: dict[str, Any], *, source: str = "
     }
 
 
-def load_default_credentials() -> dict[str, Any] | None:
-    value = load_auth(GMAIL_DEFAULT_CREDENTIAL_REF)
+def load_default_credentials(credential_ref: str = GMAIL_DEFAULT_CREDENTIAL_REF) -> dict[str, Any] | None:
+    value = load_auth(credential_ref)
     return value if isinstance(value, dict) else None
 
 
@@ -315,14 +330,16 @@ def _expiry_ms(credentials: dict[str, Any]) -> int:
     return 0
 
 
-async def refresh_default_credentials_if_needed(*, leeway_ms: int = 60_000) -> dict[str, Any]:
+async def refresh_default_credentials_if_needed(
+    *, leeway_ms: int = 60_000, credential_ref: str = GMAIL_DEFAULT_CREDENTIAL_REF
+) -> dict[str, Any]:
     """Return saved Gmail credentials, refreshing the access token when stale.
 
     This deliberately uses only the credential selected during Hexis Gmail setup.
     It does not fall back to ambient Google auth state.
     """
-    with auth_lock(GMAIL_DEFAULT_CREDENTIAL_REF):
-        credentials = load_default_credentials()
+    with auth_lock(credential_ref):
+        credentials = load_default_credentials(credential_ref)
         if not credentials:
             raise GmailOAuthError("Gmail credentials are not saved. Use connect_gmail first.")
 
@@ -372,12 +389,12 @@ async def refresh_default_credentials_if_needed(*, leeway_ms: int = 60_000) -> d
         scopes = token_data.get("scope")
         if isinstance(scopes, str) and scopes.strip():
             refreshed["scopes"] = scopes.split()
-        save_auth(GMAIL_DEFAULT_CREDENTIAL_REF, refreshed)
+        save_auth(credential_ref, refreshed)
         return refreshed
 
 
-def delete_default_credentials() -> None:
-    delete_auth(GMAIL_DEFAULT_CREDENTIAL_REF)
+def delete_default_credentials(credential_ref: str = GMAIL_DEFAULT_CREDENTIAL_REF) -> None:
+    delete_auth(credential_ref)
 
 
 def _resolve_client_secret(
@@ -444,6 +461,7 @@ async def start_gmail_oauth(
     use_env_client_secret: bool = False,
     source_channel: str | None = None,
     source_session_id: str | None = None,
+    connector_id: str = GMAIL_CONNECTOR_ID,
 ) -> GmailOAuthStart | dict[str, Any]:
     """Create a DB connection attempt and persisted pending PKCE state."""
     client_secret, source = _resolve_client_secret(
@@ -454,7 +472,7 @@ async def start_gmail_oauth(
     if not client_secret:
         return build_client_secret_needed_payload()
 
-    prepared = await prepare_gmail_connection_attempt(pool, capabilities)
+    prepared = await prepare_gmail_connection_attempt(pool, capabilities, connector_id=connector_id)
     caps = list(prepared.get("capabilities") or prepared.get("requested_capabilities") or [])
     scopes = list(prepared.get("requested_scopes") or [])
     if not caps or not scopes:
@@ -496,7 +514,7 @@ async def start_gmail_oauth(
         raw = await conn.fetchval(
             """
             SELECT start_connection_attempt(
-                'gmail',
+                $7,
                 $1::jsonb,
                 ARRAY[]::text[],
                 $2::jsonb,
@@ -513,9 +531,10 @@ async def start_gmail_oauth(
             next_step,
             source_channel,
             source_session_id,
+            connector_id,
         )
     payload = json.loads(raw) if isinstance(raw, str) else raw
-    pending_ref = f"{GMAIL_PENDING_PREFIX}{payload['attempt_id']}"
+    pending_ref = f"{pending_prefix_for(connector_id)}{payload['attempt_id']}"
     save_auth(
         pending_ref,
         {
@@ -665,39 +684,52 @@ async def complete_gmail_oauth(
     attempt_id: str | None = None,
 ) -> GmailOAuthComplete:
     code, returned_state = parse_authorization_response(authorization_response)
+    connector_id = GMAIL_CONNECTOR_ID
+    async with pool.acquire() as conn:
+        # Google returns to one callback for every Google connector; the state
+        # says which attempt (and so which connector) this is.
+        row = None
+        if attempt_id:
+            row = await conn.fetchrow(
+                "SELECT id::text AS id, connector_id FROM connection_attempts WHERE id = $1::uuid",
+                attempt_id,
+            )
+        elif returned_state:
+            row = await conn.fetchrow(
+                """
+                SELECT id::text AS id, connector_id
+                FROM connection_attempts
+                WHERE connector_id = ANY($2::text[])
+                  AND status IN ('pending_user', 'awaiting_input', 'error')
+                  AND flow_state->>'state_hash' = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                hashlib.sha256(returned_state.encode("utf-8")).hexdigest(),
+                list(GOOGLE_CONNECTOR_IDS),
+            )
+        if row is None and not attempt_id:
+            row = await conn.fetchrow(
+                """
+                SELECT id::text AS id, connector_id
+                FROM connection_attempts
+                WHERE connector_id = 'gmail'
+                  AND status IN ('pending_user', 'awaiting_input', 'error')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+        if row is not None:
+            attempt_id = row["id"]
+            connector_id = row["connector_id"] or GMAIL_CONNECTOR_ID
     if not attempt_id:
-        async with pool.acquire() as conn:
-            if returned_state:
-                attempt_id = await conn.fetchval(
-                    """
-                    SELECT id::text
-                    FROM connection_attempts
-                    WHERE connector_id = 'gmail'
-                      AND status IN ('pending_user', 'awaiting_input', 'error')
-                      AND flow_state->>'state_hash' = $1
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    hashlib.sha256(returned_state.encode("utf-8")).hexdigest(),
-                )
-            if not attempt_id:
-                attempt_id = await conn.fetchval(
-                    """
-                    SELECT id::text
-                    FROM connection_attempts
-                    WHERE connector_id = 'gmail'
-                      AND status IN ('pending_user', 'awaiting_input', 'error')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """
-                )
-    if not attempt_id:
-        raise GmailOAuthError("No pending Gmail connection attempt. Start with connect_gmail first.")
+        raise GmailOAuthError("No pending Google sign-in. Start it again from the Connections page.")
 
-    pending_ref = f"{GMAIL_PENDING_PREFIX}{attempt_id}"
+    credential_ref = credential_ref_for(connector_id)
+    pending_ref = f"{pending_prefix_for(connector_id)}{attempt_id}"
     pending = load_auth(pending_ref)
     if not isinstance(pending, dict):
-        raise GmailOAuthError("The pending Gmail OAuth session expired or is missing. Start connect_gmail again.")
+        raise GmailOAuthError("The pending Google sign-in expired or is missing. Start it again.")
 
     if returned_state and returned_state != pending.get("state"):
         raise GmailOAuthError("OAuth state mismatch. Start a fresh Gmail connection attempt and use the newest browser tab.")
@@ -727,7 +759,7 @@ async def complete_gmail_oauth(
         if missing:
             raise GmailOAuthError(_missing_scopes_message(connector_id))
         account_email = await _fetch_account_email(access_token)
-        account_key = account_email or f"gmail:{attempt_id}"
+        account_key = account_email or f"{connector_id}:{attempt_id}"
         expires_in = int(token_data.get("expires_in") or 3600)
         credential_payload = {
             "type": "authorized_user",
@@ -741,7 +773,7 @@ async def complete_gmail_oauth(
             "expires_ms": now_ms() + expires_in * 1000,
             "account_email": account_email,
         }
-        save_auth(GMAIL_DEFAULT_CREDENTIAL_REF, credential_payload)
+        save_auth(credential_ref, credential_payload)
         caps = list(pending.get("capabilities") or [])
         async with pool.acquire() as conn:
             raw = await conn.fetchval(
@@ -758,8 +790,8 @@ async def complete_gmail_oauth(
                 """,
                 attempt_id,
                 account_key,
-                account_email or "Gmail account",
-                GMAIL_DEFAULT_CREDENTIAL_REF,
+                account_email or "Google account",
+                credential_ref,
                 granted_scopes,
                 json.dumps(caps),
                 json.dumps({"auth_store": "filesystem", "token_uri": GOOGLE_TOKEN_URL}),
@@ -770,7 +802,8 @@ async def complete_gmail_oauth(
         return GmailOAuthComplete(
             account_key=str(result["account_key"]),
             display_name=str(result.get("display_name") or result["account_key"]),
-            credential_ref=GMAIL_DEFAULT_CREDENTIAL_REF,
+            connector_id=connector_id,
+            credential_ref=credential_ref,
             granted_scopes=granted_scopes,
             capabilities=result_caps,
             credential_payload=credential_payload,

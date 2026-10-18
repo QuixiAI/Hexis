@@ -11,6 +11,7 @@ import json
 import hashlib
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.llm_config import load_llm_config
@@ -825,6 +826,25 @@ async def run_user_model_synthesis_step(
     }
 
 
+HISTORY_AGE = timedelta(days=2)
+
+
+def _is_historical(value: Any) -> bool:
+    """Imported history is not news: items older than HISTORY_AGE are scored
+    by rules alone and never alert, so importing a backlog neither stalls the
+    maintenance loop on model calls nor floods the inbox."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return False
+    if not isinstance(value, datetime):
+        return False
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - value > HISTORY_AGE
+
+
 async def run_connector_importance_step(
     conn: Any, *, limit: int | None = None
 ) -> dict[str, Any]:
@@ -857,11 +877,21 @@ async def run_connector_importance_step(
     # One model call for the batch rather than one per item.
     estimates: dict[str, dict[str, Any]] = {}
     provenance_by_item: dict[str, str] = {}
-    if llm_enabled:
+    historical_ids = {
+        str(it.get("source_item_id") or "")
+        for it in items
+        if isinstance(it, dict) and _is_historical(it.get("item_timestamp"))
+    }
+    current_items = [
+        it
+        for it in items
+        if isinstance(it, dict) and str(it.get("source_item_id") or "") not in historical_ids
+    ]
+    if llm_enabled and current_items:
         try:
             estimates = await estimate_connector_item_importance_llm_batch(
                 conn,
-                [it for it in items if isinstance(it, dict)],
+                current_items,
                 provenance=provenance_by_item,
             )
         except Exception as exc:
@@ -874,6 +904,7 @@ async def run_connector_importance_step(
         if not isinstance(item, dict):
             continue
         source_item_id = str(item.get("source_item_id") or "")
+        historical = source_item_id in historical_ids
         try:
             estimate = estimates.get(
                 source_item_id
@@ -896,7 +927,7 @@ async def run_connector_importance_step(
                             $4::jsonb,
                             $5::jsonb,
                             $6,
-                            TRUE
+                            $7
                         )
                         """,
                         source_item_id,
@@ -905,6 +936,7 @@ async def run_connector_importance_step(
                         _json_dumps(estimate["reasons"]),
                         _json_dumps(estimate["recommended_actions"]),
                         _detector_version(source),
+                        not historical,
                     )
                 )
                 or {}

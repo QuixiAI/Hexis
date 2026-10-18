@@ -7,6 +7,7 @@ import { Badge } from "../components/ui/badge";
 import { PageHeader } from "../components/ui/page-header";
 import { Spinner } from "../components/ui/spinner";
 import { PwaSettings } from "../components/pwa/pwa-settings";
+import { OutreachSettings } from "./outreach-settings";
 import { RetentionSettings } from "./retention-settings";
 
 type SettingsData = {
@@ -17,7 +18,7 @@ type SettingsData = {
   tools: Record<string, unknown>;
 };
 
-const TABS = ["models", "autonomy", "tools", "voice", "retention", "app", "advanced"] as const;
+const TABS = ["models", "messages", "autonomy", "tools", "voice", "retention", "app", "advanced"] as const;
 type Tab = (typeof TABS)[number];
 
 const MODEL_ROLES = [
@@ -142,6 +143,8 @@ export default function SettingsPage() {
               {arrayOfStrings(toolsConfig.disabled).length ? <div className="rounded-lg border border-[var(--outline)] bg-white p-5"><h2 className="text-sm font-semibold">Disabled tools</h2><div className="mt-3 flex flex-wrap gap-2">{arrayOfStrings(toolsConfig.disabled).map((tool) => <Badge key={tool} variant="warning">{humanize(tool)}</Badge>)}</div></div> : null}
             </section>
           ) : null}
+
+          {tab === "messages" ? <OutreachSettings /> : null}
 
           {tab === "voice" ? <VoicePanel /> : null}
 

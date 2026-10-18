@@ -387,3 +387,67 @@ async def test_connector_source_items_become_claims_and_importance_notifications
         envelope["payload"]["delivery"]["source_item_id"]
         == source_item["source_item_id"]
     )
+
+
+async def test_imported_history_is_scored_by_rules_and_never_alerts(db_pool, monkeypatch):
+    """An item older than two days is history: no model call, no inbox note."""
+    from services.connector_cognition import _is_historical
+
+    assert _is_historical("2020-01-01T00:00:00+00:00")
+    assert not _is_historical(None)
+    assert not _is_historical("not a date")
+
+    marker = get_test_identifier("connector-history")
+    account = f"channel:slack:{marker}"
+    llm_calls: list[list] = []
+
+    async def fake_importance(_conn, items, *, provenance=None):
+        llm_calls.append(items)
+        result = {}
+        for item in items:
+            source_id = str(item["source_item_id"])
+            if provenance is not None:
+                provenance[source_id] = "llm"
+            result[source_id] = {"score": 0.95, "label": "important", "reasons": ["urgent"],
+                                 "recommended_actions": [{"kind": "notify_user", "urgency": "important"}]}
+        return result
+
+    monkeypatch.setattr(
+        "services.connector_cognition.estimate_connector_item_importance_llm_batch", fake_importance,
+    )
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            await _connected_channel(conn, "slack", marker, account)
+            source_item = _j(await conn.fetchval(
+                """
+                SELECT upsert_connector_source_item(
+                    'slack', $1, $2, 'Old message', $3, 'message', NULL,
+                    CURRENT_TIMESTAMP - INTERVAL '10 days',
+                    ARRAY['slack']::text[], '[{"role": "sender", "id": "U1"}]'::jsonb, '[]'::jsonb,
+                    '{"provider_priority": "high"}'::jsonb, 'private', FALSE
+                )
+                """,
+                account, f"msg-{marker}", f"The deadline is today, please flag this {marker}",
+            ))
+            await conn.execute(
+                "UPDATE connector_source_items SET status = 'archived' WHERE id <> $1::uuid",
+                source_item["source_item_id"],
+            )
+            importance = await run_connector_importance_step(conn, limit=5)
+            row = await conn.fetchrow(
+                "SELECT status, notification_queued_at FROM connector_item_importance WHERE source_item_id = $1::uuid",
+                source_item["source_item_id"],
+            )
+        finally:
+            await tr.rollback()
+
+    assert importance["completed"] == 1
+    assert importance["notified"] == 0
+    assert importance["llm_used"] == 0
+    assert llm_calls == []  # history never reaches the model
+    assert row["status"] == "completed"
+    assert row["notification_queued_at"] is None
+

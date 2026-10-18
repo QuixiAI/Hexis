@@ -112,7 +112,7 @@ export type ConnectorSummary = {
   runtime: ChannelRuntime | null;
   backfillJobs: BackfillJob[];
   sourceItemCount: number;
-  state: "connected" | "pending" | "running" | "available" | "planned" | "disabled" | "error";
+  state: "connected" | "needs_reauth" | "pending" | "running" | "available" | "planned" | "disabled" | "error";
 };
 
 export function asRecord(value: unknown): JsonRecord {
@@ -160,6 +160,8 @@ export function summarizeConnectors(data: IntegrationStatusData): ConnectorSumma
       state = "error";
     } else if (activeConnections.length > 0) {
       state = "connected";
+    } else if (connections.some((item) => item.status === "needs_reauth")) {
+      state = "needs_reauth";
     } else if (activeAttempts.length > 0) {
       state = "pending";
     } else if (runtime?.running) {
@@ -181,5 +183,6 @@ export function summarizeConnectors(data: IntegrationStatusData): ConnectorSumma
 }
 
 export function stateLabel(state: ConnectorSummary["state"]): string {
+  if (state === "needs_reauth") return "needs sign-in";
   return state.replace(/_/g, " ");
 }

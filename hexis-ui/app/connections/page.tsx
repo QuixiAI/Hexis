@@ -1,9 +1,11 @@
 "use client";
 
 import {
+  AlertCircle,
   CheckCircle2,
   Clock3,
   ExternalLink,
+  FolderOpen,
   Mail,
   MessageCircle,
   Paperclip,
@@ -18,6 +20,7 @@ import { Card } from "../components/ui/card";
 import { Label, TextInput } from "../components/ui/input";
 import { PageHeader } from "../components/ui/page-header";
 import { Spinner } from "../components/ui/spinner";
+import { DriveControls } from "./drive-controls";
 import {
   BackfillJob,
   ConnectorSummary,
@@ -281,6 +284,26 @@ function ConnectorCard({
           <p className="text-sm text-[var(--ink-soft)]">No account connected.</p>
         )}
 
+        {summary.connections
+          .filter((connection) => connection.status === "needs_reauth")
+          .map((connection) => (
+            <div
+              key={connection.id}
+              role="alert"
+              className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span className="min-w-0 truncate font-medium">
+                  {connection.display_name || connection.account_key}
+                </span>
+                <Badge variant="warning">needs sign-in</Badge>
+              </div>
+              <p className="mt-1 text-xs text-amber-800">
+                {connection.last_error || "Sign in again to restore access."}
+              </p>
+            </div>
+          ))}
+
         {summary.activeAttempts.map((attempt) => (
           <div
             key={attempt.attempt_id}
@@ -335,6 +358,8 @@ function ConnectorCard({
       {connector.id === "gmail" ? (
         <GmailControls summary={summary} actionBusy={actionBusy} onAction={onAction} />
       ) : null}
+
+      {connector.id === "google_drive" ? <DriveControls /> : null}
 
       {isChannelConnector ? (
         <ChannelControls
@@ -1371,7 +1396,18 @@ function BackfillPanel({
                       {job.estimate.cost_class ? ` · ${String(job.estimate.cost_class)}` : ""}
                     </p>
                   ) : null}
-                  {job.error ? <p className="mt-1 text-xs text-red-700">{job.error}</p> : null}
+                  {job.error && ["pending", "failed"].includes(job.status) ? (
+                    <p role="alert" className="mt-1 flex items-start gap-1 break-words text-xs text-red-700">
+                      <AlertCircle size={12} className="mt-0.5 shrink-0" aria-hidden />
+                      <span>
+                        {job.status === "pending"
+                          ? `Last try failed, trying again: ${job.error.slice(0, 300)}`
+                          : job.error.slice(0, 300)}
+                      </span>
+                    </p>
+                  ) : job.error ? (
+                    <p className="mt-1 text-xs text-[var(--ink-soft)]">{job.error.slice(0, 300)}</p>
+                  ) : null}
                 </div>
                 <div className="flex flex-wrap items-center gap-2 md:justify-end">
                   {job.pause_requested ? <Badge variant="warning">pause requested</Badge> : null}
@@ -1480,6 +1516,7 @@ function Metric({
 
 function ConnectorIcon({ id }: { id: string }) {
   if (id === "gmail") return <Mail size={16} className="text-[var(--teal)]" />;
+  if (id === "google_drive") return <FolderOpen size={16} className="text-[var(--teal)]" />;
   if (["slack", "telegram", "signal"].includes(id)) {
     return <MessageCircle size={16} className="text-[var(--teal)]" />;
   }
@@ -1488,7 +1525,7 @@ function ConnectorIcon({ id }: { id: string }) {
 
 function stateVariant(state: ConnectorSummary["state"]) {
   if (state === "connected" || state === "running") return "success";
-  if (state === "pending" || state === "planned") return "warning";
+  if (state === "pending" || state === "planned" || state === "needs_reauth") return "warning";
   if (state === "error") return "error";
   return "muted";
 }
@@ -1509,7 +1546,7 @@ function humanize(value: string): string {
 }
 
 function authTypeLabel(connector: { id: string; auth_type: string }): string {
-  if (connector.id === "gmail") return "Google sign-in";
+  if (connector.id === "gmail" || connector.id === "google_drive") return "Google sign-in";
   if (connector.auth_type === "oauth2") return "account sign-in";
   return humanize(connector.auth_type);
 }

@@ -24,6 +24,7 @@ import html
 import json
 import logging
 import os
+import re
 import time
 import uuid
 import urllib.parse
@@ -968,9 +969,10 @@ async def _handle_gmail_oauth_callback(request: Request) -> HTMLResponse:
         )
 
     account = completed.display_name or completed.account_key
+    service = "Google Drive" if getattr(completed, "connector_id", "gmail") == "google_drive" else "Gmail"
     return _gmail_callback_page(
-        title="Gmail connected",
-        message=f"{account} is connected to Hexis with the Gmail permissions you approved.",
+        title=f"{service} connected",
+        message=f"{account} is connected to Hexis with the {service} permissions you approved.",
         status="connected",
     )
 
@@ -1256,6 +1258,124 @@ async def _integration_status_payload(
     }
     payload["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return payload
+
+
+class DriveFolderRequest(BaseModel):
+    link: str = ""
+    id: str = ""
+
+
+def _drive_error(exc: Exception) -> JSONResponse:
+    # Codes for the page to explain; Google's own message otherwise.
+    message = str(exc)
+    code = message if re.fullmatch(r"[a-z_]+", message) else "drive_error"
+    return JSONResponse({"error_code": code, "error": message}, status_code=400)
+
+
+@app.get("/api/integrations/google_drive")
+async def google_drive_status_endpoint():
+    from services.google_drive import status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/connect")
+async def google_drive_connect_endpoint():
+    """Start Google sign-in for read-only Drive access; returns Google's page."""
+    from core.auth.google_gmail import GmailOAuthError, start_gmail_oauth
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        started = await start_gmail_oauth(_pool, connector_id="google_drive", source_channel="web")
+    except GmailOAuthError as exc:
+        return JSONResponse({"error_code": "drive_error", "error": str(exc)}, status_code=400)
+    if isinstance(started, dict):
+        # No Google sign-in client yet; it is set up once, on the Gmail card.
+        return JSONResponse({"error_code": "needs_google_setup"}, status_code=409)
+    return {"authorization_url": started.attempt_payload.get("authorization_url")}
+
+
+@app.post("/api/integrations/google_drive/disconnect")
+async def google_drive_disconnect_endpoint():
+    from services.google_drive import disconnect, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    await disconnect(_pool)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/folders")
+async def google_drive_add_folder_endpoint(req: DriveFolderRequest):
+    from services.google_drive import DriveError, add_folder, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        await add_folder(_pool, req.link)
+    except DriveError as exc:
+        return _drive_error(exc)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/folders/remove")
+async def google_drive_remove_folder_endpoint(req: DriveFolderRequest):
+    from services.google_drive import remove_folder, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    await remove_folder(_pool, req.id)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/import")
+async def google_drive_import_endpoint():
+    """Queue an import of the chosen folders; the maintenance worker reads them."""
+    from services.google_drive import DriveError, start_import, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        await start_import(_pool)
+    except DriveError as exc:
+        return _drive_error(exc)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+class OutreachRequest(BaseModel):
+    destination: str | None = None
+    slack_user_id: str | None = None
+    telegram_chat_id: str | None = None
+
+
+@app.get("/api/outreach")
+async def outreach_status_endpoint():
+    """Where the agent's messages to the user go, and what can reach them."""
+    from core.outreach_destination import state
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    return JSONResponse(jsonable_encoder(await state(_pool)))
+
+
+@app.post("/api/outreach")
+async def outreach_save_endpoint(req: OutreachRequest):
+    from core.outreach_destination import save
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        return JSONResponse(jsonable_encoder(await save(
+            _pool,
+            destination=req.destination,
+            slack_user_id=req.slack_user_id,
+            telegram_chat_id=req.telegram_chat_id,
+        )))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @app.get("/api/integrations/status")
@@ -1871,6 +1991,9 @@ async def connector_importance(
     total = int(items[0].get("total") or 0) if items else 0
     for item in items:
         item.pop("total", None)
+        # asyncpg returns jsonb as text; the page expects arrays and objects.
+        for key in ("reasons", "recommended_actions", "metadata"):
+            item[key] = _json_value(item.get(key))
     return JSONResponse(
         jsonable_encoder(
             {"items": items, "total": total, "limit": limit, "offset": offset}

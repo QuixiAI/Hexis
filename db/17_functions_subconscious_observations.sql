@@ -1355,14 +1355,17 @@ BEGIN
         WHEN 'reach_out_user' THEN
             queued_call := build_outbox_message(
                 'user',
-                jsonb_build_object(
+                jsonb_strip_nulls(jsonb_build_object(
                     'message', p_params->>'message',
                     'intent', p_params->>'intent',
+                    -- Where the agent wants it to reach the user
+                    -- (core.outreach_destination decides whether it may).
+                    'channel', NULLIF(p_params->>'channel', ''),
                     'heartbeat_id', p_heartbeat_id,
                     'purpose_kind', p_params->>'purpose_kind',
                     'purpose_reference', p_params->>'purpose_reference',
                     'urgency', COALESCE(p_params->>'urgency', 'normal')
-                )
+                ))
             );
             outbox_messages := outbox_messages || jsonb_build_array(queued_call);
             result := jsonb_build_object('queued', true, 'outbox_message', queued_call);

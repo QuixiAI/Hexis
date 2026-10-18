@@ -381,6 +381,13 @@ class ChannelOutboxConsumer:
     ) -> None:
         """Send to the sender's most recently active channel session."""
         sender_id = str(payload.get("sender_id") or payload.get("target_user") or "")
+        if not sender_id:
+            # Addressed to no one in particular: it is for the user, who is not
+            # necessarily whoever talked to the agent last.
+            await self._deliver_to_user(
+                message, content, payload, outbox_msg_id, payload.get("channel")
+            )
+            return
 
         async with self._pool.acquire() as conn:
             raw = await conn.fetchval(
@@ -420,6 +427,56 @@ class ChannelOutboxConsumer:
             )
         except Exception:
             logger.debug("Last-active delivery failed", exc_info=True)
+
+    async def _deliver_to_user(
+        self,
+        message: str | MessagePresentation,
+        content: str,
+        payload: dict,
+        outbox_msg_id: str,
+        requested: str | None,
+    ) -> None:
+        """Send a message meant for the user where core.outreach_destination
+        says: their Slack DM (opened if needed), their Telegram chat, or their
+        own mailbox. The dashboard inbox already has its copy."""
+        from core.outreach_destination import choose
+
+        channel, current = await choose(self._pool, requested)
+        if channel == "inbox":
+            return
+        info = current["channels"][channel]
+        try:
+            if channel == "email":
+                from services.gmail_actions import send_gmail_message
+
+                subject = str(payload.get("intent") or "").strip() or content.split("\n", 1)[0][:80]
+                await send_gmail_message(
+                    account_key=info["address"], to=info["address"], subject=subject, body=content
+                )
+                await self._log_delivery(
+                    outbox_msg_id, "email", info["address"], None, content, "user", True, None
+                )
+                return
+            if channel == "slack":
+                # A Slack user id; the adapter opens (or finds) the DM with them.
+                channel_id = sender = str(info["user_id"])
+            else:
+                channel_id = sender = str(info["chat_id"])
+            if not channel_id:
+                return
+            await self._send_with_obligation(
+                outbox_msg_id=outbox_msg_id,
+                channel_type=channel,
+                channel_id=channel_id,
+                sender_id=sender,
+                thread_id=None,
+                message=message,
+                content=content,
+                delivery_mode="user",
+                payload=payload,
+            )
+        except Exception as e:
+            logger.warning("Delivery to the user on %s failed: %s", channel, e)
 
     async def _deliver_broadcast(
         self,

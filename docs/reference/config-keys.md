@@ -222,6 +222,24 @@ The learning diff shares the explicitly enabled background skill-review pass;
 | `learning.review.enabled` | bool | Publish a learning diff when the opted-in pass finds enough grounded change (default `true`) |
 | `learning.review.max_items` | int | Maximum changes in one review (default `20`) |
 
+## Messages to the User
+
+Where messages meant for the user (a heartbeat reaching out, `queue_user_message`
+from a heartbeat) go besides the dashboard inbox, which always gets a copy. See
+`core/outreach_destination.py`; set from Settings → Messages.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `outreach.destination` | text | `auto` (default: the agent decides, honouring a channel it asked for when several are set up), `slack`, `telegram`, `email`, or `inbox` (dashboard only) |
+| `outreach.slack_user_id` | text | The user's own Slack account (`U...`) for messages to them; empty falls back to `channel.slack.operator_user_id`, then the most recent Slack DM |
+| `outreach.telegram_chat_id` | text | The user's Telegram chat; empty falls back to the most recent Telegram chat |
+
+## Google Drive
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `integrations.google_drive.folders` | json | Folders the agent reads: `[{"id", "name", "url"}]`, managed from the Connections page; imports are connector backfill jobs run by the maintenance worker |
+
 ## Operator Standing Policies
 
 An explicit standing instruction such as “Always cite the exact source” is
