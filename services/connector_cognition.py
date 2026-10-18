@@ -829,6 +829,24 @@ async def run_user_model_synthesis_step(
 HISTORY_AGE = timedelta(days=2)
 
 
+async def _imported_ids(conn: Any, source_item_ids: list[str]) -> set[str]:
+    """Items the user imported on purpose (raw_metadata.acquisition = import)."""
+    ids = [i for i in source_item_ids if i]
+    if not ids:
+        return set()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT id::text AS id FROM connector_source_items
+            WHERE id = ANY($1::uuid[]) AND raw_metadata->>'acquisition' = 'import'
+            """,
+            ids,
+        )
+    except Exception:
+        return set()
+    return {str(r["id"]) for r in rows}
+
+
 def _is_historical(value: Any) -> bool:
     """Imported history is not news: items older than HISTORY_AGE are scored
     by rules alone and never alert, so importing a backlog neither stalls the
@@ -877,10 +895,21 @@ async def run_connector_importance_step(
     # One model call for the batch rather than one per item.
     estimates: dict[str, dict[str, Any]] = {}
     provenance_by_item: dict[str, str] = {}
+    # Imported history is not news: score it by rules and never alert on it.
+    # An item is history when the user imported it on purpose (acquisition =
+    # import, stamped by the Gmail and Drive imports) or when it is simply old.
+    imported_ids = await _imported_ids(
+        conn,
+        [str(it.get("source_item_id") or "") for it in items if isinstance(it, dict)],
+    )
     historical_ids = {
         str(it.get("source_item_id") or "")
         for it in items
-        if isinstance(it, dict) and _is_historical(it.get("item_timestamp"))
+        if isinstance(it, dict)
+        and (
+            str(it.get("source_item_id") or "") in imported_ids
+            or _is_historical(it.get("item_timestamp"))
+        )
     }
     current_items = [
         it

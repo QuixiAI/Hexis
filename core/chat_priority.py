@@ -69,4 +69,7 @@ async def wait_for_chat_idle(pool_or_conn: Any, *, max_wait_seconds: float | Non
             logger.debug("Background model call waiting for the chat turn to finish")
             waited_once = True
         await asyncio.sleep(POLL_SECONDS)
-    return time.monotonic() - start
+    waited = time.monotonic() - start
+    if waited_once and waited < max_wait_seconds:
+        logger.info("Background model call waited %.1fs for the chat turn to finish", waited)
+    return waited

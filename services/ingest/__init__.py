@@ -35,6 +35,7 @@ from .readers import (
     LatexReader,
     MarkdownReader,
     NotebookReader,
+    ZipArchiveReader,
     PDFReader,
     PptxReader,
     RssReader,

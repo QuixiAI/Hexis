@@ -451,3 +451,51 @@ async def test_imported_history_is_scored_by_rules_and_never_alerts(db_pool, mon
     assert row["status"] == "completed"
     assert row["notification_queued_at"] is None
 
+
+
+async def test_an_imported_item_never_alerts_even_when_recent(db_pool, monkeypatch):
+    """Mail or files the user imported on purpose are history, however new."""
+    marker = get_test_identifier("connector-import")
+    account = f"channel:slack:{marker}"
+    llm_calls: list[list] = []
+
+    async def fake_importance(_conn, items, *, provenance=None):
+        llm_calls.append(items)
+        return {}
+
+    monkeypatch.setattr(
+        "services.connector_cognition.estimate_connector_item_importance_llm_batch", fake_importance,
+    )
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            await _connected_channel(conn, "slack", marker, account)
+            source_item = _j(await conn.fetchval(
+                """
+                SELECT upsert_connector_source_item(
+                    'slack', $1, $2, 'Fresh imported message', $3, 'message', NULL,
+                    CURRENT_TIMESTAMP - INTERVAL '1 hour',
+                    ARRAY['slack']::text[], '[{"role": "sender", "id": "U1"}]'::jsonb, '[]'::jsonb,
+                    '{"provider_priority": "high", "acquisition": "import"}'::jsonb, 'private', FALSE
+                )
+                """,
+                account, f"msg-{marker}", f"The deadline is today, please flag this {marker}",
+            ))
+            await conn.execute(
+                "UPDATE connector_source_items SET status = 'archived' WHERE id <> $1::uuid",
+                source_item["source_item_id"],
+            )
+            importance = await run_connector_importance_step(conn, limit=5)
+            row = await conn.fetchrow(
+                "SELECT status, notification_queued_at FROM connector_item_importance WHERE source_item_id = $1::uuid",
+                source_item["source_item_id"],
+            )
+        finally:
+            await tr.rollback()
+
+    assert importance["completed"] == 1
+    assert importance["notified"] == 0
+    assert llm_calls == []
+    assert row["notification_queued_at"] is None

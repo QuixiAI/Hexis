@@ -32,16 +32,19 @@ def _j(value):
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def _seed_turn(db_pool, marker: str, session_id: str) -> str:
+async def _seed_turn(db_pool, marker: str, session_id: str, *, message_first: bool = False) -> str:
     async with db_pool.acquire() as conn:
-        # A realistic chat user_message: internal context ahead of the stable
-        # '[USER MESSAGE]' marker (see services/agent.py), then the literal text.
-        user_message = (
-            "## Subconscious Signals\n"
-            f"- Instinct: curiosity (0.7) — test signal {marker}\n"
-            "\n"
-            f"[USER MESSAGE]\nwhat is {marker}?"
-        )
+        signals = f"## Subconscious Signals\n- Instinct: curiosity (0.7) — test signal {marker}\n"
+        if message_first:
+            # Current layout (services/agent.py compose_chat_turn): the literal
+            # text first, then the divider and what the agent remembered.
+            from services.agent import compose_chat_turn
+
+            user_message = compose_chat_turn(f"what is {marker}?", signals)
+        else:
+            # Turns stored earlier: internal context ahead of the stable
+            # '[USER MESSAGE]' marker, then the literal text.
+            user_message = signals + "\n" + f"[USER MESSAGE]\nwhat is {marker}?"
         started = _j(
             await conn.fetchval(
                 "SELECT start_agent_turn('chat', $1::text, $2::uuid, $3::jsonb)",
@@ -68,10 +71,11 @@ async def _seed_turn(db_pool, marker: str, session_id: str) -> str:
         return turn_id
 
 
-async def test_transcript_session_json_and_markdown(db_pool):
+@pytest.mark.parametrize("message_first", [False, True], ids=["context-first", "message-first"])
+async def test_transcript_session_json_and_markdown(db_pool, message_first):
     marker = get_test_identifier("clitranscript")
     session_id = str(uuid.uuid4())
-    await _seed_turn(db_pool, marker, session_id)
+    await _seed_turn(db_pool, marker, session_id, message_first=message_first)
 
     p = _run("transcript", "--session", session_id, "--json")
     assert p.returncode == 0, p.stderr
@@ -86,6 +90,7 @@ async def test_transcript_session_json_and_markdown(db_pool):
     out = p.stdout
     # Markdown strips the internal prefix down to what was actually typed...
     assert f"**You:** what is {marker}?" in out
+    assert "What you remember" not in out
     # ...but still surfaces the subconscious-signals block the issue asks for.
     assert "## Subconscious Signals" in out
     assert f"test signal {marker}" in out

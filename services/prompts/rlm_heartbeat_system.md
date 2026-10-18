@@ -187,7 +187,7 @@ Available actions (check `context["allowed_actions"]` and `context["action_costs
 Params the executor reads (an action missing its required text is rejected):
 - remember: `content` (required), `importance`
 - synthesize: `content` (required, the synthesis itself), `topic`, `confidence`, `sources`
-- reach_out_user: `message` (required), `intent`
+- reach_out_user: `message` (required), `intent`, `channel` (optional: `slack`, `telegram` or `email`, when the user lets you choose in Settings → Messages; a chat app for quick things, email for longer ones)
 - reach_out_public: `content` (required), `platform`, `target_id`
 - recall: `query`, `limit`; inquire_shallow / inquire_deep: `query`
 - reprioritize: `goal_id`, `new_priority`, `reason`

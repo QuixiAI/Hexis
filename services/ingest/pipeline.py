@@ -54,6 +54,7 @@ from .readers import (
     ImageReader,
     LatexReader,
     NotebookReader,
+    ZipArchiveReader,
     PDFReader,
     PptxReader,
     ReaderResult,
@@ -96,6 +97,7 @@ class IngestionPipeline:
         | PptxReader.EXTENSIONS
         | XlsxReader.EXTENSIONS
         | NotebookReader.EXTENSIONS
+        | ZipArchiveReader.EXTENSIONS
         # Code
         | set(CodeReader.LANGUAGE_MAP.keys())
         # Data

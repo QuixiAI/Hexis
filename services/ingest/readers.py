@@ -1030,6 +1030,62 @@ class RssReader(DocumentReader):
         return "\n\n".join(parts)
 
 
+class ZipArchiveReader(DocumentReader):
+    """Reader for .zip bundles of notes, documents and exported mail.
+
+    Reads the text-like entries (plain text, Markdown, CSV, JSON, .eml) into
+    one document, one section per entry, and skips everything else. A guard
+    stops at 50 MB uncompressed so a large archive can't exhaust memory.
+    """
+
+    EXTENSIONS = {".zip"}
+    MAX_TOTAL_BYTES = 50 * 1024 * 1024
+    TEXT_SUFFIXES = {".txt", ".text", ".md", ".markdown", ".csv", ".json", ".eml"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        import email
+        import email.policy
+        import zipfile
+
+        if not zipfile.is_zipfile(file_path):
+            raise RuntimeError(f"Invalid .zip archive: {file_path.name}")
+
+        sections: list[str] = []
+        skipped = 0
+        total_bytes = 0
+        with zipfile.ZipFile(file_path, "r") as zf:
+            for info in sorted(zf.infolist(), key=lambda i: i.filename):
+                if info.is_dir():
+                    continue
+                entry = Path(info.filename)
+                if entry.name.startswith(".") or "__MACOSX" in entry.parts:
+                    continue
+                suffix = entry.suffix.lower()
+                if suffix not in cls.TEXT_SUFFIXES:
+                    skipped += 1
+                    continue
+                if total_bytes + info.file_size > cls.MAX_TOTAL_BYTES:
+                    sections.append("[Archive truncated: reached the 50 MB uncompressed limit]")
+                    break
+                raw = zf.read(info.filename)
+                total_bytes += len(raw)
+                if suffix == ".eml":
+                    msg = email.message_from_bytes(raw, policy=email.policy.default)
+                    text = EmailReader._format_message(msg)
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+                if text.strip():
+                    sections.append(f"--- Entry: {info.filename} ---\n{text.strip()}")
+
+        header = f"[Format: ZIP Archive]\n[File: {file_path.name}]"
+        if skipped:
+            header += f"\n[Skipped {skipped} entries that are not text, Markdown, CSV, JSON or email]"
+        if not sections:
+            return f"{header}\n[No readable entries found]"
+        return f"{header}\n\n" + "\n\n".join(sections)
+
+
 def get_reader(file_path: Path) -> DocumentReader:
     suffix = file_path.suffix.lower()
     if suffix == ".xls":
@@ -1059,6 +1115,8 @@ def get_reader(file_path: Path) -> DocumentReader:
         return XlsxReader()
     if suffix in NotebookReader.EXTENSIONS:
         return NotebookReader()
+    if suffix in ZipArchiveReader.EXTENSIONS:
+        return ZipArchiveReader()
     if suffix in DataReader.DATA_EXTENSIONS:
         return DataReader()
     if suffix in ImageReader.IMAGE_EXTENSIONS:

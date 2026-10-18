@@ -383,9 +383,17 @@ class ChannelOutboxConsumer:
         sender_id = str(payload.get("sender_id") or payload.get("target_user") or "")
         if not sender_id:
             # Addressed to no one in particular: it is for the user, who is not
-            # necessarily whoever talked to the agent last.
+            # necessarily whoever talked to the agent last. A heartbeat names
+            # the channel it wants in the payload; queue_user_message in the
+            # delivery doc ({"mode": "user", "channel": ...}).
+            delivery = payload.get("delivery")
+            requested = payload.get("channel") or (
+                delivery.get("channel")
+                if isinstance(delivery, dict) and delivery.get("mode") == "user"
+                else None
+            )
             await self._deliver_to_user(
-                message, content, payload, outbox_msg_id, payload.get("channel")
+                message, content, payload, outbox_msg_id, requested
             )
             return
 

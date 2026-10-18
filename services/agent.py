@@ -110,6 +110,28 @@ def _reply_language_addendum(user_message: str) -> list[str]:
     ]
 
 
+USER_MESSAGE_MARKER = "[USER MESSAGE]"
+REMEMBERED_DIVIDER = (
+    "--- What you remember (context for this reply, not part of the message) ---"
+)
+
+
+def compose_chat_turn(user_message: str, *context: str | None) -> str:
+    """The person's words first, then what the agent remembers around them.
+
+    The model answers what it reads first: with several thousand characters
+    of signals, continuity and memory ahead of a short message, replies
+    followed the context more than the person. The divider says the rest is
+    the agent's own recollection, not part of what was said. `hexis
+    transcript` splits on the marker and the divider (apps/hexis_cli.py).
+    """
+    turn = f"{USER_MESSAGE_MARKER}\n{user_message}"
+    parts = [str(c).strip() for c in context if c and str(c).strip()]
+    if not parts:
+        return turn
+    return "\n\n".join([turn, REMEMBERED_DIVIDER, *parts])
+
+
 def _with_reply_language(user_message: str) -> str:
     """The person's message, followed by the language to answer it in."""
     note = _reply_language_note(user_message)
@@ -1145,29 +1167,18 @@ async def run_agent(
         prompt_addenda=_reply_language_addendum(user_message) if mode == "chat" else None,
     )
 
-    # 5. Build enriched user message
-    enriched_parts: list[str] = []
-
-    # Add subconscious signals (rendered by the DB inside the conn scope)
-    if sub_signals:
-        enriched_parts.append(sub_signals)
-
-    if continuity_context:
-        enriched_parts.append(continuity_context)
-
-    # Add memory context (chat mode)
-    if memory_context:
-        enriched_parts.append(memory_context)
-
-    # Add the actual user message
+    # 5. Build enriched user message: in chat, the person's words come first
+    # and what the agent remembers follows; other modes keep context first.
     if mode == "chat":
-        enriched_parts.append(f"[USER MESSAGE]\n{_with_reply_language(user_message)}")
+        enriched_user_message = compose_chat_turn(
+            _with_reply_language(user_message), sub_signals, continuity_context, memory_context
+        )
     else:
+        enriched_parts = [
+            part for part in (sub_signals, continuity_context, memory_context) if part
+        ]
         enriched_parts.append(user_message)
-
-    enriched_user_message = (
-        "\n\n".join(enriched_parts) if enriched_parts else user_message
-    )
+        enriched_user_message = "\n\n".join(enriched_parts)
     enriched_user_content = _user_content_with_visuals(
         enriched_user_message,
         visual_attachments if mode == "chat" else None,
@@ -1437,16 +1448,11 @@ async def stream_agent(
         prompt_addenda=[*(prompt_addenda or []), *(_reply_language_addendum(user_message) if mode == "chat" else [])],
     )
 
-    # Build enriched user message (signals were rendered by the DB in-scope)
-    enriched_parts: list[str] = []
-    if sub_signals:
-        enriched_parts.append(sub_signals)
-    if continuity_context:
-        enriched_parts.append(continuity_context)
-    if memory_context:
-        enriched_parts.append(memory_context)
-    enriched_parts.append(f"[USER MESSAGE]\n{_with_reply_language(user_message)}")
-    enriched_user_message = "\n\n".join(enriched_parts)
+    # Build enriched user message (signals were rendered by the DB in-scope):
+    # the person's words first, then what the agent remembers.
+    enriched_user_message = compose_chat_turn(
+        _with_reply_language(user_message), sub_signals, continuity_context, memory_context
+    )
     enriched_user_content = _user_content_with_visuals(
         enriched_user_message,
         visual_attachments if mode == "chat" else None,

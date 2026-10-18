@@ -65,3 +65,15 @@ async def test_gate_never_blocks_on_a_broken_database(monkeypatch):
     assert await chat_priority.wait_for_chat_idle(_Broken(), max_wait_seconds=1) < 0.01
     await chat_priority.begin_chat_turn(_Broken(), "s")  # logs, does not raise
     await chat_priority.end_chat_turn(_Broken(), "s")
+
+
+async def test_logs_how_long_it_waited_when_the_turn_ended(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(chat_priority, "POLL_SECONDS", 0.01)
+    with caplog.at_level(logging.INFO, logger=chat_priority.logger.name):
+        await chat_priority.wait_for_chat_idle(_Pool(active_for=2))
+        await chat_priority.wait_for_chat_idle(_Pool(active_for=0))
+    waits = [r for r in caplog.records if "waited" in r.getMessage()]
+    assert len(waits) == 1
+    assert "for the chat turn to finish" in waits[0].getMessage()

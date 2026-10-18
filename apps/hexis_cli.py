@@ -4588,20 +4588,33 @@ def _format_transcript_event(event: dict[str, Any]) -> str | None:
     return None
 
 
+# Mirrors services/agent.py (compose_chat_turn); duplicated so the CLI does
+# not import the agent runtime just to render a transcript.
+_TRANSCRIPT_MARKER = "[USER MESSAGE]\n"
+_TRANSCRIPT_DIVIDER = (
+    "--- What you remember (context for this reply, not part of the message) ---"
+)
+
+
 def _split_transcript_user_message(raw: str | None) -> tuple[str, str | None]:
-    """Chat turns store the FULL assembled prompt as `user_message` --
-    subconscious signals, the continuity packet, identity/memory context,
-    then the literal text a human typed after a stable '[USER MESSAGE]'
-    marker (see services/agent.py's enriched_parts / services/chat.py). Pull
-    out just what was actually said, plus the '## Subconscious Signals'
-    block if present -- that block lives nowhere else, so this is the only
-    way a transcript can show it as the issue asks. Heartbeat turns carry no
-    marker and pass through unchanged."""
+    """Chat turns store the FULL assembled prompt as `user_message`: the
+    literal text a human typed after a stable '[USER MESSAGE]' marker, then a
+    divider and what the agent remembered (subconscious signals, the
+    continuity packet, memory context). Turns stored before the message came
+    first carry that context ahead of the marker instead. Pull out just what
+    was actually said, plus the '## Subconscious Signals' block if present --
+    that block lives nowhere else, so this is the only way a transcript can
+    show it as the issue asks. Heartbeat turns carry no marker and pass
+    through unchanged."""
     if not raw:
         return raw or "", None
-    marker = "[USER MESSAGE]\n"
+    marker = _TRANSCRIPT_MARKER
     idx = raw.rfind(marker)
     prefix, clean = (raw[:idx], raw[idx + len(marker):]) if idx != -1 else ("", raw)
+    div = clean.find(_TRANSCRIPT_DIVIDER)
+    if div != -1:
+        prefix = prefix + "\n" + clean[div + len(_TRANSCRIPT_DIVIDER):]
+        clean = clean[:div]
     signals = None
     sig_idx = prefix.find("## Subconscious Signals")
     if sig_idx != -1:

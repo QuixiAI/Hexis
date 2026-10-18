@@ -100,3 +100,24 @@ async def test_setting_and_reading_the_destination(db_pool):
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM config WHERE key = $1", outreach_destination.DESTINATION_KEY)
+
+
+async def test_queue_user_message_names_its_channel_in_the_delivery_doc(monkeypatch):
+    from channels.outbox import ChannelOutboxConsumer
+
+    consumer = ChannelOutboxConsumer(MagicMock(), MagicMock())
+    seen: dict = {}
+
+    async def deliver(message, content, payload, outbox_msg_id, requested):
+        seen["requested"] = requested
+
+    monkeypatch.setattr(consumer, "_deliver_to_user", deliver)
+    await consumer._deliver_last_active(
+        "Hi", "Hi", {"delivery": {"mode": "user", "channel": "telegram"}}, "m3"
+    )
+    assert seen["requested"] == "telegram"
+    # A channel-routing doc is not a request about the user's channel.
+    await consumer._deliver_last_active(
+        "Hi", "Hi", {"delivery": {"mode": "web_inbox", "channel": "slack"}}, "m4"
+    )
+    assert seen["requested"] is None

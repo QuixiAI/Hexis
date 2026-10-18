@@ -362,6 +362,8 @@ async def _store(pool: Any, job: dict[str, Any], item: dict[str, Any], folder_id
                 "drive_path": path,
                 "drive_folder_id": folder_id,
                 "modified_time": item.get("modifiedTime"),
+                # Imported on purpose: history, not news (connector_cognition).
+                "acquisition": "import",
             }),
         )
 

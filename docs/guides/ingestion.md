@@ -129,8 +129,9 @@ All paths converge on the same pipeline and receipts:
    reads PDF, Office, text and CSV files, and queues each as one document
    for the ingest worker. Unchanged files are skipped on later imports, and
    one unreadable file never stops the rest. Nothing is written to Drive.
-   Connector items older than two days are history: scored by rules only and
-   never raised as an alert, so importing a backlog never floods the inbox.
+   Imported items, and any connector item older than two days, are history:
+   scored by rules only and never raised as an alert, so importing a backlog
+   never floods the inbox.
 5. **The agent itself** — `url_ingest`/`git_ingest` during heartbeats. Sources
    are stamped with `acquisition` provenance (`user`, `agent`, `connector`):
    user-provided sources never auto-fade (retention asks you first), while
@@ -153,6 +154,10 @@ hexis ingest --url https://example.com/article
 # Stdin
 cat ./notes.md | hexis ingest --stdin --stdin-type markdown --stdin-title "notes"
 ```
+
+A `.zip` is read as one document with a section per entry: plain text,
+Markdown, CSV, JSON and `.eml` mail are read, other entries are counted and
+skipped, and reading stops at 50 MB uncompressed.
 
 ## Useful Flags
 

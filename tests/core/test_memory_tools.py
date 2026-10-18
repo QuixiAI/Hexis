@@ -257,6 +257,44 @@ class TestQueueUserMessage:
                 )
 
 
+    async def test_a_chosen_channel_goes_through_the_outbox_and_says_where(
+        self, db_pool, monkeypatch
+    ):
+        from core import outreach_destination
+
+        marker = get_test_identifier("chatchannel")
+        message = f"long update by email {marker}"
+        requested: list = []
+
+        async def choose(_pool, channel=None):
+            requested.append(channel)
+            return "email", {"destination": "auto", "available": ["slack", "email"], "channels": {}}
+
+        monkeypatch.setattr(outreach_destination, "choose", choose)
+        try:
+            result = await QueueUserMessageHandler().execute(
+                {"message": message, "channel": "email"},
+                _ctx(db_pool),
+            )
+            assert result.success, result.error
+            assert requested == ["email"]
+            assert result.output["delivered_to"] == ["email", "inbox"]
+            assert result.output["channels_available"] == ["slack", "email"]
+            async with db_pool.acquire() as conn:
+                delivery = await conn.fetchval(
+                    "SELECT envelope->'payload'->'delivery' FROM outbox_messages WHERE id = $1::uuid",
+                    result.output["outbox_id"],
+                )
+            delivery = json.loads(delivery) if isinstance(delivery, str) else delivery
+            assert delivery == {"mode": "user", "channel": "email"}
+        finally:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM outbox_messages WHERE envelope->'payload'->>'message' = $1",
+                    message,
+                )
+
+
 class TestProvenanceTooling:
     async def test_remember_handler_passes_session_context_for_idempotency(
         self, db_pool, ensure_embedding_service

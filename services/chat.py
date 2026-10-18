@@ -640,15 +640,10 @@ async def chat_turn(
                 render_operator_policy_context,
             )
 
+            from services.agent import compose_chat_turn
+
             policy_context = await render_operator_policy_context(pool)
-            rlm_user_message = "\n\n".join(
-                part
-                for part in (
-                    policy_context,
-                    f"[USER MESSAGE]\n{agent_user_message}",
-                )
-                if part
-            )
+            rlm_user_message = compose_chat_turn(agent_user_message, policy_context)
 
             result = await run_chat_turn(
                 user_message=rlm_user_message,
@@ -1019,15 +1014,10 @@ async def stream_chat_events(
                 render_operator_policy_context,
             )
 
+            from services.agent import compose_chat_turn
+
             policy_context = await render_operator_policy_context(pool)
-            rlm_user_message = "\n\n".join(
-                part
-                for part in (
-                    policy_context,
-                    f"[USER MESSAGE]\n{agent_user_message}",
-                )
-                if part
-            )
+            rlm_user_message = compose_chat_turn(agent_user_message, policy_context)
             yield AgentEventData(
                 event=AgentEvent.LOOP_START,
                 data={"phase": "conscious_final", "runtime": "rlm"},
