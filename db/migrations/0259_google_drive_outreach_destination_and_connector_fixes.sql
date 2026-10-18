@@ -90,7 +90,22 @@ INSERT INTO config_defaults (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 -- reach_out_user may name a channel (params.channel).
-CREATE OR REPLACE FUNCTION execute_heartbeat_action(
+-- execute_heartbeat_action is a narrow wrapper (0233, db/46j) that handles
+-- resolve_contradiction / accept_tension and hands every other action to
+-- execute_heartbeat_action_legacy_contradictions. 0257 replaced the wrapper
+-- itself with the full action body, so a database that applied 0257 lost the
+-- contradiction handling. The full body is replaced under the legacy name
+-- here, and the wrapper is installed again on top of it.
+DO $rename$
+BEGIN
+    IF to_regprocedure('execute_heartbeat_action_legacy_contradictions(uuid,text,jsonb)') IS NULL THEN
+        ALTER FUNCTION execute_heartbeat_action(UUID, TEXT, JSONB)
+            RENAME TO execute_heartbeat_action_legacy_contradictions;
+    END IF;
+END;
+$rename$;
+
+CREATE OR REPLACE FUNCTION execute_heartbeat_action_legacy_contradictions(
     p_heartbeat_id UUID,
     p_action TEXT,
     p_params JSONB DEFAULT '{}'
@@ -811,5 +826,71 @@ BEGIN
         SET source_attribution = replace(u.source_attribution::text, d.copy_hash, d.stored_hash)::jsonb
         WHERE u.source_attribution->>'content_hash' = d.copy_hash;
     END LOOP;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION execute_heartbeat_action(
+    p_heartbeat_id UUID,
+    p_action TEXT,
+    p_params JSONB DEFAULT '{}'
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_case_id UUID := _db_brain_try_uuid(p_params->>'case_id');
+    v_memory_a UUID := _db_brain_try_uuid(p_params->>'memory_a');
+    v_memory_b UUID := _db_brain_try_uuid(p_params->>'memory_b');
+    v_filed JSONB;
+BEGIN
+    IF p_action NOT IN ('resolve_contradiction', 'accept_tension') THEN
+        RETURN execute_heartbeat_action_legacy_contradictions(p_heartbeat_id, p_action, p_params);
+    END IF;
+    IF v_case_id IS NULL AND v_memory_a IS NOT NULL AND v_memory_b IS NOT NULL THEN
+        SELECT id INTO v_case_id
+        FROM contradiction_cases
+        WHERE status = 'pending'
+          AND LEAST(memory_a, memory_b) = LEAST(v_memory_a, v_memory_b)
+          AND GREATEST(memory_a, memory_b) = GREATEST(v_memory_a, v_memory_b)
+        LIMIT 1;
+    END IF;
+    IF v_case_id IS NULL AND v_memory_a IS NOT NULL AND v_memory_b IS NOT NULL THEN
+        v_filed := file_contradiction_case(
+            v_memory_a, v_memory_b, v_memory_b,
+            COALESCE(NULLIF(p_params->>'resolution', ''), NULLIF(p_params->>'note', ''), 'Contradictory memories need a user decision.'),
+            COALESCE(NULLIF(p_params->>'confidence', '')::float, 0.8),
+            'heartbeat',
+            jsonb_build_object('heartbeat_id', p_heartbeat_id)
+        );
+        v_case_id := _db_brain_try_uuid(v_filed->>'case_id');
+    END IF;
+    IF v_case_id IS NULL THEN
+        RETURN jsonb_build_object(
+            'success', FALSE,
+            'error', 'No pending contradiction case was found. Detection must file a case before review.',
+            'action', p_action,
+            'cost', 0,
+            'energy_remaining', get_current_energy()
+        );
+    END IF;
+    UPDATE contradiction_cases
+    SET proposed_at = COALESCE(proposed_at, CURRENT_TIMESTAMP),
+        metadata = metadata || jsonb_build_object('noticed_by_heartbeat_id', p_heartbeat_id),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = v_case_id AND status = 'pending';
+    RETURN jsonb_build_object(
+        'success', TRUE,
+        'action', p_action,
+        'cost', 0,
+        'energy_remaining', get_current_energy(),
+        'result', jsonb_build_object(
+            'case_id', v_case_id,
+            'decision_required', TRUE,
+            'changed_memories', FALSE,
+            'next_step', 'Include this case in the next daily contradiction review; only the user chooses new, old, or both.'
+        ),
+        'external_calls', '[]'::jsonb,
+        'outbox_messages', '[]'::jsonb
+    );
 END;
 $$;
