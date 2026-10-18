@@ -1,5 +1,6 @@
 "use client";
 
+import { confirmAction } from "../../lib/confirm";
 import {
   Activity,
   BrainCircuit,
@@ -1709,8 +1710,9 @@ export default function ChatPage() {
     if (sending || sessionActionBusy) return;
     const currentSessionId = sessionId || loadSessionId();
     if (!currentSessionId && messages.length === 0) return;
-    const confirmed = window.confirm(
-      "Clear this conversation from active context? Long-term memories and source records are preserved."
+    const confirmed = await confirmAction(
+      "Clear this conversation from active context? Long-term memories and source records are preserved.",
+      { confirmLabel: "Clear", destructive: true }
     );
     if (!confirmed) return;
 
@@ -4568,23 +4570,26 @@ function emotionSnapshotFromEvent(event: LogEvent): EmotionSnapshot | null {
   const raw = asRecord(event.raw);
   const signals = asRecord(raw.signals);
   const emotion = asRecord(signals.emotional_state);
+  // An appraisal that failed or reported no emotional state is not a mood:
+  // the tile keeps the last real appraisal (or neutral) rather than reading
+  // the event's summary line, which then names the model.
   const label =
     asString(emotion.primary_emotion) ||
     asString(emotion.mood) ||
-    asString(emotion.state) ||
-    firstDetailPart(event.detail) ||
-    "neutral";
+    asString(emotion.state);
   const valence = asNumber(emotion.valence);
+  if (!label && valence === null) return null;
   const detail =
     asString(emotion.summary) ||
     asString(emotion.reason) ||
     asString(signals.subconscious_response) ||
     event.detail ||
-    label;
+    label ||
+    "neutral";
   return {
     id: event.id,
     ts: event.ts,
-    label,
+    label: label || "neutral",
     valence,
     detail,
   };
@@ -4660,10 +4665,6 @@ function memoryCountFromEvent(event: LogEvent | null): number {
   if (count !== null) return Math.round(count);
   const match = event.detail.match(/Retrieved\s+(\d+)/i);
   return match ? Number(match[1]) : memoryPreviewsFromEvent(event).length;
-}
-
-function firstDetailPart(value: string): string {
-  return value.split(" · ")[0]?.trim() || "";
 }
 
 function afterFirstDetailPart(value: string): string {

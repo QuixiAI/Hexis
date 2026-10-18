@@ -4,6 +4,7 @@ import { ExternalLink, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import { Button } from "../components/ui/button";
+import { confirmAction } from "../../lib/confirm";
 
 type DriveFolder = { id: string; name: string; url?: string | null };
 type ImportState = {
@@ -157,10 +158,12 @@ export function DriveControls() {
     });
   const removeFolder = (id: string) => run("add", async () => setStatus(await call<DriveStatus>("/folders/remove", { id })));
   const startImport = () => run("import", async () => setStatus(await call<DriveStatus>("/import", {})));
-  const signOut = () => {
-    if (!window.confirm("Sign out of Google Drive? What it has already remembered stays, but it stops reading these folders.")) {
-      return;
-    }
+  const signOut = async () => {
+    const ok = await confirmAction(
+      "Sign out of Google Drive? What it has already remembered stays, but it stops reading these folders.",
+      { confirmLabel: "Sign out", destructive: true },
+    );
+    if (!ok) return;
     void run("signOut", async () => setStatus(await call<DriveStatus>("/disconnect", {})));
   };
 

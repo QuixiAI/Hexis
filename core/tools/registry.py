@@ -212,6 +212,24 @@ class ToolRegistry:
         """List all tool names."""
         return list(self._handlers.keys()) + list(self._mcp_handlers.keys())
 
+    async def unready_tools(self, context: ToolContext) -> dict[str, str]:
+        """Registered tools that cannot run yet, mapped to the setup step each needs."""
+        probe = ToolExecutionContext(
+            tool_context=context,
+            call_id="readiness",
+            allow_network=False,
+            registry=self,
+        )
+        unready: dict[str, str] = {}
+        for handler in self.list_all():
+            try:
+                step = await handler.readiness(probe)
+            except Exception:
+                logger.debug("Readiness probe failed for %s", handler.spec.name, exc_info=True)
+                continue
+            if step:
+                unready[handler.spec.name] = step
+        return unready
     def _tool_catalog_payload(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         mcp_names = set(self._mcp_handlers.keys())

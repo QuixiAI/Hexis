@@ -2209,11 +2209,14 @@ async def run_heartbeat_now():
     )
 
 
+# Manual heartbeats run to completion even if the page that started them
+# closes; the stream only relays their events. Strong references keep the
+# tasks alive until they finish.
+_manual_heartbeat_tasks: set[Any] = set()
+
+
 async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
     import asyncio
-
-    from services.heartbeat_agentic import finalize_heartbeat, run_agentic_heartbeat
-    from services.worker_service import _extract_heartbeat_context
 
     async with pool.acquire() as conn:
         state = await conn.fetchrow("""
@@ -2225,101 +2228,120 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
             FROM heartbeat_state
             WHERE id = 1
             """)
-        if not state or not state["configured"] or not state["initialized"]:
-            yield _sse_event(
-                "error",
-                {"message": "Complete initialization before running a heartbeat."},
-            )
-            return
-        if state["terminated"]:
-            yield _sse_event(
-                "error",
-                {"message": "The agent is terminated and cannot run a heartbeat."},
-            )
-            return
-        if state["is_paused"]:
-            yield _sse_event(
-                "error",
-                {"message": "Heartbeat is paused. Resume it before running one now."},
-            )
-            return
-        if state["running"]:
-            yield _sse_event("error", {"message": "A heartbeat is already running."})
-            return
-
-        raw_payload = await conn.fetchval("SELECT start_heartbeat()")
-        payload = (
-            raw_payload
-            if isinstance(raw_payload, dict)
-            else json.loads(raw_payload)
-            if isinstance(raw_payload, str)
-            else {}
-        )
-        heartbeat_id = str(payload.get("heartbeat_id") or "")
-        if not heartbeat_id:
-            # start_heartbeat refuses while another heartbeat runs (one at a time).
-            running = await conn.fetchval("SELECT heartbeat_in_progress()")
-            message = "A heartbeat is already running." if running else "Hexis could not start a heartbeat."
-            yield _sse_event("error", {"message": message})
-            return
-
-        heartbeat_number = payload.get("heartbeat_number")
+    if not state or not state["configured"] or not state["initialized"]:
         yield _sse_event(
-            "heartbeat_start",
-            {
-                "heartbeat_id": heartbeat_id,
-                "heartbeat_number": heartbeat_number,
-            },
+            "error",
+            {"message": "Complete initialization before running a heartbeat."},
         )
-
-        queue: asyncio.Queue[AgentEventData] = asyncio.Queue()
-
-        async def on_event(event: AgentEventData) -> None:
-            await queue.put(event)
-
-        registry = await create_full_registry(pool)
-        context = _extract_heartbeat_context(payload)
-        task = asyncio.create_task(
-            run_agentic_heartbeat(
-                conn,
-                pool=pool,
-                registry=registry,
-                heartbeat_id=heartbeat_id,
-                context=context,
-                on_event=on_event,
-            )
+        return
+    if state["terminated"]:
+        yield _sse_event(
+            "error",
+            {"message": "The agent is terminated and cannot run a heartbeat."},
         )
+        return
+    if state["is_paused"]:
+        yield _sse_event(
+            "error",
+            {"message": "Heartbeat is paused. Resume it before running one now."},
+        )
+        return
+    if state["running"]:
+        yield _sse_event("error", {"message": "A heartbeat is already running."})
+        return
 
-        try:
-            while not task.done() or not queue.empty():
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    continue
-                yield _heartbeat_agent_sse(event)
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    task = asyncio.create_task(_run_manual_heartbeat(pool, queue))
+    _manual_heartbeat_tasks.add(task)
+    task.add_done_callback(_manual_heartbeat_tasks.discard)
 
-            result = await task
-            finalized = await finalize_heartbeat(
-                conn,
-                heartbeat_id=heartbeat_id,
-                result=result,
+    while True:
+        message = await queue.get()
+        if message is None:
+            return
+        yield message
+
+
+async def _run_manual_heartbeat(pool: asyncpg.Pool, queue: "asyncio.Queue[str | None]") -> None:
+    """Start, run and finalize one heartbeat on its own connection, posting SSE
+    messages to ``queue`` and ``None`` when done.
+
+    Runs as its own task so that a closed page (which cancels the stream) never
+    cancels the heartbeat mid-run and leaves its claim active.
+    """
+    from services.heartbeat_agentic import finalize_heartbeat, run_agentic_heartbeat
+    from services.worker_service import _extract_heartbeat_context
+
+    heartbeat_id = ""
+    try:
+        async with pool.acquire() as conn:
+            raw_payload = await conn.fetchval("SELECT start_heartbeat()")
+            payload = (
+                raw_payload
+                if isinstance(raw_payload, dict)
+                else json.loads(raw_payload)
+                if isinstance(raw_payload, str)
+                else {}
             )
-            yield _sse_event(
-                "heartbeat_done",
-                {
-                    "heartbeat_id": heartbeat_id,
-                    "heartbeat_number": heartbeat_number,
-                    "text": result.get("text") or "",
-                    "tool_calls": result.get("tool_calls_made") or [],
-                    "energy_spent": result.get("energy_spent") or 0,
-                    "stopped_reason": result.get("stopped_reason") or "completed",
-                    "memory_id": finalized.get("memory_id"),
-                },
+            heartbeat_id = str(payload.get("heartbeat_id") or "")
+            if not heartbeat_id:
+                # start_heartbeat refuses while another heartbeat runs (one at a time).
+                running = await conn.fetchval("SELECT heartbeat_in_progress()")
+                message = "A heartbeat is already running." if running else "Hexis could not start a heartbeat."
+                await queue.put(_sse_event("error", {"message": message}))
+                return
+
+            heartbeat_number = payload.get("heartbeat_number")
+            await queue.put(
+                _sse_event(
+                    "heartbeat_start",
+                    {
+                        "heartbeat_id": heartbeat_id,
+                        "heartbeat_number": heartbeat_number,
+                    },
+                )
             )
-        except Exception as exc:
-            logger.exception("Manual heartbeat failed")
-            await conn.fetchval("SELECT release_active_heartbeat($1)", heartbeat_id)
-            yield _sse_event("error", {"message": str(exc)})
+
+            async def on_event(event: AgentEventData) -> None:
+                await queue.put(_heartbeat_agent_sse(event))
+
+            try:
+                registry = await create_full_registry(pool)
+                result = await run_agentic_heartbeat(
+                    conn,
+                    pool=pool,
+                    registry=registry,
+                    heartbeat_id=heartbeat_id,
+                    context=_extract_heartbeat_context(payload),
+                    on_event=on_event,
+                )
+                finalized = await finalize_heartbeat(
+                    conn,
+                    heartbeat_id=heartbeat_id,
+                    result=result,
+                )
+            except BaseException:
+                await conn.fetchval("SELECT release_active_heartbeat($1)", heartbeat_id)
+                raise
+            await queue.put(
+                _sse_event(
+                    "heartbeat_done",
+                    {
+                        "heartbeat_id": heartbeat_id,
+                        "heartbeat_number": heartbeat_number,
+                        "text": result.get("text") or "",
+                        "tool_calls": result.get("tool_calls_made") or [],
+                        "energy_spent": result.get("energy_spent") or 0,
+                        "stopped_reason": result.get("stopped_reason") or "completed",
+                        "memory_id": finalized.get("memory_id"),
+                    },
+                )
+            )
+    except Exception as exc:
+        logger.exception("Manual heartbeat failed")
+        await queue.put(_sse_event("error", {"message": str(exc)}))
+    finally:
+        await queue.put(None)
 
 
 def _heartbeat_agent_sse(event: AgentEventData) -> str:
@@ -3371,6 +3393,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     turn_timeout_s = await _chat_turn_timeout_s(pool)
     await begin_chat_turn(pool, session_id, ttl_seconds=int(turn_timeout_s or 360))
     citation_sources = {}
+    question_asked = False
 
     def build_done_payload() -> dict[str, Any]:
         payload: dict[str, Any] = {"assistant": full_text, "session_id": session_id}
@@ -3378,6 +3401,10 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             payload["presentation"] = presentation_from_text(
                 full_text, citation_sources.values()
             ).to_dict()
+        # The final event says plainly when the turn produced no answer, so a
+        # client never has to infer failure from an empty bubble.
+        elif not question_asked:
+            payload["error"] = "The model returned no answer."
         return payload
 
     def build_failed_payload() -> dict[str, Any]:
@@ -3555,6 +3582,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 yield _sse_event("ui", event.data)
 
             elif event.event == AgentEvent.QUESTION:
+                question_asked = True
                 yield _sse_event("question", event.data)
 
             elif event.event == AgentEvent.CLAIM_FLAGGED:

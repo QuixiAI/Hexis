@@ -145,6 +145,7 @@ async def run_conscious_extraction_step(conn) -> dict[str, Any]:
             temperature=0.2,
             response_format={"type": "json_object"},
             fallback={"facts": []},
+            usage_source="memory",
         )
         facts = doc.get("facts") if isinstance(doc, dict) else []
         if not isinstance(facts, list):

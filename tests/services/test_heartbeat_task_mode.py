@@ -39,6 +39,7 @@ def _mock_registry(tool_names: list[str] | None = None) -> MagicMock:
     registry.get_specs = AsyncMock(return_value=specs)
     registry.get_spec = MagicMock(return_value=None)
     registry.execute = AsyncMock()
+    registry.unready_tools = AsyncMock(return_value={})
     registry.get_config = AsyncMock(return_value=MagicMock(
         get_context_overrides=MagicMock(return_value=MagicMock(
             allow_shell=False, allow_file_write=False

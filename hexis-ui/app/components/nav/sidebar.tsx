@@ -25,6 +25,7 @@ import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useAgentStatus } from "../../hooks/use-agent-status";
 import { ProgressBar } from "../ui/progress-bar";
+import { ActivityPanel } from "./background-activity";
 
 type StatusData = {
   agent_name?: string;
@@ -133,6 +134,7 @@ export function Sidebar({
       </nav>
 
       <div className="space-y-4 border-t border-[var(--outline)] px-4 py-4">
+        <ActivityPanel />
         <div className="flex items-center justify-between text-xs">
           <span className="flex items-center gap-2 text-[var(--ink-soft)]">
             <Activity size={15} aria-hidden="true" />

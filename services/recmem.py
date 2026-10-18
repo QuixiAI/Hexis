@@ -160,6 +160,7 @@ async def _handle_episode_merge(conn, task: dict[str, Any], llm_config: dict[str
         temperature=0.1,
         response_format={"type": "json_object"},
         fallback={"should_merge": False},
+        usage_source="memory",
     )
     if not isinstance(doc, dict):
         doc = {"should_merge": False}
@@ -186,6 +187,7 @@ async def _handle_episode_create(conn, task: dict[str, Any], llm_config: dict[st
         temperature=0.1,
         response_format={"type": "json_object"},
         fallback={"episodes": []},
+        usage_source="memory",
     )
     normalized = await conn.fetchval("SELECT normalize_recmem_episode_output($1::jsonb)", json.dumps(doc or {}))
     episodes = _coerce_json(normalized)
@@ -211,6 +213,7 @@ async def _handle_semantic_refine(conn, task: dict[str, Any], llm_config: dict[s
         temperature=0.1,
         response_format={"type": "json_object"},
         fallback={"facts": []},
+        usage_source="memory",
     )
     normalized = await conn.fetchval("SELECT normalize_recmem_fact_output($1::jsonb)", json.dumps(doc or {}))
     facts = _coerce_json(normalized)

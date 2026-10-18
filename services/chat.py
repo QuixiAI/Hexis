@@ -383,6 +383,44 @@ async def _remember_conversation(
     )
 
 
+async def keep_unanswered_question(
+    pool: Any,
+    *,
+    session_id: str | None,
+    user_message: str,
+    surface: str,
+    reason: str,
+) -> bool:
+    """A turn that produced no answer still keeps the question.
+
+    The session transcript gets the user's message (so a reload shows it and
+    the next turn can see it) with an unanswered marker; no episodic memory
+    is formed from a one-sided exchange.
+    """
+    parsed = _uuid_text_or_none(session_id)
+    if not parsed or not user_message:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval(
+                "SELECT get_or_create_chat_session($1::uuid, $2::text, NULL, '{}'::jsonb)",
+                parsed,
+                "chat" if surface == "api" else surface,
+            )
+            await conn.fetchval(
+                "SELECT append_chat_message($1::uuid, 'user', $2::text, $3::jsonb, NULL, TRUE)",
+                parsed,
+                user_message,
+                json.dumps({"unanswered": True, "error": reason[:500]}),
+            )
+        return True
+    except Exception:
+        logger.warning(
+            "Could not keep the unanswered question for session %s", session_id, exc_info=True
+        )
+        return False
+
+
 async def _hydrate_after_persist(
     mem_client: CognitiveMemory,
     session_id: str | None,
@@ -1010,6 +1048,19 @@ async def stream_chat_events(
                         event=AgentEvent.TEXT_DELTA,
                         data={"text": assistant_text, "runtime": "rlm"},
                     )
+                else:
+                    reason = "The model returned no answer."
+                    await keep_unanswered_question(
+                        pool,
+                        session_id=session_id,
+                        user_message=user_message,
+                        surface=surface,
+                        reason=reason,
+                    )
+                    yield AgentEventData(
+                        event=AgentEvent.ERROR,
+                        data={"error": reason, "unanswered": True, "runtime": "rlm"},
+                    )
                 yield AgentEventData(
                     event=AgentEvent.LOOP_END,
                     data={"stopped_reason": "completed", "runtime": "rlm"},
@@ -1053,11 +1104,19 @@ async def stream_chat_events(
             except Exception as exc:
                 logger.exception("RLM chat stream failed")
                 error = describe_exception(exc)
+                await keep_unanswered_question(
+                    pool,
+                    session_id=session_id,
+                    user_message=user_message,
+                    surface=surface,
+                    reason=error,
+                )
                 yield AgentEventData(
                     event=AgentEvent.ERROR,
                     data={
                         "error": error,
                         "error_type": type(exc).__name__,
+                        "unanswered": True,
                         "runtime": "rlm",
                     },
                 )
@@ -1072,6 +1131,8 @@ async def stream_chat_events(
         collected: list[str] = []
         timed_out = False
         failed = False
+        loop_error: str | None = None
+        asked_question = False
         appraisal_affect: dict[str, Any] | None = None
         tool_energy_spent = 0
         agent_turn_id: str | None = None
@@ -1111,6 +1172,9 @@ async def stream_chat_events(
                 failed = failed or stopped == "error"
             elif event.event == AgentEvent.ERROR:
                 failed = True
+                loop_error = str(event.data.get("error") or "") or loop_error
+            elif event.event == AgentEvent.QUESTION:
+                asked_question = True
             elif event.event == AgentEvent.PHASE_CHANGE:
                 if (
                     event.data.get("phase") == "subconscious"
@@ -1146,7 +1210,30 @@ async def stream_chat_events(
             yield event
 
         full_text = "".join(collected)
-        if full_text and not timed_out and not failed:
+        if (not full_text and not asked_question) or timed_out or failed:
+            # No answer, or a partial one cut off by the turn limit: say so
+            # plainly (once) and keep the question. Silence is the one
+            # outcome the person must never get. A turn that paused on a
+            # question to the user is not unanswered.
+            if timed_out:
+                reason = "The answer did not finish within the turn time limit."
+            elif loop_error:
+                reason = loop_error
+            else:
+                reason = "The model returned no answer."
+            await keep_unanswered_question(
+                pool,
+                session_id=session_id,
+                user_message=user_message,
+                surface=surface,
+                reason=reason,
+            )
+            if not failed:
+                yield AgentEventData(
+                    event=AgentEvent.ERROR,
+                    data={"error": reason, "unanswered": True, "partial": bool(full_text)},
+                )
+        else:
             action_receipts = _compact_action_receipts(
                 completed_tool_calls,
                 agent_turn_id=agent_turn_id,

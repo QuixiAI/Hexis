@@ -33,12 +33,30 @@ ON CONFLICT (key) DO NOTHING;
 -- the user's, from config with init-profile fallback. Everything that names
 -- the participants — turn rendering, extraction context, source labels —
 -- reads this.
+-- The user's name as a channel knows it: the display name of the channel
+-- session whose sender is a configured channel.<type>.operator_user_id, most
+-- recently active first. Lets the web chat call the user by the same name
+-- Slack or Telegram does when nothing set agent.user_name.
+CREATE OR REPLACE FUNCTION get_user_channel_name()
+RETURNS TEXT AS $$
+    SELECT NULLIF(btrim(s.sender_name), '')
+    FROM config c
+    JOIN channel_sessions s
+      ON s.channel_type = split_part(c.key, '.', 2)
+     AND s.sender_id = NULLIF(btrim(c.value #>> '{}'), '')
+    WHERE c.key LIKE 'channel.%.operator_user_id'
+      AND NULLIF(btrim(s.sender_name), '') IS NOT NULL
+    ORDER BY s.last_active DESC NULLS LAST
+    LIMIT 1;
+$$ LANGUAGE sql STABLE;
+
 CREATE OR REPLACE FUNCTION get_turn_labels()
 RETURNS JSONB AS $$
     SELECT jsonb_build_object(
         'user_label', COALESCE(
             NULLIF(get_config_text('agent.user_name'), ''),
             NULLIF(get_init_profile()#>>'{user,name}', ''),
+            get_user_channel_name(),
             'User'),
         'agent_label', COALESCE(
             NULLIF(get_config_text('agent.name'), ''),

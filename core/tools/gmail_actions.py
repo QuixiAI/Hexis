@@ -26,7 +26,18 @@ def _string_list(value: Any) -> list[str]:
     return []
 
 
-class GmailSendHandler(ToolHandler):
+class _ConnectedGmail:
+    """Readiness shared by the Gmail action tools: they act as the connected account."""
+
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        from core.auth.google_gmail import load_default_credentials
+
+        if load_default_credentials():
+            return None
+        return "Gmail is not connected. Connect it on the Connections page."
+
+
+class GmailSendHandler(_ConnectedGmail, ToolHandler):
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
@@ -98,7 +109,7 @@ class GmailSendHandler(ToolHandler):
         )
 
 
-class GmailReplyHandler(ToolHandler):
+class GmailReplyHandler(_ConnectedGmail, ToolHandler):
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
@@ -184,7 +195,7 @@ class GmailReplyHandler(ToolHandler):
         )
 
 
-class GmailLabelHandler(ToolHandler):
+class GmailLabelHandler(_ConnectedGmail, ToolHandler):
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
@@ -246,7 +257,7 @@ class GmailLabelHandler(ToolHandler):
         )
 
 
-class GmailSpamTriageHandler(ToolHandler):
+class GmailSpamTriageHandler(_ConnectedGmail, ToolHandler):
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
@@ -302,7 +313,7 @@ class GmailSpamTriageHandler(ToolHandler):
         )
 
 
-class GmailDeleteHandler(ToolHandler):
+class GmailDeleteHandler(_ConnectedGmail, ToolHandler):
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(

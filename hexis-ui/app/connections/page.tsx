@@ -1,5 +1,6 @@
 "use client";
 
+import { confirmAction } from "../../lib/confirm";
 import {
   AlertCircle,
   CheckCircle2,
@@ -246,10 +247,11 @@ function ConnectorCard({
                   type="button"
                   variant="ghost"
                   disabled={Boolean(actionBusy)}
-                  onClick={() => {
+                  onClick={async () => {
                     if (
-                      window.confirm(
-                        `Disconnect ${connection.display_name || connection.account_key}?`
+                      await confirmAction(
+                        `Disconnect ${connection.display_name || connection.account_key}?`,
+                        { confirmLabel: "Disconnect", destructive: true }
                       )
                     ) {
                       const revokeAction =
@@ -1438,8 +1440,13 @@ function BackfillPanel({
                         type="button"
                         variant="ghost"
                         disabled={Boolean(actionBusy)}
-                        onClick={() => {
-                          if (window.confirm(`Cancel ${job.connector_id} backfill job ${job.job_id}?`)) {
+                        onClick={async () => {
+                          if (
+                            await confirmAction(
+                              `Cancel ${job.connector_id} backfill job ${job.job_id}?`,
+                              { confirmLabel: "Cancel import", destructive: true }
+                            )
+                          ) {
                             void onAction(
                               `backfill:${job.job_id}:cancel`,
                               controlAction,

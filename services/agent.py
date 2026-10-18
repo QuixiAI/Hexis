@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal, TYPE_CHECKI
 from core.agent_loop import AgentEvent, AgentEventData, AgentLoop, AgentLoopConfig
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
+from core.subconscious import character_block
 from core.tools.base import ToolContext
 from core.tools.config import ContextOverrides
 from services.prompt_resources import (
@@ -31,6 +32,7 @@ from services.prompt_resources import (
 from services.skill_runtime import (
     format_skills_prompt,
     load_available_skills,
+    skill_setup_steps as resolve_skill_setup_steps,
     record_selection,
     select_skills,
 )
@@ -566,8 +568,16 @@ async def run_subconscious_appraisal(
     total_chars = int(limits.get("total_chars") or _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS)
     user_prompt = "Context (JSON):\n" + _bounded_subconscious_json(payload, total_chars)
 
+    system_prompt = load_subconscious_inline_prompt().strip()
+    character = ""
+    try:
+        character = character_block(await conn.fetchval("SELECT get_agent_profile_context()"))
+    except Exception as exc:
+        logger.warning("Character unavailable for subconscious prompt: %s", exc)
+    if character:
+        system_prompt = f"{character}\n\n{system_prompt}"
     request_messages = [
-        {"role": "system", "content": load_subconscious_inline_prompt().strip()},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     try:
@@ -577,6 +587,11 @@ async def run_subconscious_appraisal(
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             fallback={},
+            # The appraisal is a fast pre-phase the user waits on. Left at
+            # its default, a thinking model spent the whole budget thinking
+            # and returned an empty appraisal after most of a minute.
+            reasoning_effort="low",
+            usage_source="subconscious",
         )
     except Exception as exc:
         logger.warning("Subconscious appraisal failed: %s", exc)
@@ -770,6 +785,7 @@ async def build_system_prompt(
     surface: str = "chat",
     active_skills: list["SkillSpec"] | None = None,
     available_skills: list["SkillSpec"] | None = None,
+    skill_setup_steps: dict[str, str] | None = None,
     allowed_tool_names: set[str] | None = None,
     prompt_addenda: list[str] | None = None,
 ) -> str:
@@ -855,13 +871,15 @@ async def build_system_prompt(
     tool_context = ToolContext.CHAT if mode == "chat" else ToolContext.HEARTBEAT
     if registry is not None or active_skills:
         available = available_skills
+        setup_steps = skill_setup_steps
         if available is None and registry is not None:
             try:
                 available = load_available_skills(registry, tool_context)
+                setup_steps = await resolve_skill_setup_steps(registry, tool_context, available)
             except Exception:
-                available = []
+                available = available or []
                 logger.debug("Failed to load skill catalog for prompt", exc_info=True)
-        volatile.append(format_skills_prompt(active_skills or [], available or []))
+        volatile.append(format_skills_prompt(active_skills or [], available or [], setup_steps))
 
     # Energy costs, derived from the actual ToolSpecs of this turn's allowed
     # tools (#44) — never hardcoded prose. Heartbeat only: chat is unbudgeted.
@@ -1122,6 +1140,7 @@ async def run_agent(
         surface=surface,
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
+        skill_setup_steps=skill_selection.setup_steps,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
         prompt_addenda=_reply_language_addendum(user_message) if mode == "chat" else None,
     )
@@ -1413,6 +1432,7 @@ async def stream_agent(
         surface=surface,
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
+        skill_setup_steps=skill_selection.setup_steps,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
         prompt_addenda=[*(prompt_addenda or []), *(_reply_language_addendum(user_message) if mode == "chat" else [])],
     )
