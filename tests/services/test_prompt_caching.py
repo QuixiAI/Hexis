@@ -11,13 +11,12 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from core import llm
 from core.llm import _anthropic_system_blocks, _extract_system_parts
-from core.providers.anthropic_http import _build_system_prompt
 from core.usage import extract_usage
 from services.agent import SystemPrompt
 
@@ -74,6 +73,13 @@ class TestSystemPartsSurviveTheLLMLayer:
         assert parts == ["REAL"]
 
 
+_MESSAGES = [
+    {"role": "system", "content": "STABLE"},
+    {"role": "system", "content": "VOLATILE"},
+    {"role": "user", "content": "hello"},
+]
+
+
 class TestAnthropicBreakpoint:
     def test_the_marker_lands_on_the_last_stable_block(self):
         blocks = _anthropic_system_blocks(["STABLE", "VOLATILE"])
@@ -87,16 +93,47 @@ class TestAnthropicBreakpoint:
     def test_no_system_message_stays_none(self):
         assert _anthropic_system_blocks([]) is None
 
-    @pytest.mark.parametrize("auth_mode", ["api-key", "setup-token"])
-    def test_the_oauth_path_caches_too(self, auth_mode):
+    @pytest.mark.parametrize("auth_mode", [None, "setup-token"])
+    @pytest.mark.asyncio
+    async def test_both_anthropic_paths_send_the_breakpoint(self, auth_mode):
         """Both Anthropic paths cache, or OAuth users silently get nothing."""
-        result = _build_system_prompt(["STABLE", "VOLATILE"], auth_mode)
-        assert isinstance(result, list)
-        marked = [b for b in result if "cache_control" in b]
+        sent = {}
+
+        async def acompletion(**request):
+            sent.update(request)
+            choice = SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]), finish_reason="stop")
+            return SimpleNamespace(choices=[choice])
+
+        with patch.object(llm.litellm, "acompletion", acompletion):
+            await llm.chat_completion(
+                provider="anthropic", model="claude-sonnet-4-5", endpoint=None,
+                api_key="sk-ant-oat01-x" if auth_mode else "sk-ant-api", auth_mode=auth_mode,
+                messages=_MESSAGES,
+            )
+        blocks = sent["messages"][0]["content"]
+        marked = [b for b in blocks if "cache_control" in b]
         assert len(marked) == 1
         assert marked[0]["text"] == "STABLE"
-        assert result[-1]["text"] == "VOLATILE"
-        assert "cache_control" not in result[-1]
+        assert blocks[-1]["text"] == "VOLATILE"
+        assert "cache_control" not in blocks[-1]
+
+    @pytest.mark.asyncio
+    async def test_the_stream_caches_like_the_plain_call(self):
+        sent = {}
+
+        async def acompletion(**request):
+            sent.update(request)
+
+            async def events():
+                delta = SimpleNamespace(content="ok", tool_calls=None, reasoning_content=None)
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason="stop")])
+            return events()
+
+        with patch.object(llm.litellm, "acompletion", acompletion):
+            await llm.stream_chat_completion(
+                provider="anthropic", model="claude-sonnet-4-5", endpoint=None, api_key="k", messages=_MESSAGES,
+            )
+        assert sent["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
     def test_a_plain_string_is_passed_through_unchanged(self):
         """No split means no cacheable boundary — so do not reshape the wire.
@@ -105,78 +142,53 @@ class TestAnthropicBreakpoint:
         preamble. A prompt with nothing to cache keeps exactly the shape it has
         always had rather than becoming blocks for no gain.
         """
-        from core.providers.anthropic_http import _CLAUDE_CODE_IDENTITY
+        one = [{"role": "system", "content": "ONE"}, {"role": "user", "content": "hi"}]
+        plain = llm._litellm_messages(one, provider="anthropic", model="claude-sonnet-4-5", auth_mode=None)
+        assert plain[0]["content"] == "ONE"
+        oauth = llm._litellm_messages(one, provider="anthropic", model="claude-sonnet-4-5", auth_mode="setup-token")
+        assert isinstance(oauth[0]["content"], str)
+        assert oauth[0]["content"].startswith(llm._CLAUDE_CODE_IDENTITY)
 
-        assert _build_system_prompt("ONE", "api-key") == "ONE"
-        oauth = _build_system_prompt("ONE", "setup-token")
-        assert isinstance(oauth, str)
-        assert oauth.startswith(_CLAUDE_CODE_IDENTITY)
 
+class TestOtherProvidersPrefixCaching:
+    """OpenAI and Gemini cache a stable prefix on their own: the system parts
+    reach LiteLLM in order, stable first, and are never reshuffled."""
 
-class TestGeminiPrefixCaching:
     @pytest.mark.asyncio
     async def test_public_api_keeps_stable_prefix_before_volatile_tail(self):
-        response = MagicMock(text="ok", function_calls=[])
-        client = MagicMock()
-        client.aio.models.generate_content = AsyncMock(return_value=response)
-        messages = [
-            {"role": "system", "content": "STABLE"},
-            {"role": "system", "content": "VOLATILE"},
-            {"role": "user", "content": "hello"},
-        ]
+        sent = {}
 
-        with patch.object(llm.genai, "Client", return_value=client):
+        async def acompletion(**request):
+            sent.update(request)
+            choice = SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]), finish_reason="stop")
+            return SimpleNamespace(choices=[choice])
+
+        with patch.object(llm.litellm, "acompletion", acompletion):
             await llm.chat_completion(
-                provider="gemini",
-                model="gemini-2.5-flash",
-                endpoint=None,
-                api_key="test",
-                messages=messages,
+                provider="gemini", model="gemini-2.5-flash", endpoint=None, api_key="test", messages=_MESSAGES,
             )
-
-        config = client.aio.models.generate_content.await_args.kwargs["config"]
-        assert config.system_instruction == "STABLE\n\nVOLATILE"
+        assert [m["content"] for m in sent["messages"] if m["role"] == "system"] == ["STABLE", "VOLATILE"]
 
     @pytest.mark.asyncio
-    async def test_stream_preserves_final_usage_metadata(self):
-        first = SimpleNamespace(text="Hel", function_calls=[])
-        last = SimpleNamespace(
-            text="lo",
-            function_calls=[],
-            usage_metadata=SimpleNamespace(
-                prompt_token_count=7000,
-                candidates_token_count=20,
-                cached_content_token_count=6400,
-            ),
+    async def test_stream_preserves_final_usage(self):
+        usage = SimpleNamespace(
+            prompt_tokens=7000, completion_tokens=20,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=6400),
         )
 
-        async def chunks():
-            yield first
-            yield last
+        async def acompletion(**request):
+            async def chunks():
+                for text in ("Hel", "lo"):
+                    delta = SimpleNamespace(content=text, tool_calls=None, reasoning_content=None)
+                    yield SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=None)])
+                yield SimpleNamespace(choices=[], usage=usage)
+            return chunks()
 
-        client = MagicMock()
-        client.aio.models.generate_content_stream = MagicMock(
-            side_effect=lambda **_: chunks()
-        )
-        messages = [
-            {"role": "system", "content": "STABLE"},
-            {"role": "system", "content": "VOLATILE"},
-            {"role": "user", "content": "hello"},
-        ]
-
-        with patch.object(llm.genai, "Client", return_value=client):
+        with patch.object(llm.litellm, "acompletion", acompletion):
             result = await llm.stream_chat_completion(
-                provider="gemini",
-                model="gemini-2.5-flash",
-                endpoint=None,
-                api_key="test",
-                messages=messages,
+                provider="gemini", model="gemini-2.5-flash", endpoint=None, api_key="test", messages=_MESSAGES,
             )
-
-        config = client.aio.models.generate_content_stream.call_args.kwargs["config"]
-        assert config.system_instruction == "STABLE\n\nVOLATILE"
         assert result["content"] == "Hello"
-        assert result["raw"] is last
         assert extract_usage("gemini", result["raw"]) == {
             "input_tokens": 7000,
             "output_tokens": 20,
@@ -186,12 +198,6 @@ class TestGeminiPrefixCaching:
 
     @pytest.mark.asyncio
     async def test_code_assist_does_not_override_provider_prompt_assembly(self):
-        messages = [
-            {"role": "system", "content": "STABLE"},
-            {"role": "system", "content": "VOLATILE"},
-            {"role": "user", "content": "hello"},
-        ]
-
         with patch(
             "core.providers.google_code_assist.google_code_assist_completion",
             new_callable=AsyncMock,
@@ -202,9 +208,9 @@ class TestGeminiPrefixCaching:
                 model="gemini-2.5-flash",
                 endpoint=None,
                 api_key=json.dumps({"token": "test", "projectId": "project"}),
-                messages=messages,
+                messages=_MESSAGES,
             )
 
         kwargs = completion.await_args.kwargs
-        assert kwargs["messages"] == messages
+        assert kwargs["messages"] == _MESSAGES
         assert "system_prompt" not in kwargs

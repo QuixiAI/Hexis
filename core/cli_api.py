@@ -376,6 +376,18 @@ async def config_validate(
             if not model:
                 warnings.append(f"{name}.model is empty (will rely on worker defaults)")
 
+            # A key typed in the dashboard lives in the auth store under this reference.
+            if str(val.get("api_key_ref") or "").strip():
+                from core.llm import load_stored_api_key
+
+                if load_stored_api_key(str(val.get("api_key_ref")).strip()):
+                    return
+                errors.append(
+                    f"{name}: the saved API key ({val.get('api_key_ref')}) is missing from the "
+                    "auth store. Re-enter it in the dashboard's Models step or `hexis init`."
+                )
+                return
+
             if provider == "openai-codex":
                 oauth = cfg.get("oauth.openai_codex")
                 if (
@@ -397,6 +409,7 @@ async def config_validate(
                 "minimax-portal": "oauth.minimax_portal",
                 "google-gemini-cli": "oauth.google_gemini_cli",
                 "google-antigravity": "oauth.google_antigravity",
+                "xai-oauth": "oauth.xai",
             }
             oauth_key = _oauth_providers.get(provider)
             if oauth_key:
