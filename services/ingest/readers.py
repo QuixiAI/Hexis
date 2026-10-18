@@ -845,8 +845,19 @@ class EpubReader(DocumentReader):
         author = book.get_metadata("DC", "creator")
         author_str = author[0][0] if author else "Unknown"
 
+        # The spine is the reading order; the manifest lists files in any order.
+        # Documents the spine does not name keep their manifest order after it.
+        documents = {
+            item.get_id(): item
+            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)
+        }
+        ordered = [
+            documents.pop(idref) for idref, *_ in book.spine if idref in documents
+        ]
+        ordered.extend(documents.values())
+
         parts: list[str] = []
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        for item in ordered:
             soup = BeautifulSoup(item.get_body_content(), "html.parser")
             text = soup.get_text(separator="\n", strip=True)
             if text.strip():

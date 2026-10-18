@@ -42,6 +42,12 @@ try:
 except ImportError:
     _HAS_PDF = False
 
+_HAS_EBOOKLIB = True
+try:
+    import ebooklib  # noqa: F401
+except ImportError:
+    _HAS_EBOOKLIB = False
+
 
 def test_default_read_result_wraps_legacy_read(tmp_path):
     p = tmp_path / "note.txt"
@@ -51,6 +57,33 @@ def test_default_read_result_wraps_legacy_read(tmp_path):
     assert result.text == "plain text content"
     assert result.warnings == []
     assert result.extractor_name == "TextReader"
+
+
+@pytest.mark.skipif(not _HAS_EBOOKLIB, reason="ebooklib not installed")
+def test_epub_chapters_follow_the_spine_not_the_manifest(tmp_path):
+    from ebooklib import epub
+
+    from services.ingest.readers import EpubReader
+
+    book = epub.EpubBook()
+    book.set_identifier("reading-order")
+    book.set_title("Reading order")
+    chapters = {}
+    # Added out of order, so the manifest lists chapter 2 first.
+    for name in ("two", "one", "three"):
+        chapter = epub.EpubHtml(title=name, file_name=f"{name}.xhtml", lang="en")
+        chapter.content = f"<h1>Chapter {name}</h1><p>Text of chapter {name}.</p>"
+        book.add_item(chapter)
+        chapters[name] = chapter
+    book.add_item(epub.EpubNcx())
+    book.spine = [chapters["one"], chapters["two"], chapters["three"]]
+    path = tmp_path / "order.epub"
+    epub.write_epub(str(path), book)
+
+    text = EpubReader.read(path)
+
+    positions = [text.index(f"Chapter {name}") for name in ("one", "two", "three")]
+    assert positions == sorted(positions), text
 
 
 def test_xls_fails_loud_with_conversion_hint(tmp_path):
