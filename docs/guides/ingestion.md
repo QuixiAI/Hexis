@@ -123,7 +123,15 @@ All paths converge on the same pipeline and receipts:
    same way. Nothing is ingested until the message is actually sent.
 3. **Web UI** — the **Ingest** page: multi-file upload, paste box, URL field,
    and a live job list showing what ran, what is pending, and what failed and why.
-4. **The agent itself** — `url_ingest`/`git_ingest` during heartbeats. Sources
+4. **Connections** — Gmail and Google Drive on the **Connections** page.
+   Drive folders are added by link (subfolders and Shared Drives included);
+   an import exports Docs and Slides as text and Sheets as spreadsheets,
+   reads PDF, Office, text and CSV files, and queues each as one document
+   for the ingest worker. Unchanged files are skipped on later imports, and
+   one unreadable file never stops the rest. Nothing is written to Drive.
+   Connector items older than two days are history: scored by rules only and
+   never raised as an alert, so importing a backlog never floods the inbox.
+5. **The agent itself** — `url_ingest`/`git_ingest` during heartbeats. Sources
    are stamped with `acquisition` provenance (`user`, `agent`, `connector`):
    user-provided sources never auto-fade (retention asks you first), while
    agent-acquired sources may be archived autonomously by the daily retention

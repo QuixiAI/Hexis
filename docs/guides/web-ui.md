@@ -27,6 +27,9 @@ hexis open   # open http://localhost:3477 in your browser
 - **Documents** -- The source-document filing cabinet: search files or passages (with page/section/sheet locators), preview with paging and a PDF page picker, see extraction warnings, and load sources onto the desk
 - **Desk** -- Mid-term working material: read items window by window, pin what stays needed, clear the rest (cleared items archive; sources stay in the cabinet)
 - **Ingest** -- Bulk ingestion: multi-file upload, paste box, URL field, and a live job list showing what ran, what is pending, and what failed and why
+- **Connections** -- Gmail and Google Drive sign-in and imports; a connection that needs signing in again says why, and a pending import that is retrying shows what its last try hit
+- **Settings → Messages** -- Where the agent's messages to you go (its own choice among the channels set up, a fixed Slack DM, Telegram chat, or email, or the dashboard only); every such message also lands in the dashboard inbox
+- **Background work** -- Imports, reading and indexing in progress show in the sidebar on every page
 - **Character Gallery** -- Browse and select from 11 preset characters with portraits
 
 ## Init Wizard

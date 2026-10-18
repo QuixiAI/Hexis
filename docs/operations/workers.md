@@ -207,6 +207,8 @@ The maintenance worker handles subconscious upkeep:
 - **Neighborhood recomputation** -- refreshes stale precomputed neighbors
 - **Embedding cache pruning** -- cleans old cached embeddings
 - **Outbox/inbox bridging** -- publishes outbox messages to RabbitMQ, ingests inbox messages
+- **Connector imports** -- runs queued Gmail and Google Drive imports as connector backfill jobs; each item becomes one document for the ingest worker
+- **Embedding backlog** -- embeds new memories and source chunks until the backlog is empty or a minute has passed, so new memories are searchable within a tick
 - **Conscious-episode extraction** -- sweeps recent chat turns and heartbeat episodes (`subconscious_units`) and selectively promotes salient facts into durable memories; one LLM call per batch, importance floor `extraction.min_importance`, duplicates corroborate existing beliefs. Gated by `extraction.enabled` (default on) Each turn is encoded with the previous turn of its conversation as context, a fact may name the belief it replaces (the older memory is marked no longer current), and the agent's own positions are kept in its own voice.
 - **Transcript retention** -- once a day, deletes raw transcripts past their limits: per-turn traces, old web-chat and channel conversations with their message documents, and raw turns the memory system has finished with. Memories are untouched. Keys `retention.transcripts_enabled`, `retention.*_days` (0 keeps forever); the Settings page's Retention tab edits them
 - **Origin-memory seeding** -- idempotently keeps the protected origin-story memories seeded (`origin_memories.enabled`, default on); a flipped flag takes effect on the next tick

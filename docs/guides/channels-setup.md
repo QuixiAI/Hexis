@@ -98,6 +98,15 @@ SELECT set_config(
 Set the master switch back to `false` at any time to restore legacy routing. No worker
 restart is required in either direction.
 
+## Where Messages to You Go
+
+A message the agent addresses to you rather than to a conversation (a heartbeat
+reaching out, a reminder) always lands in the dashboard inbox. **Settings →
+Messages** decides where else it goes: `auto` lets the agent choose among the
+channels that are set up (honouring the channel it asked for), or pin it to
+your Slack DM, Telegram chat, or email, or keep it to the dashboard. Keys:
+`outreach.destination`, `outreach.slack_user_id`, `outreach.telegram_chat_id`.
+
 ## Outbound Safety
 
 Every person-facing send—provider tool, formal outbox delivery, or direct channel
