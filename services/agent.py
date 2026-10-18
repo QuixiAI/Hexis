@@ -177,6 +177,23 @@ class SubconsciousOutput:
     consolidation_observations: list[dict[str, Any]] = field(default_factory=list)
 
 
+async def _chat_answer_budget(pool: "asyncpg.Pool", timeout_seconds: float) -> dict[str, Any]:
+    """Tool-round and time budgets that make a chat turn end in an answer."""
+    try:
+        row = await pool.fetchrow(
+            "SELECT get_config_int('chat.max_tool_rounds') AS rounds, "
+            "get_config_float('chat.answer_reserve_s') AS reserve"
+        )
+    except Exception:
+        row = None
+    rounds = row["rounds"] if row and row["rounds"] is not None else 5
+    reserve = row["reserve"] if row and row["reserve"] is not None else 30.0
+    return {
+        "max_tool_rounds": max(0, int(rounds)),
+        "answer_reserve_seconds": min(max(0.0, float(reserve)), timeout_seconds / 2),
+    }
+
+
 async def render_subconscious_signals_db(
     conn: "asyncpg.Connection", output: SubconsciousOutput
 ) -> str:
@@ -1163,7 +1180,9 @@ async def run_agent(
             + question_wait_extension
         )
         effective_max_tokens = max_tokens or 4096
+        answer_budget = await _chat_answer_budget(pool, effective_timeout)
         loop_config = AgentLoopConfig(
+            **answer_budget,
             tool_context=tool_context,
             system_prompt=system_prompt,
             llm_config=llm_config,
@@ -1442,7 +1461,9 @@ async def stream_agent(
     effective_temperature = (
         temperature if temperature is not None else _cfg_num("temperature", 0.7)
     )
+    answer_budget = await _chat_answer_budget(pool, effective_timeout) if mode == "chat" else {}
     loop_config = AgentLoopConfig(
+        **answer_budget,
         tool_context=tool_context,
         system_prompt=system_prompt,
         llm_config=llm_config,

@@ -23,8 +23,7 @@ import {
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
-import { useGatewayEvents } from "../../hooks/use-gateway-events";
+import { useAgentStatus } from "../../hooks/use-agent-status";
 import { ProgressBar } from "../ui/progress-bar";
 
 type StatusData = {
@@ -65,22 +64,8 @@ export function Sidebar({
   onClose?: () => void;
 }) {
   const pathname = usePathname();
-  const [status, setStatus] = useState<StatusData>({});
-
-  const loadStatus = useCallback(async () => {
-    try {
-      const response = await fetch("/api/status", { cache: "no-store" });
-      if (response.ok) setStatus(await response.json());
-    } catch {
-      // The active page owns visible connection errors.
-    }
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setTimeout(loadStatus, 0);
-    return () => window.clearTimeout(timer);
-  }, [loadStatus]);
-  useGatewayEvents(loadStatus);
+  // One shared status for the whole page, so this agrees with the overview.
+  const status = useAgentStatus<StatusData>().status ?? {};
 
   const heartbeatLabel = status.heartbeat_paused
     ? "Paused"

@@ -1111,6 +1111,53 @@ class TestStreaming:
         assert registry.execute.await_count == 0
 
 
+class TestAnswerBudget:
+    @patch("core.agent_loop.chat_completion")
+    async def test_tool_round_budget_forces_an_answer(self, mock_llm):
+        """After max_tool_rounds the model gets no tools and is asked to answer."""
+        spec = {"type": "function", "function": {"name": "tool", "description": "t", "parameters": {"type": "object", "properties": {}}}}
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(tool_specs=[spec], execute_results={"tool": tool_result})
+        mock_llm.side_effect = [
+            _tool_response("", [_tool_call("tool", {})]),
+            _tool_response("", [_tool_call("tool", {})]),
+            _text_response("Could not find it; closest is X."),
+        ]
+
+        agent = AgentLoop(_make_config(registry=registry, max_tool_rounds=2))
+        result = await agent.run("Find something that is not there")
+
+        assert result.text == "Could not find it; closest is X."
+        assert result.stopped_reason == "completed"
+        offered = [call.kwargs.get("tools") for call in mock_llm.call_args_list]
+        assert offered[0] and offered[1] and not offered[2]
+        last_messages = mock_llm.call_args_list[2].kwargs["messages"]
+        assert last_messages[-1]["role"] == "user"
+        assert "Stop searching" in last_messages[-1]["content"]
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_time_reserve_forces_an_answer(self, mock_llm):
+        """With less than answer_reserve_seconds left, the next call has no tools."""
+        spec = {"type": "function", "function": {"name": "tool", "description": "t", "parameters": {"type": "object", "properties": {}}}}
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(tool_specs=[spec], execute_results={"tool": tool_result})
+
+        async def _llm(**kwargs):
+            if kwargs.get("tools"):
+                await asyncio.sleep(0.4)
+                return _tool_response("", [_tool_call("tool", {})])
+            return _text_response("Answer from what I found.")
+
+        mock_llm.side_effect = _llm
+        agent = AgentLoop(_make_config(registry=registry, timeout_seconds=5.0, answer_reserve_seconds=4.8))
+        result = await agent.run("Keep searching")
+
+        assert result.timed_out is False
+        assert result.text == "Answer from what I found."
+
+
 class TestParagraphs:
     @patch("core.agent_loop.stream_chat_completion")
     async def test_text_after_a_tool_round_starts_a_new_paragraph(self, mock_stream_llm):

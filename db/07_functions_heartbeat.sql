@@ -919,6 +919,22 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
+-- A heartbeat claim counts until the longest a heartbeat may run, plus ten
+-- minutes. A worker killed mid-heartbeat clears nothing; without this, every
+-- later heartbeat was refused as "already running" until someone cleared the
+-- row by hand.
+CREATE OR REPLACE FUNCTION heartbeat_in_progress() RETURNS BOOLEAN
+    LANGUAGE sql STABLE AS $$
+    SELECT COALESCE((
+        SELECT active_heartbeat_id IS NOT NULL
+           AND (last_heartbeat_at IS NULL
+                OR last_heartbeat_at > CURRENT_TIMESTAMP - make_interval(secs => GREATEST(
+                    COALESCE(get_config_int('heartbeat.claim_timeout_s'), 1800),
+                    COALESCE(get_config_int('rlm.heartbeat.timeout_seconds'), 300) + 600)))
+        FROM heartbeat_state WHERE id = 1
+    ), FALSE);
+$$;
+
 CREATE OR REPLACE FUNCTION should_run_heartbeat()
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -939,7 +955,7 @@ BEGIN
     IF state_record.is_paused THEN
         RETURN FALSE;
     END IF;
-    IF state_record.active_heartbeat_id IS NOT NULL THEN
+    IF heartbeat_in_progress() THEN
         RETURN FALSE;
     END IF;
     IF state_record.last_heartbeat_at IS NULL THEN

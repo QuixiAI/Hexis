@@ -13,6 +13,7 @@ import json
 import logging
 from typing import Any
 
+from core.chat_priority import wait_for_chat_idle
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
 
@@ -133,6 +134,7 @@ async def run_conscious_extraction_step(conn) -> dict[str, Any]:
         user_payload = naming + "\n\n---\n\n" + "\n\n---\n\n".join(
             _format_unit(row, previous.get(str(row["id"]))) for row in rows
         )
+        await wait_for_chat_idle(conn)  # chat comes first
         doc, _raw = await chat_json(
             llm_config=llm_config,
             messages=[

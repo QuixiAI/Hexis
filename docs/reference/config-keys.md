@@ -378,6 +378,16 @@ separately and cannot be cleared by any setting below.
 | `ingest.upload_max_bytes` | int | Upload API file-size cap; larger files use the CLI (default `104857600`) |
 | `ingest.job_*` | various | Durable ingestion-job queue: content cap, claim timeout, retry backoff, batch size |
 
+## Chat Turn Limits
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `chat.turn_timeout_s` | int | Outer time limit for one chat turn; a hung model call ends in a visible error (default `360`; `0` disables) |
+| `chat.max_tool_rounds` | int | Rounds of tool calls in one chat turn before the agent is asked to answer with what it has found (default `5`) |
+| `chat.answer_reserve_s` | int | Seconds of the loop's time limit kept for writing the answer; with less left, the next model call gets no tools (default `30`) |
+| `chat.priority_max_wait_s` | int | Chat comes first: longest a background model call (extraction, RecMem, summarization, reading) waits for a live chat turn before going ahead (default `180`) |
+| `heartbeat.claim_timeout_s` | int | Seconds after a heartbeat starts before its claim stops blocking new heartbeats; a claim always counts for the RLM heartbeat timeout plus ten minutes (default `1800`) |
+
 ## Transcript Retention
 
 Raw transcripts are deleted after a set time; memories are not affected (they fade on the rules below). `run_transcript_retention()` runs once a day in the maintenance worker, in batches, and the Settings page's Retention tab edits these.

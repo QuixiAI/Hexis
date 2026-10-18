@@ -977,6 +977,11 @@ INSERT INTO config_defaults (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
     ('heartbeat.use_rlm', 'true'::jsonb, 'Enable RLM loop for heartbeat decisions'),
+    ('chat.turn_timeout_s', '360'::jsonb, 'Outer time limit for one chat turn, in seconds; 0 disables'),
+    ('chat.priority_max_wait_s', '180'::jsonb, 'Longest a background model call waits for chat to finish before going ahead'),
+    ('chat.max_tool_rounds', '5'::jsonb, 'Rounds of tool calls in one chat turn before the agent must answer'),
+    ('chat.answer_reserve_s', '30'::jsonb, 'Seconds of the chat loop time limit kept for writing the answer'),
+    ('heartbeat.claim_timeout_s', '1800'::jsonb, 'Seconds after a heartbeat starts before its claim stops blocking new heartbeats'),
     ('chat.use_rlm', 'false'::jsonb, 'Route chat turns through the RLM REPL loop instead of the agent loop (the REPL prompt carries no persona or memory context)'),
     ('rlm.chat.streaming_enabled', 'false'::jsonb, 'Use native RLM chat path for streaming transports; false keeps UI/CLI token streaming through AgentLoop until RLM supports incremental final output'),
     ('rlm.heartbeat.max_iterations', '10'::jsonb, 'Max RLM iterations for heartbeat'),

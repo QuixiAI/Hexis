@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 
 from .config import Appraisal, Config, DocumentInfo, Extraction, IngestionMode, Section
@@ -39,12 +39,17 @@ class IngestLLM:
         self._cfg = normalize_llm_config(config.llm_config)
         self._config_ref = config
         self.call_count = 0
+        # Set by the job runner: awaited before every model call so reading
+        # yields to a live chat turn (core.chat_priority).
+        self.before_call: Callable[[], Awaitable[Any]] | None = None
 
     async def complete(self, messages: list[dict[str, str]], temperature: float = 0.3) -> str:
         """Async completion via core.llm (#88: one async path, no sync twin)."""
         from core.llm import chat_completion
         from core.usage import record_llm_usage
 
+        if self.before_call is not None:
+            await self.before_call()
         self.call_count += 1
         result = await chat_completion(
             provider=self._cfg["provider"],

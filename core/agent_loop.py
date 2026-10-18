@@ -265,6 +265,14 @@ class AgentLoopConfig:
     max_iterations: int | None = None  # None = timeout-based only
     timeout_seconds: float = 300.0
 
+    # Answer budget. Without one, a question the history cannot answer kept
+    # the model searching until the time limit, and the person got nothing.
+    # After this many rounds of tool calls, or once less than
+    # answer_reserve_seconds of the time limit is left, the next model call
+    # gets no tools and is asked to answer from what it has found.
+    max_tool_rounds: int | None = None
+    answer_reserve_seconds: float | None = None
+
     # LLM params
     temperature: float = 0.7
     max_tokens: int = 4096
@@ -367,6 +375,25 @@ class AgentLoop:
         self._plan_text: str = ""
         self._phases_completed: list[str] = []
         self._turn_id: str | None = None
+        self._started_at: float | None = None
+        self._tool_rounds: int = 0
+        self._wrap_up_sent: bool = False
+
+    _WRAP_UP_PROMPT = (
+        "Stop searching now and answer with what you have found. If you could not "
+        "find what was asked, say so plainly, and say what you did find that is "
+        "closest to it."
+    )
+
+    def _should_wrap_up(self) -> bool:
+        cfg = self.config
+        if cfg.max_tool_rounds is not None and self._tool_rounds >= cfg.max_tool_rounds:
+            return True
+        if cfg.answer_reserve_seconds is not None and self._started_at is not None:
+            remaining = cfg.timeout_seconds - (time.monotonic() - self._started_at)
+            if remaining <= cfg.answer_reserve_seconds:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Public API
@@ -418,6 +445,7 @@ class AgentLoop:
             },
         )
 
+        self._started_at = time.monotonic()
         try:
             result = await asyncio.wait_for(
                 self._loop(tools),
@@ -691,9 +719,17 @@ class AgentLoop:
             if messages is None:
                 messages = await self._get_messages()
 
+            offered_tools = tools
+            if tools and self._should_wrap_up():
+                if not self._wrap_up_sent:
+                    self._wrap_up_sent = True
+                    await self._append_user_message(self._WRAP_UP_PROMPT)
+                    messages = await self._get_messages()
+                offered_tools = []
+
             # LLM call
             try:
-                response = await self._llm_call(messages, tools)
+                response = await self._llm_call(messages, offered_tools)
             except Exception as e:
                 error = describe_exception(e)
                 logger.exception(
@@ -747,6 +783,7 @@ class AgentLoop:
             # Process tool calls. Energy budgets are enforced at the step
             # boundary by next_agent_step, so every tool the model requested in
             # one turn runs before the next budget check.
+            self._tool_rounds += 1
             for call in tool_calls:
                 tool_name = call.get("name", "")
                 arguments = call.get("arguments", {})

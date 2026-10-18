@@ -147,6 +147,10 @@ SELECT
 FROM memories m
 WHERE m.type = 'episodic'
   AND m.metadata#>>'{context,heartbeat_id}' IS NOT NULL
+  -- The heartbeat's own record, not every memory saved during it (those carry
+  -- the heartbeat_id too): complete_heartbeat and finalize_agentic_heartbeat
+  -- write the number; earlier finalizer records carry stopped_reason.
+  AND ((m.metadata -> 'context') ? 'heartbeat_number' OR (m.metadata -> 'context') ? 'stopped_reason')
 ORDER BY COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at) DESC
 LIMIT 20;
 CREATE OR REPLACE VIEW boundary_status AS

@@ -69,6 +69,11 @@ async def _process_job(pool, job: dict[str, Any], *, config_override=None) -> No
     if acquired_reason:
         config.acquired_reason = acquired_reason
     pipeline = IngestionPipeline(config)
+    # Chat comes first: each model call for this document waits while a
+    # chat turn is live, so a person's question never queues behind reading.
+    from core.chat_priority import wait_for_chat_idle
+
+    pipeline.llm.before_call = lambda: wait_for_chat_idle(pool)
 
     async def _ingest_artifact() -> int:
         """Re-read preserved original bytes and run the file pipeline. The

@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 
+from core.chat_priority import wait_for_chat_idle
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
 from services.prompt_resources import (
@@ -148,6 +149,7 @@ async def _load_task_context(conn, task: dict[str, Any]) -> dict[str, Any]:
 
 async def _handle_episode_merge(conn, task: dict[str, Any], llm_config: dict[str, Any]) -> dict[str, Any]:
     context = await _load_task_context(conn, task)
+    await wait_for_chat_idle(conn)  # chat comes first
     doc, _raw = await chat_json(
         llm_config=llm_config,
         messages=[
@@ -173,6 +175,7 @@ async def _handle_episode_merge(conn, task: dict[str, Any], llm_config: dict[str
 
 async def _handle_episode_create(conn, task: dict[str, Any], llm_config: dict[str, Any]) -> dict[str, Any]:
     context = await _load_task_context(conn, task)
+    await wait_for_chat_idle(conn)  # chat comes first
     doc, _raw = await chat_json(
         llm_config=llm_config,
         messages=[
@@ -197,6 +200,7 @@ async def _handle_episode_create(conn, task: dict[str, Any], llm_config: dict[st
 
 async def _handle_semantic_refine(conn, task: dict[str, Any], llm_config: dict[str, Any]) -> dict[str, Any]:
     context = await _load_task_context(conn, task)
+    await wait_for_chat_idle(conn)  # chat comes first
     doc, _raw = await chat_json(
         llm_config=llm_config,
         messages=[

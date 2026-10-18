@@ -46,6 +46,7 @@ from core.cli_api import status_payload_rich
 from core.gateway import EventSource, Gateway
 from core.rabbitmq_bridge import RabbitMQBridge
 from core.tools import create_default_registry, create_full_registry
+from core.chat_priority import begin_chat_turn, end_chat_turn
 from services.chat import resolve_prompt_addenda, stream_chat_events
 
 logger = logging.getLogger(__name__)
@@ -2033,6 +2034,45 @@ async def event_stream():
     )
 
 
+@app.post("/api/heartbeat/pause")
+async def pause_heartbeats():
+    """Stop the agent's own heartbeats (autonomy off)."""
+    return await _set_heartbeat_paused("pause")
+
+
+@app.post("/api/heartbeat/resume")
+async def resume_heartbeats():
+    """Let the agent run its own heartbeats again (autonomy on)."""
+    return await _set_heartbeat_paused("resume")
+
+
+async def _set_heartbeat_paused(action: str):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    async with pool.acquire() as conn:
+        if action == "resume":
+            ready = await conn.fetchval("SELECT is_agent_configured() AND is_init_complete() AND NOT is_agent_terminated()")
+            if not ready:
+                return JSONResponse(
+                    {"error": "Complete initialization before resuming heartbeats."}, status_code=409,
+                )
+        paused = await conn.fetchval(
+            """
+            UPDATE heartbeat_state
+            SET is_paused = $1,
+                -- an overdue heartbeat runs on the next tick after resuming
+                next_heartbeat_at = CASE WHEN $1 THEN next_heartbeat_at
+                                         ELSE LEAST(COALESCE(next_heartbeat_at, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP) END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            RETURNING is_paused
+            """,
+            action == "pause",
+        )
+    return {"heartbeat_paused": bool(paused)}
+
+
 @app.post("/api/heartbeat/run")
 async def run_heartbeat_now():
     """Run an explicit heartbeat and stream its complete observable lifecycle."""
@@ -2058,7 +2098,7 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
                    is_init_complete() AS initialized,
                    is_agent_terminated() AS terminated,
                    is_paused,
-                   active_heartbeat_id
+                   heartbeat_in_progress() AS running
             FROM heartbeat_state
             WHERE id = 1
             """)
@@ -2080,7 +2120,7 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
                 {"message": "Heartbeat is paused. Resume it before running one now."},
             )
             return
-        if state["active_heartbeat_id"]:
+        if state["running"]:
             yield _sse_event("error", {"message": "A heartbeat is already running."})
             return
 
@@ -2094,7 +2134,10 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
         )
         heartbeat_id = str(payload.get("heartbeat_id") or "")
         if not heartbeat_id:
-            yield _sse_event("error", {"message": "Hexis could not start a heartbeat."})
+            # start_heartbeat refuses while another heartbeat runs (one at a time).
+            running = await conn.fetchval("SELECT heartbeat_in_progress()")
+            message = "A heartbeat is already running." if running else "Hexis could not start a heartbeat."
+            yield _sse_event("error", {"message": message})
             return
 
         heartbeat_number = payload.get("heartbeat_number")
@@ -3198,6 +3241,12 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     failure_message = "Unknown error"
     reasoning_last_sent = 0.0
     visual_attachment_count = len(req.visual_attachments or [])
+    # One chat turn ends in a visible error, never a spinner: the agent loop
+    # stops itself after its own limit, and this outer bound catches a model
+    # call that hangs before or after it. Chat also comes first: the turn
+    # holds a lease so background model calls wait instead of competing.
+    turn_timeout_s = await _chat_turn_timeout_s(pool)
+    await begin_chat_turn(pool, session_id, ttl_seconds=int(turn_timeout_s or 360))
     citation_sources = {}
 
     def build_done_payload() -> dict[str, Any]:
@@ -3231,7 +3280,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 },
             )
 
-        async for event in stream_chat_events(
+        events = stream_chat_events(
             user_message=user_message,
             history=history,
             session_id=session_id,
@@ -3252,7 +3301,8 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 attachment.model_dump(exclude_none=True)
                 for attachment in (req.attachments or [])[:16]
             ],
-        ):
+        )
+        async for event in _with_turn_deadline(events, turn_timeout_s):
             if event.event == AgentEvent.PHASE_CHANGE:
                 phase = event.data.get("phase", "")
                 status = event.data.get("status", "")
@@ -3453,6 +3503,14 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             else:
                 yield _sse_event("done", build_done_payload())
 
+    except _ChatTurnTimeout:
+        logger.error("Chat turn exceeded chat.turn_timeout_s (%ss)", turn_timeout_s)
+        if not done_sent:
+            failure_message = f"No answer within {int(turn_timeout_s)} seconds. The model may be overloaded."
+            yield _sse_event("error", {"message": failure_message})
+            if conscious_started:
+                yield _sse_event("phase_end", {"phase": active_stream_phase})
+            yield _sse_event("failed", build_failed_payload())
     except Exception as exc:
         logger.exception("Chat stream error")
         if done_sent:
@@ -3464,6 +3522,47 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         if conscious_started:
             yield _sse_event("phase_end", {"phase": active_stream_phase})
         yield _sse_event("failed", build_failed_payload())
+    finally:
+        await end_chat_turn(pool, session_id)
+
+
+class _ChatTurnTimeout(Exception):
+    """The outer chat turn limit (chat.turn_timeout_s) passed."""
+
+
+async def _chat_turn_timeout_s(pool: Any) -> float:
+    """Outer time limit for one chat turn; 0 disables it."""
+    try:
+        async with pool.acquire() as conn:
+            raw = await conn.fetchval("SELECT get_config_float('chat.turn_timeout_s')")
+        return max(0.0, float(raw)) if raw is not None else 360.0
+    except Exception:
+        return 360.0
+
+
+async def _with_turn_deadline(events: AsyncIterator[Any], timeout_s: float) -> AsyncIterator[Any]:
+    """Yield the turn's events, raising _ChatTurnTimeout once the deadline passes.
+
+    The deadline covers the whole turn, however long any one event takes:
+    each wait is capped by what is left of it.
+    """
+    if not timeout_s:
+        async for event in events:
+            yield event
+        return
+    deadline = time.monotonic() + timeout_s
+    iterator = events.__aiter__()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ChatTurnTimeout()
+        try:
+            event = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError as exc:
+            raise _ChatTurnTimeout() from exc
+        yield event
 
 
 def _resolve_fallback_api_key(provider: str, role: str) -> str | None:

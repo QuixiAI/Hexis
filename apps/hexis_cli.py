@@ -1856,6 +1856,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     goals_complete.set_defaults(func="goals_complete")
 
+    goals_abandon = goals_sub.add_parser(
+        "abandon", parents=[_db], help="Abandon a goal (archived with its reason; not marked completed)"
+    )
+    goals_abandon.add_argument("goal_id", help="Goal UUID")
+    goals_abandon.add_argument("--reason", default="Abandoned via CLI", help="Why it was abandoned")
+    goals_abandon.set_defaults(func="goals_abandon")
+
     goals.set_defaults(func="goals")
 
     # -- Schedule command (defaults to 'list') --
@@ -8495,6 +8502,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if func == "goals_complete":
         dsn = _get_dsn(args)
         return asyncio.run(_goals_update(dsn, args.goal_id, "completed", args.reason))
+    if func == "goals_abandon":
+        dsn = _get_dsn(args)
+        return asyncio.run(_goals_update(dsn, args.goal_id, "abandoned", args.reason))
 
     # Schedule commands
     if func == "schedule":

@@ -22,7 +22,7 @@ hexis open   # open http://localhost:3477 in your browser
 
 - **Init Wizard** -- 3-tier initialization flow (Express, Character, Custom) with character gallery
 - **Interactive Chat** -- Streaming conversation with tool use visibility; attached files are read the moment they are attached, so the agent can answer about a PDF in the same message it arrives in (large pastes attach the same way, and each attachment has a private toggle)
-- **Agent Status** -- Memory counts, energy level, heartbeat status
+- **Agent Status** -- Memory counts, energy level, heartbeat status; Run heartbeat now, and Pause/Resume for the agent's own heartbeats (the sidebar and the overview read one shared status)
 - **Memory Browser** -- Search and inspect distilled memories; memory detail links to the exact source documents and chunks behind it
 - **Documents** -- The source-document filing cabinet: search files or passages (with page/section/sheet locators), preview with paging and a PDF page picker, see extraction warnings, and load sources onto the desk
 - **Desk** -- Mid-term working material: read items window by window, pin what stays needed, clear the rest (cleared items archive; sources stay in the cabinet)
