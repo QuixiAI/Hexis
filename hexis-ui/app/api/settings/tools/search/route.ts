@@ -30,6 +30,12 @@ const PROVIDERS = [
     hint: "Brave Search API. Provide BRAVE_SEARCH_API_KEY or a direct key.",
   },
   {
+    id: "keenable",
+    label: "Keenable",
+    requires_credential: false,
+    hint: "Web search with no key required. Optionally provide KEENABLE_API_KEY for higher limits.",
+  },
+  {
     id: "searxng",
     label: "SearXNG",
     requires_credential: false,
@@ -183,6 +189,8 @@ export async function POST(req: NextRequest) {
     if (resolver) {
       if (provider === "brave") {
         nextConfig.api_keys.brave_search = resolver;
+      } else if (provider === "keenable") {
+        nextConfig.api_keys.keenable = resolver;
       } else {
         nextConfig.api_keys.tavily = resolver;
       }

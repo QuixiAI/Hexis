@@ -1391,7 +1391,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tools_web_provider.add_argument(
         "provider",
-        choices=["auto", "tavily", "brave", "searxng", "duckduckgo_lite", "bing_rss"],
+        choices=["auto", "tavily", "brave", "keenable", "searxng", "duckduckgo_lite", "bing_rss"],
         help="Provider id. Use auto to pick the best available provider.",
     )
     tools_web_provider.set_defaults(func="tools_web_search_set_provider")

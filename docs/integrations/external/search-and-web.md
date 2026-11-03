@@ -26,9 +26,10 @@ in this order:
 
 1. `tavily` when `TAVILY_API_KEY` or `api_keys.tavily` is configured.
 2. `brave` when `BRAVE_SEARCH_API_KEY` or `api_keys.brave_search` is configured.
-3. `searxng` when `SEARXNG_URL` or `web_search.searxng_url` is configured.
-4. `duckduckgo_lite`, keyless fallback.
-5. `bing_rss`, keyless secondary fallback.
+3. `keenable` when `KEENABLE_API_KEY` or `api_keys.keenable` is configured.
+4. `searxng` when `SEARXNG_URL` or `web_search.searxng_url` is configured.
+5. `duckduckgo_lite`, keyless fallback.
+6. `bing_rss`, keyless secondary fallback.
 
 Choose a provider explicitly:
 
@@ -37,6 +38,17 @@ hexis tools web-search status
 hexis tools web-search set-provider auto
 hexis tools web-search set-provider tavily
 hexis tools web-search set-searxng-url http://localhost:8080
+```
+
+## Keenable
+
+Keenable works without an API key when selected explicitly; a key (optional)
+switches to the keyed endpoint and adds it to automatic selection.
+
+```bash
+hexis tools web-search set-provider keenable
+# optional, for higher rate limits:
+hexis tools set-api-key keenable env:KEENABLE_API_KEY
 ```
 
 ## Brave Search
