@@ -17,6 +17,7 @@ import { ACCOUNT_LABEL, OAuthControl, SetupTokenControl, type OAuthProvider } fr
 export type LlmProvider =
   // API keys
   | "openai"
+  | "atlascloud"
   | "anthropic"
   | "gemini"
   | "grok"
@@ -65,6 +66,7 @@ type ProviderMeta = {
 
 export const providerMeta: Record<LlmProvider, ProviderMeta> = {
   openai: { label: "OpenAI", endpoint: "https://api.openai.com/v1", apiKeyRequired: true, accounts: ["openai-codex"] },
+  atlascloud: { label: "Atlas Cloud", endpoint: "https://api.atlascloud.ai/v1", apiKeyRequired: true },
   anthropic: { label: "Anthropic", endpoint: "", apiKeyRequired: true },
   gemini: { label: "Google Gemini", endpoint: "", apiKeyRequired: true, accounts: ["google-gemini-cli", "google-antigravity"] },
   grok: { label: "Grok (xAI)", endpoint: "https://api.x.ai/v1", apiKeyRequired: true, accounts: ["xai-oauth"] },

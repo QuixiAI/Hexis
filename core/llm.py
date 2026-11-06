@@ -155,6 +155,7 @@ if litellm is not None:
 # through a gateway).
 OPENAI_COMPATIBLE = {
     "openai",
+    "atlascloud",
     "openai_compatible",
     "openai-chat-completions-endpoint",
     "grok",
@@ -455,6 +456,7 @@ def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:
     if endpoint:
         return endpoint.strip() or None
     _DEFAULTS: dict[str, str] = {
+        "atlascloud": "https://api.atlascloud.ai/v1",
         "grok": "https://api.x.ai/v1",
         "chutes": "https://api.chutes.ai/v1",
         "qwen-portal": "https://portal.qwen.ai/v1",
@@ -508,6 +510,7 @@ def load_stored_api_key(ref: str | None) -> str | None:
 # never silently consume an ambient OPENAI_API_KEY (Bar #5).
 _PROVIDER_ENV_KEYS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
+    "atlascloud": "ATLASCLOUD_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "grok": "XAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -803,6 +806,8 @@ _LITELLM_PREFIX = {
     "openai": "openai",
     "openai_compatible": "openai",
     "openai-chat-completions-endpoint": "openai",
+    # Atlas Cloud's OpenAI-compatible gateway, reached through api_base.
+    "atlascloud": "openai",
     # Subscription sign-ins that expose an OpenAI-compatible endpoint; the
     # OAuth access token is the API key (core.llm_config injects a fresh one).
     "chutes": "openai",

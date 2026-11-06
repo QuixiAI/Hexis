@@ -46,7 +46,7 @@ def test_supported_providers_keep_the_companion_sign_ins_and_add_the_clouds():
         "openai-codex", "chutes", "github-copilot", "qwen-portal", "minimax-portal",
         "google-gemini-cli", "google-antigravity", "xai-oauth",
         # Clouds and gateways
-        "azure_openai", "openrouter", "bedrock", "vertex", "zai", "deepseek", "qwen", "qwen_coding", "meta", "minimax",
+        "atlascloud", "azure_openai", "openrouter", "bedrock", "vertex", "zai", "deepseek", "qwen", "qwen_coding", "meta", "minimax",
     }
 
 
@@ -55,6 +55,7 @@ def test_normalize_endpoint_defaults():
     assert llm.normalize_endpoint("openai", " https://example.com ") == "https://example.com"
     assert llm.normalize_endpoint("anthropic", None) is None
     assert llm.normalize_endpoint("grok", None) == "https://api.x.ai/v1"
+    assert llm.normalize_endpoint("atlascloud", None) == "https://api.atlascloud.ai/v1"
     assert llm.normalize_endpoint("chutes", None) == "https://api.chutes.ai/v1"
     assert llm.normalize_endpoint("qwen-portal", None) == "https://portal.qwen.ai/v1"
     assert llm.normalize_endpoint("minimax-portal", None) == "https://api.minimax.io/anthropic"
@@ -78,6 +79,27 @@ def test_vertex_endpoint_parsing():
     assert llm.parse_vertex_endpoint("projects/bank-ai/locations/asia-northeast1") == ("bank-ai", "asia-northeast1")
     assert llm.parse_vertex_endpoint("projects/bank-ai/locations/") == ("bank-ai", "us-central1")
     assert llm.parse_vertex_endpoint("") == ("", "us-central1")
+
+
+def test_atlascloud_routes_through_litellm_chat_completions():
+    assert "atlascloud" in llm.OPENAI_COMPATIBLE
+    model, kwargs = llm._litellm_target(
+        "atlascloud", "deepseek-ai/deepseek-v4-pro", "https://api.atlascloud.ai/v1", "k"
+    )
+    assert model == "openai/deepseek-ai/deepseek-v4-pro"
+    assert kwargs == {"api_base": "https://api.atlascloud.ai/v1", "api_key": "k"}
+
+
+def test_atlascloud_resolves_conventional_api_key(monkeypatch):
+    monkeypatch.setenv("ATLASCLOUD_API_KEY", "atlas-test-key")
+    normalized = llm.normalize_llm_config(
+        {
+            "provider": "atlascloud",
+            "model": "deepseek-ai/deepseek-v4-pro",
+        }
+    )
+    assert normalized["api_key"] == "atlas-test-key"
+    assert normalized["endpoint"] == "https://api.atlascloud.ai/v1"
 
 
 def test_normalize_llm_config_preserves_auth_mode():

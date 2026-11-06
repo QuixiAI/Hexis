@@ -446,7 +446,7 @@ LLM_ROLES = ("conscious", "subconscious")
 # Bedrock and Vertex AI may also authenticate with the cloud's own credentials
 # (instance role, Application Default Credentials), so a key is optional there.
 API_KEY_REQUIRED = frozenset({
-    "openai", "anthropic", "grok", "gemini", "azure_openai", "openrouter",
+    "openai", "atlascloud", "anthropic", "grok", "gemini", "azure_openai", "openrouter",
     "zai", "deepseek", "qwen", "qwen_coding", "meta", "minimax",
 })
 # Subscription sign-ins: the credential is an OAuth token in the auth store.
@@ -462,7 +462,7 @@ _OAUTH_LABELS = {
 }
 # Providers whose endpoint lists its models at GET /models with the key.
 _LISTS_MODELS = frozenset({
-    "openai", "openai_compatible", "openai-chat-completions-endpoint", "grok",
+    "openai", "atlascloud", "openai_compatible", "openai-chat-completions-endpoint", "grok",
     "azure_openai", "openrouter", "zai", "deepseek", "qwen", "qwen_coding",
     "meta", "minimax", "xai-oauth", "chutes", "qwen-portal", "github-copilot",
 })

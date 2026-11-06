@@ -24,6 +24,12 @@ describe("resolveInitLlmEndpoint", () => {
     expect(resolveInitLlmEndpoint("openrouter", "")).toBe("https://openrouter.ai/api/v1");
   });
 
+  it("derives the Atlas Cloud API-key default", () => {
+    expect(resolveInitLlmEndpoint("atlascloud", "")).toBe(
+      "https://api.atlascloud.ai/v1"
+    );
+  });
+
   it("derives the recommended model from live catalog metadata", () => {
     const block = {
       models: {

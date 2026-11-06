@@ -77,6 +77,37 @@ def test_model_catalog_provider_mapping():
     assert slugs["anthropic"] == "anthropic"
 
 
+@pytest.mark.asyncio
+async def test_atlascloud_catalog_filters_visible_llms(monkeypatch):
+    async def fake_request_json(*_args, **_kwargs):
+        return {
+            "data": [
+                {
+                    "model": "chat/model",
+                    "type": "Text",
+                    "categories": ["LLM"],
+                    "display_console": True,
+                },
+                {
+                    "model": "hidden/model",
+                    "type": "Text",
+                    "categories": ["LLM"],
+                    "display_console": False,
+                },
+                {
+                    "model": "image/model",
+                    "type": "Image",
+                    "categories": ["TEXT-TO-IMAGE"],
+                    "display_console": True,
+                },
+            ]
+        }
+
+    monkeypatch.setattr(model_catalog, "request_json", fake_request_json)
+
+    assert await model_catalog.fetch_models("atlascloud") == ["chat/model"]
+
+
 def test_model_menu_filter_and_suppress():
     menu = ModelMenu(id="model-menu")
     menu.populate(["gpt-5.2", "gpt-4o", "claude-sonnet-5"])

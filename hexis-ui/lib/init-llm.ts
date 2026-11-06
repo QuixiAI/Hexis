@@ -1,6 +1,7 @@
 // Endpoint defaults mirror core/llm.normalize_endpoint; the Python API
 // applies the same rules when it saves, so these only keep the form honest.
 const ENDPOINT_DEFAULTS: Record<string, string> = {
+  atlascloud: "https://api.atlascloud.ai/v1",
   openai: "https://api.openai.com/v1",
   grok: "https://api.x.ai/v1",
   "xai-oauth": "https://api.x.ai/v1",
