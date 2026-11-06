@@ -20,7 +20,7 @@ class _StubLLM:
         self.marker = marker
         self.call_count = 0
 
-    async def complete_json(self, messages, temperature=0.2):
+    async def complete_json(self, messages, temperature=0.2, **kwargs):
         self.call_count += 1
         text = str(messages[-1].get("content", ""))
         if "key 'items'" in text:

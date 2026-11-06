@@ -1,6 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
-const port = Number(process.env.HEXIS_UI_PORT || 3477);
+// Not 3477: that is the dashboard a developer may already be running.
+const port = Number(process.env.HEXIS_UI_PORT || 3479);
 
 export default defineConfig({
   testDir: "./e2e",

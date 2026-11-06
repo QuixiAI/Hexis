@@ -388,3 +388,33 @@ async def test_migrate_existing_database_preserves_data():
             await admin.execute(f'DROP DATABASE IF EXISTS "{scratch}"')
         finally:
             await admin.close()
+
+
+async def test_edited_migration_is_reported(db_pool, tmp_path):
+    """A migration changed after it was applied is named; unchanged ones are not."""
+    import hashlib
+
+    from core.migrations import changed_migrations
+
+    version = f"9999_checksum_probe_{uuid4().hex[:8]}"
+    path = tmp_path / f"{version}.sql"
+    path.write_text("SELECT 1;\n", encoding="utf-8")
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO public.schema_migrations (version, checksum) VALUES ($1, $2)",
+            version,
+            hashlib.sha256(b"SELECT 1;\n").hexdigest(),
+        )
+        try:
+            assert await changed_migrations(conn, migrations_dir=tmp_path) == []
+            path.write_text("SELECT 2;\n", encoding="utf-8")
+            assert await changed_migrations(conn, migrations_dir=tmp_path) == [version]
+        finally:
+            await conn.execute("DELETE FROM public.schema_migrations WHERE version = $1", version)
+
+
+async def test_shipped_migrations_match_what_was_applied(db_pool):
+    from core.migrations import changed_migrations
+
+    async with db_pool.acquire() as conn:
+        assert await changed_migrations(conn) == []

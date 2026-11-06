@@ -10,7 +10,9 @@ import pytest
 
 from core.tools.config import MCPServerConfig, ToolsConfig
 from services.skill_runtime import (
+    format_skills_prompt,
     load_available_skills,
+    select_skills,
     skill_catalog,
     synthesize_implicit_mcp_skills,
 )
@@ -122,9 +124,14 @@ def test_implicit_skills_for_unbound_configured_servers():
     assert slack.provenance == {"generated": "mcp_server_config"}
 
 
-def _mock_registry(tool_names: list[str], mcp_servers: list[MCPServerConfig]) -> MagicMock:
+def _mock_registry(
+    tool_names: list[str],
+    mcp_servers: list[MCPServerConfig],
+    unready: dict[str, str] | None = None,
+) -> MagicMock:
     registry = MagicMock()
     registry.list_names.return_value = tool_names
+    registry.unready_tools = AsyncMock(return_value=unready or {})
     registry.extra_skill_dirs = []
     registry.get_config = AsyncMock(return_value=ToolsConfig(mcp_servers=mcp_servers))
     return registry
@@ -188,3 +195,55 @@ def test_prompt_instructed_tools_are_bound_in_default_chat_skills():
     self_inspection = skill_bound_tools(by_name["self-inspection"])
     assert "inspect_config" in self_inspection
     assert "review_recent_actions" in self_inspection
+
+
+class TestReadiness:
+    def test_registered_but_unready_tool_needs_setup(self):
+        skill = SkillSpec(name="calendar", description="d", content="c", requires_tools=["calendar_events"])
+        status, missing, next_step = skill.usability(
+            {"calendar_events"}, set(), {"calendar_events": "Connect a calendar."}
+        )
+        assert status == "needs_setup"
+        assert missing == ["not set up: calendar_events"]
+        assert next_step == "Connect a calendar."
+
+
+async def test_unready_skills_are_listed_as_not_set_up_and_never_auto_activate():
+    from core.tools.base import ToolContext
+
+    registry = _mock_registry(
+        ["recall", "remember", "search_history", "calendar_events", "search_contacts", "list_skills", "use_skill"],
+        [],
+        unready={"calendar_events": "Google Calendar is not connected."},
+    )
+    registry.pool = None
+    selection = await select_skills(registry, ToolContext.CHAT, query="prepare my calendar meeting")
+    assert "calendar" in selection.setup_steps
+    assert "calendar" not in {s.name for s in selection.skills}
+
+    prompt = format_skills_prompt(selection.skills, selection.available, selection.setup_steps)
+    ready_part, _, unset_part = prompt.partition("Installed but not set up")
+    assert "- calendar:" not in ready_part
+    assert "- calendar:" in unset_part
+    assert "Google Calendar is not connected." in unset_part
+
+    catalog = {e["name"]: e for e in await skill_catalog(registry, ToolContext.CHAT)}
+    assert catalog["calendar"]["status"] == "needs_setup"
+    assert catalog["calendar"]["next_step"] == "Google Calendar is not connected."
+
+
+async def test_registry_reports_unready_credential_tools():
+    from core.tools.base import ToolContext
+    from core.tools.calendar import create_calendar_tools
+    from core.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(None)
+    for handler in create_calendar_tools(credentials_resolver=lambda: None):
+        registry.register(handler)
+    unready = await registry.unready_tools(ToolContext.CHAT)
+    assert set(unready) == {"calendar_events", "calendar_create", "calendar_update", "calendar_delete", "meeting_prep"}
+
+    ready = ToolRegistry(None)
+    for handler in create_calendar_tools(credentials_resolver=lambda: {"token": "t"}):
+        ready.register(handler)
+    assert await ready.unready_tools(ToolContext.CHAT) == {}

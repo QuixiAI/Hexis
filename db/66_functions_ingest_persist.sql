@@ -267,6 +267,16 @@ BEGIN
         WHERE length(trim(f)) >= 10
     );
     IF cardinality(valid_facts) = 0 THEN
+        -- A chunk read with nothing worth keeping is still read: receipt it,
+        -- so a retry of the document does not read it again.
+        IF p_source ? 'section_hash' THEN
+            PERFORM record_ingestion_receipt(
+                COALESCE(p_source->>'content_hash', p_source->>'ref'),
+                p_source->>'section_hash',
+                NULL,
+                0,
+                p_source->>'path');
+        END IF;
         RETURN jsonb_build_object('created', '[]'::jsonb, 'corroborated', 0);
     END IF;
 

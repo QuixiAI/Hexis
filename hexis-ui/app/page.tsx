@@ -7,6 +7,7 @@ import {
   Clock3,
   HeartPulse,
   MessageCircle,
+  Pause,
   Play,
   Target,
   Zap,
@@ -20,6 +21,7 @@ import { Button } from "./components/ui/button";
 import { ProgressBar } from "./components/ui/progress-bar";
 import { Spinner } from "./components/ui/spinner";
 import { useGatewayEvents } from "./hooks/use-gateway-events";
+import { refreshAgentStatus, useAgentStatus } from "./hooks/use-agent-status";
 
 type StatusData = {
   agent_name?: string;
@@ -68,20 +70,15 @@ type HeartbeatTrace = {
 
 export default function Dashboard() {
   const router = useRouter();
-  const [status, setStatus] = useState<StatusData | null>(null);
+  // The sidebar reads the same status, so both always show the same state.
+  const { status, loaded } = useAgentStatus<StatusData>();
   const [usage, setUsage] = useState<UsageData | null>(null);
-  const [loading, setLoading] = useState(true);
   const [heartbeatRunning, setHeartbeatRunning] = useState(false);
   const [heartbeatError, setHeartbeatError] = useState<string | null>(null);
+  const [pauseBusy, setPauseBusy] = useState(false);
   const [heartbeatTrace, setHeartbeatTrace] = useState<HeartbeatTrace[]>([]);
 
-  const refreshStatus = useCallback(async () => {
-    try {
-      const response = await fetch("/api/status", { cache: "no-store" });
-      if (response.ok) setStatus(await response.json());
-    } catch {
-      // The page-level connection state remains visible.
-    }
+  const refreshUsage = useCallback(async () => {
     try {
       const response = await fetch("/api/usage?period=30 days", { cache: "no-store" });
       if (response.ok) setUsage(await response.json());
@@ -90,29 +87,38 @@ export default function Dashboard() {
     }
   }, []);
 
+  const refreshStatus = useCallback(async () => {
+    await refreshAgentStatus();
+    await refreshUsage();
+  }, [refreshUsage]);
+
   useEffect(() => {
-    const load = async () => {
-      try {
-        const response = await fetch("/api/status", { cache: "no-store" });
-        if (!response.ok) throw new Error("Failed to load status");
-        const data = await response.json();
-        setStatus(data);
-        if (data.configured === false) {
-          router.push("/init");
-          return;
-        }
-        const usageResponse = await fetch("/api/usage?period=30 days", { cache: "no-store" });
-        if (usageResponse.ok) setUsage(await usageResponse.json());
-      } catch {
-        setStatus(null);
-      } finally {
-        setLoading(false);
-      }
-    };
-    load();
-  }, [router]);
+    if (status?.configured === false) router.push("/init");
+  }, [router, status?.configured]);
+
+  useEffect(() => {
+    // Usage is loaded once on mount; state is set when the request resolves.
+    const timer = window.setTimeout(() => void refreshUsage(), 0);
+    return () => window.clearTimeout(timer);
+  }, [refreshUsage]);
 
   useGatewayEvents(refreshStatus);
+
+  /** Autonomy on or off: whether the agent runs its own heartbeats. */
+  const setPaused = async (pause: boolean) => {
+    setPauseBusy(true);
+    setHeartbeatError(null);
+    try {
+      const response = await fetch(`/api/heartbeat/${pause ? "pause" : "resume"}`, { method: "POST" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+      await refreshAgentStatus();
+    } catch (error) {
+      setHeartbeatError(`Could not ${pause ? "pause" : "resume"} heartbeats: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setPauseBusy(false);
+    }
+  };
 
   const appendHeartbeat = (event: string, payload: Record<string, unknown>) => {
     setHeartbeatTrace((current) => [
@@ -134,6 +140,7 @@ export default function Dashboard() {
     setHeartbeatTrace([]);
     try {
       const response = await fetch("/api/heartbeat/run", { method: "POST" });
+      void refreshAgentStatus();
       if (!response.ok || !response.body) {
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload?.error || `Heartbeat failed (${response.status})`);
@@ -164,7 +171,8 @@ export default function Dashboard() {
     }
   };
 
-  if (loading) {
+  if (!loaded || status?.configured === false) {
+    // Still loading, or on the way to /init.
     return <div className="flex min-h-screen items-center justify-center"><Spinner label="Loading overview..." /></div>;
   }
 
@@ -180,11 +188,14 @@ export default function Dashboard() {
   }
 
   const totalMemories = (status.memory_health || []).reduce((sum, item) => sum + (item.count || 0), 0);
+  // The same reading the sidebar shows; a manual run refreshes it on start and end.
   const heartbeatState = status.heartbeat_paused
     ? "Paused"
-    : heartbeatRunning || status.heartbeat_active
+    : status.heartbeat_active
       ? "Running"
       : "Idle";
+  const energy = Number(status.energy ?? 0);
+  const energyCapacity = Number(status.energy_capacity ?? status.max_energy ?? 20);
 
   return (
     <div className="app-shell">
@@ -210,6 +221,17 @@ export default function Dashboard() {
           <div className="flex flex-wrap gap-2">
             <Button
               variant="secondary"
+              onClick={() => void setPaused(!status.heartbeat_paused)}
+              disabled={pauseBusy}
+              title={status.heartbeat_paused ? "Let Hexis run its own heartbeats again" : "Stop Hexis running its own heartbeats"}
+            >
+              {pauseBusy ? <Spinner className="mr-2" /> : status.heartbeat_paused
+                ? <Play size={16} className="mr-2 inline" />
+                : <Pause size={16} className="mr-2 inline" />}
+              {status.heartbeat_paused ? "Resume heartbeats" : "Pause heartbeats"}
+            </Button>
+            <Button
+              variant="secondary"
               onClick={runHeartbeat}
               disabled={heartbeatRunning || status.heartbeat_paused || status.heartbeat_active}
               title={status.heartbeat_paused ? "Resume heartbeat before running one" : "Run heartbeat now"}
@@ -226,7 +248,7 @@ export default function Dashboard() {
 
         <section className="grid border-x border-b border-[var(--outline)] bg-white sm:grid-cols-2 xl:grid-cols-4">
           <Metric icon={Activity} label="Heartbeat" value={heartbeatState} detail={formatRelativeTime(status.last_heartbeat_at)} />
-          <Metric icon={Zap} label="Energy" value={`${status.energy ?? 0} / ${status.energy_capacity ?? status.max_energy ?? 20}`} detail={`reserve ${status.energy_reserve ?? status.max_energy ?? 20} · ${status.heartbeat_count ?? 0} completed`} />
+          <Metric icon={Zap} label="Energy" value={`${energy.toFixed(1)} / ${energyCapacity.toFixed(0)}`} detail={`reserve ${status.energy_reserve ?? status.max_energy ?? 20} · ${status.heartbeat_count ?? 0} runs`} />
           <Metric icon={HeartPulse} label="Emotion" value={status.mood || "Unknown"} detail={status.arousal != null ? `arousal ${status.arousal.toFixed(2)}` : "No reading"} />
           <Metric icon={Brain} label="Memory" value={totalMemories.toLocaleString()} detail={`${status.memory_health?.length || 0} types`} />
         </section>
@@ -344,7 +366,7 @@ export default function Dashboard() {
             <section className="rounded-lg border border-[var(--outline)] bg-white p-5">
               <h2 className="font-semibold">Usage</h2>
               <div className="mt-3 grid grid-cols-2 gap-4">
-                <div><p className="text-xl font-semibold">${usage?.total_cost_usd.toFixed(2) || "0.00"}</p><p className="text-xs text-[var(--ink-soft)]">30 days</p></div>
+                <div><p className="text-xl font-semibold">${(usage?.total_cost_usd ?? 0).toFixed(2)}</p><p className="text-xs text-[var(--ink-soft)]">30 days</p></div>
                 <div><p className="text-xl font-semibold">{usage?.total_calls.toLocaleString() || "0"}</p><p className="text-xs text-[var(--ink-soft)]">API calls</p></div>
               </div>
               {usage?.by_model.slice(0, 3).map((model) => (

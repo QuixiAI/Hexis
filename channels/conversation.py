@@ -39,6 +39,22 @@ def _attachment_payload(value: Any) -> Any:
     return str(value)
 
 
+def speaker_label(msg: ChannelMessage) -> str:
+    """Who is talking, with their address on this channel.
+
+    "Ana Ruiz (Slack user U081GMQP0JV)". The label is how the speaker appears
+    in the reply's prompt and in the recorded episode, so the memory of
+    meeting someone keeps the ID the agent needs to message them later. The
+    web chat and channels without a separate ID keep the bare name.
+    """
+    name = (msg.sender_name or "").strip() or (msg.sender_id or "").strip()
+    sender_id = (msg.sender_id or "").strip()
+    channel = (msg.channel_type or "").strip()
+    if not sender_id or not channel or channel == "web" or sender_id == name:
+        return name
+    return f"{name} ({channel.title()} user {sender_id})"
+
+
 def _channel_message_payload(msg: ChannelMessage) -> dict[str, Any]:
     return {
         "channel_type": msg.channel_type,
@@ -229,7 +245,7 @@ async def process_channel_message(
             dsn=dsn,
             session_id=session_id,
             pool=pool,
-            user_label=msg.sender_name,
+            user_label=speaker_label(msg),
             is_group=msg.is_group,
             trusted_operator=is_operator,
             operator_context=_operator_context(msg),
@@ -385,7 +401,7 @@ async def stream_channel_message(
             dsn=dsn,
             session_id=session_id,
             pool=pool,
-            user_label=msg.sender_name,
+            user_label=speaker_label(msg),
             is_group=msg.is_group,
             trusted_operator=is_operator,
             operator_context=_operator_context(msg),

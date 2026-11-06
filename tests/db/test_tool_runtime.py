@@ -212,3 +212,21 @@ async def test_workflow_runtime_functions_create_claim_finalize(db_pool):
             assert claimed_next[0]["step_name"] == "b"
         finally:
             await tr.rollback()
+
+
+async def test_schedule_accepts_a_date_and_time(db_pool):
+    """"Remind me on November 10 at 9am Tokyo time" arrives as an ISO date-time;
+    it is a one-off schedule, read in the schedule's timezone when it has no offset."""
+    async with db_pool.acquire() as conn:
+        with_offset = _coerce_json(await conn.fetchval(
+            "SELECT parse_schedule_input($1::jsonb)",
+            json.dumps({"schedule": "2026-11-10T09:00:00+09:00"}),
+        ))
+        in_timezone = _coerce_json(await conn.fetchval(
+            "SELECT parse_schedule_input($1::jsonb)",
+            json.dumps({"schedule": "once:2026-11-10 09:00", "timezone": "Asia/Tokyo"}),
+        ))
+    assert with_offset["schedule_kind"] == "once"
+    assert with_offset["schedule"]["run_at"].startswith("2026-11-10T00:00:00")
+    assert in_timezone["schedule_kind"] == "once"
+    assert in_timezone["schedule"]["run_at"].startswith("2026-11-10T00:00:00")

@@ -3,6 +3,7 @@
 import { Menu } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
+import { ActivityBanner, BackgroundActivityProvider } from "./background-activity";
 import { Sidebar } from "./sidebar";
 
 export function Shell({ children }: { children: React.ReactNode }) {
@@ -22,6 +23,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
   if (hideNav) return <>{children}</>;
 
   return (
+    <BackgroundActivityProvider>
     <div className="min-h-screen bg-[var(--background)]">
       <header className="fixed inset-x-0 top-0 z-30 flex h-14 items-center border-b border-[var(--outline)] bg-white px-4 lg:hidden">
         <button
@@ -46,7 +48,11 @@ export function Shell({ children }: { children: React.ReactNode }) {
       ) : null}
 
       <Sidebar open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
-      <main className="min-h-screen pt-14 lg:ml-60 lg:pt-0">{children}</main>
+      <main className="min-h-screen pt-14 lg:ml-60 lg:pt-0">
+        <ActivityBanner />
+        {children}
+      </main>
     </div>
+    </BackgroundActivityProvider>
   );
 }

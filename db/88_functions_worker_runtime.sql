@@ -14,7 +14,7 @@ DECLARE
     v_host_name TEXT;
     v_build_id TEXT;
 BEGIN
-    IF v_mode NOT IN ('heartbeat', 'maintenance', 'both', 'channel', 'unknown') THEN
+    IF v_mode NOT IN ('heartbeat', 'maintenance', 'both', 'channel', 'ingest', 'unknown') THEN
         v_mode := 'unknown';
     END IF;
 
@@ -67,7 +67,7 @@ DECLARE
     v_excess INTEGER := 0;
     v_backoff INTEGER := 0;
 BEGIN
-    IF v_mode NOT IN ('heartbeat', 'maintenance', 'both', 'channel', 'unknown') THEN
+    IF v_mode NOT IN ('heartbeat', 'maintenance', 'both', 'channel', 'ingest', 'unknown') THEN
         v_mode := 'unknown';
     END IF;
 

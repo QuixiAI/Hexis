@@ -320,6 +320,9 @@ async def setup_db(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age';")
         await conn.execute("SET search_path = public, ag_catalog;")
+        # No heartbeat runs between tests: a claim an earlier test left behind
+        # would make start_heartbeat refuse (one heartbeat at a time).
+        await conn.execute("UPDATE heartbeat_state SET active_heartbeat_id = NULL WHERE id = 1")
     yield
 
 

@@ -22,6 +22,7 @@ from core.auth.callback_server import run_callback_server
 
 SUPPORTED_PROVIDERS = {
     "openai-codex",
+    "xai-oauth",
     "chutes",
     "github-copilot",
     "qwen-portal",
@@ -29,6 +30,11 @@ SUPPORTED_PROVIDERS = {
     "google-gemini-cli",
     "google-antigravity",
 }
+# A pasted subscription token rather than an OAuth flow (Claude Code setup token).
+TOKEN_PROVIDERS = {"anthropic"}
+# Sign-ins that show a one-time code to type at the provider. Nothing has to
+# reach this machine, so they work in Docker and over SSH.
+DEVICE_CODE_PROVIDERS = {"github-copilot", "qwen-portal", "minimax-portal", "xai-oauth", "openai-codex"}
 MAX_AUTH_SESSIONS = 64
 
 AuthFlowKind = Literal["authorization_code", "device_code"]
@@ -84,7 +90,18 @@ class AuthFlowCoordinator:
         await self._cancel_active_provider_sessions(provider)
 
         try:
-            if provider in {"github-copilot", "qwen-portal", "minimax-portal"}:
+            if provider == "openai-codex":
+                # The one-time code is the default; if OpenAI will not hand one
+                # out, or the page asks for it, the browser login (redirect URL
+                # pasted back) still works.
+                if clean_options.get("flow") == "browser":
+                    session = self._start_authorization_code_flow(provider, clean_options)
+                else:
+                    try:
+                        session = await self._start_device_flow(provider, clean_options)
+                    except Exception:
+                        session = self._start_authorization_code_flow(provider, clean_options)
+            elif provider in DEVICE_CODE_PROVIDERS:
                 session = await self._start_device_flow(provider, clean_options)
             else:
                 session = self._start_authorization_code_flow(provider, clean_options)
@@ -108,7 +125,7 @@ class AuthFlowCoordinator:
         return self._public_session(session)
 
     def status(self, provider: str) -> dict[str, Any]:
-        provider = _canonical_provider(provider)
+        provider = _canonical_provider(provider, tokens=True)
         creds = _load_credentials(provider)
         payload: dict[str, Any] = {"provider": provider, "configured": bool(creds)}
         if not creds:
@@ -137,7 +154,7 @@ class AuthFlowCoordinator:
 
     async def validate(self, provider: str) -> dict[str, Any]:
         """Refresh-check a stored login after an explicit user action."""
-        provider = _canonical_provider(provider)
+        provider = _canonical_provider(provider, tokens=True)
         if not _load_credentials(provider):
             return {"provider": provider, "configured": False}
         try:
@@ -151,6 +168,35 @@ class AuthFlowCoordinator:
 
     def session(self, session_id: str) -> dict[str, Any]:
         return self._public_session(self._get_session(session_id))
+
+    def save_token(self, provider: str, token: str) -> dict[str, Any]:
+        """Store a pasted subscription token (no OAuth round trip)."""
+        provider = (provider or "").strip().lower()
+        if provider not in TOKEN_PROVIDERS:
+            raise AuthFlowError(f"{provider or 'This provider'} does not use a pasted token.")
+        from core.auth.anthropic_setup_token import (
+            AnthropicSetupTokenCredentials,
+            save_credentials,
+            validate_setup_token,
+        )
+
+        token = (token or "").strip()
+        problem = validate_setup_token(token)
+        if problem:
+            raise AuthFlowError(problem)
+        save_credentials(AnthropicSetupTokenCredentials(token=token))
+        return self.status(provider)
+
+    def forget(self, provider: str) -> dict[str, Any]:
+        """Delete a stored sign-in or token at the user's request."""
+        provider = _canonical_provider(provider, tokens=True)
+        if provider == "openai-codex":
+            from core.auth.openai_codex import delete_openai_codex_credentials
+
+            delete_openai_codex_credentials()
+        else:
+            _auth_module(provider).delete_credentials()
+        return self.status(provider)
 
     async def complete(
         self, session_id: str, authorization_input: str
@@ -280,7 +326,33 @@ class AuthFlowCoordinator:
         self, provider: str, options: dict[str, str]
     ) -> _AuthSession:
         verifier: str | None = None
-        if provider == "github-copilot":
+        if provider == "openai-codex":
+            from core.auth.openai_codex import (
+                OPENAI_CODEX_DEVICE_EXPIRES_SECONDS,
+                OPENAI_CODEX_DEVICE_VERIFICATION_URL,
+                request_device_code,
+            )
+
+            device = await request_device_code()
+            now = time.time()
+            return _AuthSession(
+                id=uuid.uuid4().hex,
+                provider=provider,
+                flow="device_code",
+                status="waiting_for_user",
+                created_at=now,
+                expires_at=now + OPENAI_CODEX_DEVICE_EXPIRES_SECONDS,
+                verification_uri=OPENAI_CODEX_DEVICE_VERIFICATION_URL,
+                user_code=device.user_code,
+                options=options,
+                device=device,
+            )
+        if provider == "xai-oauth":
+            from core.auth.xai_oauth import request_device_code
+
+            device = await request_device_code()
+            verification_uri = device.verification_url
+        elif provider == "github-copilot":
             from core.auth.github_copilot import start_device_flow
 
             enterprise_domain = _normalize_domain(options.get("enterprise_domain", ""))
@@ -326,7 +398,28 @@ class AuthFlowCoordinator:
         if not session:
             return
         try:
-            if session.provider == "github-copilot":
+            if session.provider == "openai-codex":
+                from core.auth import openai_codex as codex
+
+                creds = await self._poll_one_shot(
+                    session, lambda: codex.poll_device_code(session.device)
+                )
+                codex.save_openai_codex_credentials(creds)
+            elif session.provider == "xai-oauth":
+                from core.auth import xai_oauth as xai
+
+                async def poll_xai():
+                    try:
+                        return await xai.poll_device_code(session.device)
+                    except xai.SlowDown:
+                        session.device = xai.XaiDeviceCode(
+                            **{**session.device.__dict__, "interval": session.device.interval + 5}
+                        )
+                        return None
+
+                creds = await self._poll_one_shot(session, poll_xai)
+                xai.save_xai_credentials(creds)
+            elif session.provider == "github-copilot":
                 from core.auth.github_copilot import (
                     exchange_github_for_copilot,
                     poll_for_github_token,
@@ -374,6 +467,17 @@ class AuthFlowCoordinator:
         except Exception as exc:
             session.status = "expired" if time.time() >= session.expires_at else "error"
             session.error = _error_message(exc)
+
+    async def _poll_one_shot(self, session: _AuthSession, poll_once: Any) -> Any:
+        """Repeat a single-poll sign-in check at the provider's interval until
+        it returns credentials or the code expires."""
+        while True:
+            if time.time() >= session.expires_at:
+                raise AuthFlowError("The login code expired. Start again.")
+            await asyncio.sleep(max(1, int(getattr(session.device, "interval", 5))))
+            creds = await poll_once()
+            if creds is not None:
+                return creds
 
     async def _wait_for_callback(self, session_id: str, port: int, path: str) -> None:
         session = self._sessions.get(session_id)
@@ -545,9 +649,24 @@ class AuthFlowCoordinator:
         return payload
 
 
-def _canonical_provider(provider: str) -> str:
+_PROVIDER_ALIASES = {
+    "openai_codex": "openai-codex",
+    "xai_oauth": "xai-oauth",
+    "github_copilot": "github-copilot",
+    "qwen_portal": "qwen-portal",
+    "minimax_portal": "minimax-portal",
+    "google_gemini_cli": "google-gemini-cli",
+    "google_antigravity": "google-antigravity",
+}
+
+
+def _canonical_provider(provider: str, *, tokens: bool = False) -> str:
     value = (provider or "").strip().lower()
-    if value not in SUPPORTED_PROVIDERS:
+    value = _PROVIDER_ALIASES.get(value, value)
+    allowed = SUPPORTED_PROVIDERS | (TOKEN_PROVIDERS if tokens else set())
+    if value not in allowed:
+        if value in TOKEN_PROVIDERS:
+            raise AuthFlowError(f"{value} uses a pasted setup token, not a browser sign-in.")
         raise AuthFlowError(f"Unsupported OAuth provider: {provider or 'missing'}")
     return value
 
@@ -586,24 +705,30 @@ def _parse_authorization_input(
     return parse_authorization_input(value)
 
 
+_AUTH_MODULES = {
+    "chutes": "core.auth.chutes",
+    "github-copilot": "core.auth.github_copilot",
+    "qwen-portal": "core.auth.qwen_portal",
+    "minimax-portal": "core.auth.minimax_portal",
+    "google-gemini-cli": "core.auth.google_gemini_cli",
+    "google-antigravity": "core.auth.google_antigravity",
+    "xai-oauth": "core.auth.xai_oauth",
+    "anthropic": "core.auth.anthropic_setup_token",
+}
+
+
+def _auth_module(provider: str) -> Any:
+    import importlib
+
+    return importlib.import_module(_AUTH_MODULES[provider])
+
+
 def _load_credentials(provider: str) -> Any:
     if provider == "openai-codex":
         from core.auth.openai_codex import load_openai_codex_credentials
 
         return load_openai_codex_credentials()
-    import importlib
-
-    module = importlib.import_module(
-        {
-            "chutes": "core.auth.chutes",
-            "github-copilot": "core.auth.github_copilot",
-            "qwen-portal": "core.auth.qwen_portal",
-            "minimax-portal": "core.auth.minimax_portal",
-            "google-gemini-cli": "core.auth.google_gemini_cli",
-            "google-antigravity": "core.auth.google_antigravity",
-        }[provider]
-    )
-    return module.load_credentials()
+    return _auth_module(provider).load_credentials()
 
 
 async def _ensure_fresh_credentials(provider: str) -> Any:
@@ -611,20 +736,10 @@ async def _ensure_fresh_credentials(provider: str) -> Any:
         from core.auth.openai_codex import ensure_fresh_openai_codex_credentials
 
         return await ensure_fresh_openai_codex_credentials(skew_seconds=0)
-
-    import importlib
-
-    module = importlib.import_module(
-        {
-            "chutes": "core.auth.chutes",
-            "github-copilot": "core.auth.github_copilot",
-            "qwen-portal": "core.auth.qwen_portal",
-            "minimax-portal": "core.auth.minimax_portal",
-            "google-gemini-cli": "core.auth.google_gemini_cli",
-            "google-antigravity": "core.auth.google_antigravity",
-        }[provider]
-    )
-    return await module.ensure_fresh_credentials(skew_seconds=0)
+    if provider in TOKEN_PROVIDERS:
+        # A setup token has nothing to refresh.
+        return _load_credentials(provider)
+    return await _auth_module(provider).ensure_fresh_credentials(skew_seconds=0)
 
 
 def _error_message(exc: Exception) -> str:

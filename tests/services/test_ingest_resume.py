@@ -4,6 +4,7 @@ receipt (the final act) makes a document skip entirely.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -33,7 +34,7 @@ class _StubLLM:
     async def complete(self, messages, temperature=0.3):
         raise AssertionError("complete() unused; extractor uses complete_json")
 
-    async def complete_json(self, messages, temperature=0.2):
+    async def complete_json(self, messages, temperature=0.2, **kwargs):
         self.call_count += 1
         self.completions += 1
         if self.fail_on_call is not None and self.completions >= self.fail_on_call:
@@ -210,3 +211,185 @@ async def test_worker_step_processes_enqueued_job(db_pool):
     assert failed["status"] == "pending"  # backed off, not terminal
     assert "stub LLM crash" in failed["error"]
     assert failed["attempts"] == 1
+
+
+class _PartFailLLM(_StubLLM):
+    """Extraction of one named section fails every time; the others succeed."""
+
+    def __init__(self, failing_part: str | None):
+        super().__init__()
+        self.failing_part = failing_part
+
+    async def complete_json(self, messages, temperature=0.2, **kwargs):
+        text = str(messages[-1].get("content", ""))
+        if self.failing_part and self.failing_part in text and "SECTION:" in text:
+            self.call_count += 1
+            raise RuntimeError("model returned garbage for this section")
+        return await super().complete_json(messages, temperature, **kwargs)
+
+
+async def test_one_bad_section_keeps_the_others_and_retries_only_itself(db_pool):
+    from services.ingest.pipeline import IngestSectionError
+
+    partial_doc = DOC.replace("topic", "subject")  # distinct from the doc the crash test completed
+    pipeline = await _make_pipeline(db_pool)
+    pipeline.llm = _PartFailLLM(failing_part="Part 2")
+    pipeline.appraiser.llm = pipeline.llm
+    pipeline.extractor.llm = pipeline.llm
+    with pytest.raises(IngestSectionError, match=r"1 of 3 sections failed \(2 memories kept\)"):
+        await pipeline.ingest_text(partial_doc, title="Partial doc")
+    await pipeline.close()
+
+    async with db_pool.acquire() as conn:
+        receipts = await conn.fetch(
+            "SELECT doc_ref, section_hash, memories_created FROM ingestion_receipts WHERE doc_ref IN "
+            "(SELECT doc_ref FROM ingestion_receipts WHERE section_hash LIKE 'enc:%' ORDER BY created_at DESC LIMIT 1)"
+        )
+    doc_ref = receipts[0]["doc_ref"]
+    section_receipts = [r for r in receipts if not r["section_hash"].startswith("enc:") and r["section_hash"] != doc_ref]
+    assert len(section_receipts) == 2, "the two good sections must be receipted"
+    assert not any(r["section_hash"] == doc_ref for r in receipts), "no doc-complete receipt yet"
+
+    # Second attempt: the failing section is read; nothing else is re-asked.
+    pipeline2 = await _make_pipeline(db_pool)
+    count = await pipeline2.ingest_text(partial_doc, title="Partial doc")
+    await pipeline2.close()
+    assert count >= 1
+    assert pipeline2.llm.call_count == 2, "one appraisal + the one missing section"
+    async with db_pool.acquire() as conn:
+        complete = await conn.fetchval(
+            "SELECT COUNT(*) FROM ingestion_receipts WHERE doc_ref = $1 AND section_hash = $1", doc_ref
+        )
+    assert complete == 1
+
+
+async def test_worker_step_refills_slots_until_the_queue_is_empty(db_pool):
+    """One step reads every due document, refilling each slot as it frees,
+    instead of one lock-step batch per tick."""
+    import json as _json
+
+    from services.ingest import pipeline as pipeline_mod
+    from services.ingest.jobs import run_ingestion_jobs_step
+
+    pipeline_cfg_source = await _make_pipeline(db_pool)
+    stub_config = pipeline_cfg_source.config
+    await pipeline_cfg_source.close()
+    stub_config.llm_config = {"provider": "openai", "model": "stub", "api_key": "stub"}
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE config SET value = '1'::jsonb WHERE key = 'ingest.job_batch_size'")
+        for i in range(3):
+            await conn.fetchval(
+                "SELECT enqueue_ingestion_job('text', $1::jsonb, $2, $3)",
+                _json.dumps({"title": f"Refill doc {i}", "mode": "fast"}),
+                f"# Refill doc {i}\n\n" + DOC.replace("topic", f"refill{i}"),
+                f"refill-hash-{i}",
+            )
+
+    real_init = pipeline_mod.IngestionPipeline.__init__
+
+    def _stubbed_init(self, config):
+        real_init(self, config)
+        self.llm = _StubLLM()
+        self.appraiser.llm = self.llm
+        self.extractor.llm = self.llm
+
+    pipeline_mod.IngestionPipeline.__init__ = _stubbed_init
+    try:
+        processed = await run_ingestion_jobs_step(db_pool, config_override=stub_config)
+    finally:
+        pipeline_mod.IngestionPipeline.__init__ = real_init
+
+    assert processed == 3
+    async with db_pool.acquire() as conn:
+        statuses = await conn.fetch(
+            "SELECT status FROM ingestion_jobs WHERE content_hash LIKE 'refill-hash-%'"
+        )
+    assert [r["status"] for r in statuses] == ["completed"] * 3
+
+
+async def _run_ingest_worker_until(db_pool, monkeypatch, done_sql: str, *, recheck_s: float) -> str:
+    """Run the ingest worker with stubbed reading until done_sql returns a value."""
+    from services import ingest_worker
+    from services.ingest import pipeline as pipeline_mod
+
+    monkeypatch.setattr(ingest_worker, "_RECHECK_SECONDS", recheck_s)
+    monkeypatch.setattr(ingest_worker.IngestWorker, "_agent_ready", lambda self: asyncio.sleep(0, True))
+    real_init = pipeline_mod.IngestionPipeline.__init__
+
+    def _stubbed_init(self, config):
+        real_init(self, config)
+        self.llm = _StubLLM()
+        self.appraiser.llm = self.llm
+        self.extractor.llm = self.llm
+
+    monkeypatch.setattr(pipeline_mod.IngestionPipeline, "__init__", _stubbed_init)
+    worker = ingest_worker.IngestWorker()
+    task = asyncio.ensure_future(worker.run())
+    try:
+        for _ in range(200):
+            async with db_pool.acquire() as conn:
+                value = await conn.fetchval(done_sql)
+            if value:
+                return value
+            await asyncio.sleep(0.05)
+        raise AssertionError("ingest worker did not finish in time")
+    finally:
+        worker.stop()
+        await asyncio.wait_for(task, 10)
+
+
+async def test_a_queued_document_wakes_the_ingest_worker(db_pool, monkeypatch):
+    """Reading starts when a job is queued (NOTIFY), not on the next timer tick."""
+    import json as _json
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE config SET value = '1'::jsonb WHERE key = 'ingest.job_batch_size'")
+
+    async def enqueue_soon():
+        await asyncio.sleep(0.5)  # after the worker has drained an empty queue and gone to sleep
+        async with db_pool.acquire() as conn:
+            await conn.fetchval(
+                "SELECT enqueue_ingestion_job('text', $1::jsonb, $2, $3)",
+                _json.dumps({"title": "Woken doc", "mode": "fast"}),
+                "# Woken doc\n\n" + DOC.replace("topic", "woken"),
+                "woken-hash-1",
+            )
+
+    asyncio.ensure_future(enqueue_soon())
+    status = await _run_ingest_worker_until(
+        db_pool, monkeypatch,
+        "SELECT status FROM ingestion_jobs WHERE content_hash = 'woken-hash-1' AND status = 'completed'",
+        recheck_s=3600,  # only the notification can wake it in time
+    )
+    assert status == "completed"
+
+
+async def test_the_ingest_worker_reclaims_a_job_stranded_by_a_stopped_worker(db_pool, monkeypatch):
+    """A job left in_progress past the claim timeout is read again."""
+    import json as _json
+
+    async with db_pool.acquire() as conn:
+        job_id = await conn.fetchval(
+            "SELECT enqueue_ingestion_job('text', $1::jsonb, $2, $3)",
+            _json.dumps({"title": "Stranded doc", "mode": "fast"}),
+            "# Stranded doc\n\n" + DOC.replace("topic", "stranded"),
+            "stranded-hash-1",
+        )
+        await conn.execute(
+            """
+            UPDATE ingestion_jobs
+            SET status = 'in_progress', attempts = 1,
+                claimed_at = CURRENT_TIMESTAMP - make_interval(
+                    secs => COALESCE(get_config_int('ingest.job_claim_timeout_s'), 1800) + 60)
+            WHERE id = $1::uuid
+            """,
+            job_id,
+        )
+
+    status = await _run_ingest_worker_until(
+        db_pool, monkeypatch,
+        "SELECT status FROM ingestion_jobs WHERE content_hash = 'stranded-hash-1' AND status = 'completed'",
+        recheck_s=0.2,
+    )
+    assert status == "completed"

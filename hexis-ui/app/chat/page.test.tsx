@@ -414,7 +414,7 @@ describe("ChatPage attachments", () => {
 
     expect(
       await screen.findByText(
-        "Response incomplete: stream disconnected — not added to conversation history. You can retry."
+        "Response incomplete: stream disconnected — not added to conversation history."
       )
     ).toBeInTheDocument();
     expect(
@@ -489,6 +489,54 @@ describe("ChatPage attachments", () => {
     expect(await screen.findByText("Visible answer")).toBeInTheDocument();
   });
 
+  it("resends the question from the Retry button after a failed turn", async () => {
+    const chatBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({ configured: true, agent_name: "Samantha", mood: "Ready", valence: 0 });
+        }
+        if (url.endsWith("/api/outbox")) {
+          return Response.json({ unread: 0, messages: [], pending_requests: [] });
+        }
+        if (url.endsWith("/api/chat")) {
+          chatBodies.push(JSON.parse(String(init?.body || "{}")));
+          if (chatBodies.length > 1) {
+            return eventStream([
+              'event: token\ndata: {"phase":"conscious_final","text":"second time works"}\n\n',
+              [
+                "event: done",
+                'data: {"assistant":"second time works","session_id":"00000000-0000-4000-8000-000000000001"}',
+                "",
+                "",
+              ].join("\n"),
+            ]);
+          }
+          return new Response("upstream down", { status: 502 });
+        }
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+
+    render(<ChatPage />);
+
+    const composer = await screen.findByLabelText("Message Samantha");
+    fireEvent.change(composer, { target: { value: "what did I say about cedar?" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByText("No answer came back.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(chatBodies).toHaveLength(2));
+    expect(chatBodies[1].message).toBe("what did I say about cedar?");
+    expect(await screen.findByText("second time works")).toBeInTheDocument();
+    expect(screen.queryByText("No answer came back.")).toBeNull();
+    // The failed pair left the thread; the question shows once, from the resend.
+    expect(screen.getAllByText("what did I say about cedar?")).toHaveLength(1);
+  });
+
   it("marks a cleanly truncated stream incomplete instead of leaving a spinner", async () => {
     vi.stubGlobal(
       "fetch",
@@ -522,7 +570,7 @@ describe("ChatPage attachments", () => {
 
     expect(
       await screen.findByText(
-        "Response incomplete: The response stream ended before Hexis finished — not added to conversation history. You can retry."
+        "Response incomplete: The response stream ended before Hexis finished — not added to conversation history."
       )
     ).toBeInTheDocument();
     expect(screen.queryByText("Thinking...")).not.toBeInTheDocument();
@@ -566,7 +614,7 @@ describe("ChatPage attachments", () => {
 
     expect(
       await screen.findByText(
-        "Response incomplete — Failed to reach chat endpoint (502). You can retry."
+        "Response incomplete — Failed to reach chat endpoint (502)."
       )
     ).toBeInTheDocument();
     expect(

@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 
+from core.chat_priority import wait_for_chat_idle
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
 from services.prompt_resources import (
@@ -126,6 +127,20 @@ async def run_recmem_sweep_step(conn) -> dict[str, Any]:
     return dict(result) if isinstance(result, dict) else {}
 
 
+async def _naming(conn) -> str:
+    """Who is remembering, and who the user is, so episodes are written in the
+    agent's own voice and name people (the DB's label resolution)."""
+    raw = await conn.fetchval("SELECT get_turn_labels()")
+    labels = _coerce_json(raw) if raw is not None else {}
+    labels = labels if isinstance(labels, dict) else {}
+    me = labels.get("agent_label") or "Assistant"
+    user = labels.get("user_label") or "the user"
+    return (
+        f"I am {me}; lines labelled \"{me}:\" are what I said. The person I live with is {user}; "
+        "other speakers are named in their turns.\n\n"
+    )
+
+
 async def _load_task_context(conn, task: dict[str, Any]) -> dict[str, Any]:
     raw = await conn.fetchval("SELECT load_recmem_task_context($1::uuid)", str(task["id"]))
     context = _coerce_json(raw)
@@ -134,16 +149,18 @@ async def _load_task_context(conn, task: dict[str, Any]) -> dict[str, Any]:
 
 async def _handle_episode_merge(conn, task: dict[str, Any], llm_config: dict[str, Any]) -> dict[str, Any]:
     context = await _load_task_context(conn, task)
+    await wait_for_chat_idle(conn)  # chat comes first
     doc, _raw = await chat_json(
         llm_config=llm_config,
         messages=[
             {"role": "system", "content": load_recmem_episode_merge_prompt().strip()},
-            {"role": "user", "content": json.dumps(context, default=str)[:20000]},
+            {"role": "user", "content": await _naming(conn) + json.dumps(context, default=str)[:20000]},
         ],
         max_tokens=1800,
         temperature=0.1,
         response_format={"type": "json_object"},
         fallback={"should_merge": False},
+        usage_source="memory",
     )
     if not isinstance(doc, dict):
         doc = {"should_merge": False}
@@ -159,16 +176,18 @@ async def _handle_episode_merge(conn, task: dict[str, Any], llm_config: dict[str
 
 async def _handle_episode_create(conn, task: dict[str, Any], llm_config: dict[str, Any]) -> dict[str, Any]:
     context = await _load_task_context(conn, task)
+    await wait_for_chat_idle(conn)  # chat comes first
     doc, _raw = await chat_json(
         llm_config=llm_config,
         messages=[
             {"role": "system", "content": load_recmem_episode_create_prompt().strip()},
-            {"role": "user", "content": json.dumps(context, default=str)[:24000]},
+            {"role": "user", "content": await _naming(conn) + json.dumps(context, default=str)[:24000]},
         ],
         max_tokens=2200,
         temperature=0.1,
         response_format={"type": "json_object"},
         fallback={"episodes": []},
+        usage_source="memory",
     )
     normalized = await conn.fetchval("SELECT normalize_recmem_episode_output($1::jsonb)", json.dumps(doc or {}))
     episodes = _coerce_json(normalized)
@@ -183,16 +202,18 @@ async def _handle_episode_create(conn, task: dict[str, Any], llm_config: dict[st
 
 async def _handle_semantic_refine(conn, task: dict[str, Any], llm_config: dict[str, Any]) -> dict[str, Any]:
     context = await _load_task_context(conn, task)
+    await wait_for_chat_idle(conn)  # chat comes first
     doc, _raw = await chat_json(
         llm_config=llm_config,
         messages=[
             {"role": "system", "content": load_recmem_semantic_refine_prompt().strip()},
-            {"role": "user", "content": json.dumps(context, default=str)[:24000]},
+            {"role": "user", "content": await _naming(conn) + json.dumps(context, default=str)[:24000]},
         ],
         max_tokens=1800,
         temperature=0.1,
         response_format={"type": "json_object"},
         fallback={"facts": []},
+        usage_source="memory",
     )
     normalized = await conn.fetchval("SELECT normalize_recmem_fact_output($1::jsonb)", json.dumps(doc or {}))
     facts = _coerce_json(normalized)

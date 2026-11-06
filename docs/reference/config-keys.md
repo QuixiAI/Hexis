@@ -65,6 +65,8 @@ SELECT set_config('agent.name', '"MyAgent"'::jsonb);
 | `heartbeat.outcome_regen_score_scale` | float | Regeneration multiplier added per outcome-score point (default `0.5`) |
 | `heartbeat.outcome_regen_ceiling_multiplier` | float | Maximum outcome-sensitive regeneration multiplier (default `1.5`) |
 | `heartbeat.task_energy_multiplier` | float | Maximum reserve multiple an actionable backlog beat may draw from the bank (default `2`) |
+| `rlm.heartbeat.user_goal_max_iterations` / `rlm.heartbeat.user_goal_timeout_seconds` | int | Steps and seconds a heartbeat may take while a goal the user set is active (defaults `40` / `1800`; otherwise `rlm.heartbeat.max_iterations` / `timeout_seconds`) |
+| `heartbeat.free_work_daily_token_cap` | int | Heartbeat model tokens per day after which work on the user's goals spends energy again; until then, tool calls serving a goal the user set cost nothing (default `5000000`, `0` = no cap) |
 | `heartbeat.cadence_min_minutes` | float | Shortest urgency-adjusted cadence (default `15`) |
 | `heartbeat.cadence_max_minutes` | float | Longest urgency-adjusted cadence (default `120`) |
 | `heartbeat.cadence_idle_multiplier` | float | Base-cadence multiplier at zero drive urgency (default `1.5`) |
@@ -220,6 +222,24 @@ The learning diff shares the explicitly enabled background skill-review pass;
 | `learning.review.enabled` | bool | Publish a learning diff when the opted-in pass finds enough grounded change (default `true`) |
 | `learning.review.max_items` | int | Maximum changes in one review (default `20`) |
 
+## Messages to the User
+
+Where messages meant for the user (a heartbeat reaching out, `queue_user_message`
+from a heartbeat) go besides the dashboard inbox, which always gets a copy. See
+`core/outreach_destination.py`; set from Settings → Messages.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `outreach.destination` | text | `auto` (default: the agent decides, honouring a channel it asked for when several are set up), `slack`, `telegram`, `email`, or `inbox` (dashboard only) |
+| `outreach.slack_user_id` | text | The user's own Slack account (`U...`) for messages to them; empty falls back to `channel.slack.operator_user_id`, then the most recent Slack DM |
+| `outreach.telegram_chat_id` | text | The user's Telegram chat; empty falls back to the most recent Telegram chat |
+
+## Google Drive
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `integrations.google_drive.folders` | json | Folders the agent reads: `[{"id", "name", "url"}]`, managed from the Connections page; imports are connector backfill jobs run by the maintenance worker |
+
 ## Operator Standing Policies
 
 An explicit standing instruction such as “Always cite the exact source” is
@@ -325,10 +345,10 @@ separately and cannot be cleared by any setting below.
 | Key | Type | Description |
 |-----|------|-------------|
 | `extraction.enabled` | bool | Sweep chat turns + heartbeat episodes into selective durable memories (default `true`; kill switch) |
-| `extraction.min_importance` | float | Units below this importance never earn an LLM pass (default `0.6`) |
+| `extraction.min_importance` | float | Units below this importance never earn an LLM pass (default `0.4`; turns are recorded at 0.5, and the encoder itself is selective) |
 | `extraction.batch_size` | int | Units claimed per extraction sweep (default `8`) |
 | `extraction.min_confidence` | float | Extracted facts below this confidence are dropped (default `0.55`) |
-| `extraction.max_facts_per_batch` | int | Soft cost cap on facts per sweep (default `5`) |
+| `extraction.max_facts_per_batch` | int | Soft cost cap on facts per sweep (default `16`; one claim per fact, scaled to substance) |
 
 ## Memory Budgets
 
@@ -376,7 +396,35 @@ separately and cannot be cleared by any setting below.
 | `ingest.artifact_max_db_bytes` | int | Originals up to this size are stored in-DB; larger go to `$HEXIS_ARTIFACT_DIR` (default `26214400`) |
 | `ingest.xlsx_max_rows_per_sheet` | int | Spreadsheet row cap per sheet — capping always emits a `truncated_rows` warning (default `5000`) |
 | `ingest.upload_max_bytes` | int | Upload API file-size cap; larger files use the CLI (default `104857600`) |
-| `ingest.job_*` | various | Durable ingestion-job queue: content cap, claim timeout, retry backoff, batch size |
+| `ingest.job_batch_size` | int | Documents the ingest worker reads at once (default `4`) |
+| `ingest.max_parallel_llm` | int | Model calls at the same time per document (default `4`); at most `job_batch_size × max_parallel_llm` reading calls run at once |
+| `ingest.job_claim_timeout_s` | int | Seconds without a progress refresh before another worker may reclaim a reading job; a restarted worker's documents resume after this (default `120`) |
+| `ingest.job_step_budget_s` | int | Seconds a shared-loop caller (CLI, tests) keeps claiming queued documents before handing control back (default `120`) |
+| `ingest.job_max_content_chars` / `ingest.job_retry_base_seconds` | int | Durable ingestion-job queue: content cap and retry backoff base |
+| `ingest.llm_max_tokens` | int | Output token budget per reading call, including a reasoning model's thinking; a truncated answer is re-asked with double the budget (default `8000`) |
+| `ingest.llm_reasoning_effort` | string | Reasoning effort sent with reading calls (`none`, `low`, …); unset leaves the model's default |
+
+## Chat Turn Limits
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `chat.turn_timeout_s` | int | Outer time limit for one chat turn; a hung model call ends in a visible error (default `360`; `0` disables) |
+| `chat.max_tool_rounds` | int | Rounds of tool calls in one chat turn before the agent is asked to answer with what it has found (default `5`) |
+| `chat.answer_reserve_s` | int | Seconds of the loop's time limit kept for writing the answer; with less left, the next model call gets no tools (default `30`) |
+| `chat.priority_max_wait_s` | int | Chat comes first: longest a background model call (extraction, RecMem, summarization, reading) waits for a live chat turn before going ahead (default `180`) |
+| `heartbeat.claim_timeout_s` | int | Seconds after a heartbeat starts before its claim stops blocking new heartbeats; a claim always counts for the RLM heartbeat timeout plus ten minutes (default `1800`) |
+
+## Transcript Retention
+
+Raw transcripts are deleted after a set time; memories are not affected (they fade on the rules below). `run_transcript_retention()` runs once a day in the maintenance worker, in batches, and the Settings page's Retention tab edits these.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `retention.transcripts_enabled` | bool | Delete raw transcripts past the limits below (default `true`) |
+| `retention.turn_trace_days` | int | Days to keep per-turn traces: full prompts, tool calls and results (default `30`; `0` keeps forever) |
+| `retention.conversation_days` | int | Days to keep a web-chat or channel conversation after its last activity, with its per-message documents (default `365`; `0` keeps forever) |
+| `retention.raw_turn_days` | int | Days to keep raw turns the memory system has finished with and that are not pinned (default `365`; `0` keeps forever) |
+| `retention.transcript_batch_size` | int | Rows of each kind deleted per pass (default `500`) |
 
 ## Memory and Source Retention
 

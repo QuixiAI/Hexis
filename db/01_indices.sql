@@ -9,8 +9,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_source_content_hash
     WHERE source_attribution->>'content_hash' IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_episodes_ended_at ON episodes (ended_at);
 CREATE INDEX IF NOT EXISTS idx_config_key_pattern ON config (key text_pattern_ops);
-CREATE INDEX idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops)
-    WHERE embedding IS NOT NULL AND embedding_status = 'embedded';
+-- Not partial on embedding_status: similarity queries (ingest routing, recall,
+-- worldview hints) filter on status/type/embedding IS NOT NULL but never on
+-- embedding_status, so a partial index was never used and every call scanned
+-- every memory.
+CREATE INDEX idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_memories_embedding_queue
     ON memories (embedding_status, created_at)
     WHERE embedding_status IN ('pending', 'in_progress');

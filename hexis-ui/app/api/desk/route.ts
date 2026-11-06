@@ -32,12 +32,13 @@ export async function GET(req: NextRequest) {
       limit, offset, documentId, pinnedOnly
     );
     return NextResponse.json({
-      items: items.map((i) => ({
+      // total_count is a bigint, which JSON cannot carry; it is sent as total.
+      items: items.map(({ total_count, ...i }) => ({
         ...i,
         locator: normalizeJsonValue(i.locator),
         char_count: i.char_count != null ? Number(i.char_count) : null,
         access_count: i.access_count != null ? Number(i.access_count) : null,
-        total: i.total_count != null ? Number(i.total_count) : null,
+        total: total_count != null ? Number(total_count) : null,
       })),
       total: items.length ? Number(items[0].total_count || 0) : 0,
       limit,

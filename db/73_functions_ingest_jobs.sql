@@ -6,12 +6,16 @@ SET search_path = public, ag_catalog, "$user";
 INSERT INTO config_defaults (key, value, description) VALUES
     ('ingest.job_max_content_chars', '2000000'::jsonb,
      'Maximum pasted/extracted text an ingestion job may carry; larger content uses the synchronous CLI path'),
-    ('ingest.job_claim_timeout_s', '1800'::jsonb,
-     'Seconds after which an in-progress ingestion job with no progress heartbeat is reclaimed'),
+    ('ingest.job_claim_timeout_s', '120'::jsonb,
+     'Seconds without a progress refresh before another worker may reclaim a reading job'),
     ('ingest.job_retry_base_seconds', '60'::jsonb,
      'Base for exponential retry backoff when an ingestion job fails'),
-    ('ingest.job_batch_size', '1'::jsonb,
-     'Ingestion jobs claimed per maintenance tick'),
+    ('ingest.job_batch_size', '4'::jsonb,
+     'Documents the ingest worker reads at once'),
+    ('ingest.job_step_budget_s', '120'::jsonb,
+     'Seconds a shared-loop caller (CLI, tests) keeps claiming queued documents to read'),
+    ('ingest.llm_max_tokens', '8000'::jsonb,
+     'Output token budget per ingestion LLM call (includes reasoning)'),
     ('ingest.upload_max_bytes', '104857600'::jsonb,
      'Maximum file size accepted by the upload API; larger files use the synchronous CLI path'),
     ('ingest.attachment_text_chars', '60000'::jsonb,
@@ -67,6 +71,36 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- "Is any reading work due?" asks the same question the claim does: pending
+-- and due, or stranded in progress past the claim timeout by a stopped worker.
+CREATE OR REPLACE FUNCTION ingestion_jobs_due(p_claim_timeout_s INT DEFAULT NULL) RETURNS INT
+    LANGUAGE sql STABLE AS $$
+    SELECT count(*)::int FROM ingestion_jobs
+    WHERE (status = 'pending' AND next_attempt_at <= CURRENT_TIMESTAMP)
+       OR (status = 'in_progress'
+           AND claimed_at < CURRENT_TIMESTAMP - make_interval(
+               secs => COALESCE(p_claim_timeout_s, get_config_int('ingest.job_claim_timeout_s'), 1800)));
+$$;
+
+-- A queued reading job wakes the ingest worker (services/ingest_worker.py
+-- LISTENs on this channel) instead of waiting for a timer tick.
+CREATE OR REPLACE FUNCTION notify_ingestion_job_pending() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_notify('ingestion_jobs', NEW.id::text);
+    RETURN NULL;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS ingestion_jobs_notify_pending ON ingestion_jobs;
+CREATE TRIGGER ingestion_jobs_notify_pending
+    AFTER INSERT OR UPDATE OF status ON ingestion_jobs
+    FOR EACH ROW WHEN (NEW.status = 'pending')
+    EXECUTE FUNCTION notify_ingestion_job_pending();
+
+-- A stale in_progress job (its reader stopped without finishing) is reclaimed
+-- and counts another attempt; one that has used its last attempt fails, and
+-- one whose cancel was requested is cancelled, instead of being read again.
 CREATE OR REPLACE FUNCTION claim_ingestion_jobs(
     p_limit INT DEFAULT NULL,
     p_claim_timeout_s INT DEFAULT NULL
@@ -76,6 +110,19 @@ DECLARE
     timeout_s INT := COALESCE(p_claim_timeout_s, get_config_int('ingest.job_claim_timeout_s'), 1800);
     claimed JSONB;
 BEGIN
+    UPDATE ingestion_jobs
+    SET status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'failed' END,
+        error = CASE
+            WHEN cancel_requested THEN COALESCE(error, 'cancelled')
+            ELSE concat_ws('; ', error, format(
+                'reading stopped without finishing on attempt %s of %s', attempts, max_attempts))
+        END,
+        completed_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE status = 'in_progress'
+      AND claimed_at < CURRENT_TIMESTAMP - make_interval(secs => timeout_s)
+      AND (cancel_requested OR attempts >= max_attempts);
+
     WITH candidate AS (
         SELECT id FROM ingestion_jobs
         WHERE (status = 'pending' AND next_attempt_at <= CURRENT_TIMESTAMP)
@@ -99,12 +146,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- A job cancelled while its last chunk was being read ends cancelled, keeping
+-- the result of what was read.
 CREATE OR REPLACE FUNCTION complete_ingestion_job(
     p_job_id UUID,
     p_result JSONB DEFAULT '{}'::jsonb
 ) RETURNS JSONB AS $$
     UPDATE ingestion_jobs
-    SET status = 'completed',
+    SET status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'completed' END,
         result = COALESCE(p_result, '{}'::jsonb),
         error = NULL,
         completed_at = CURRENT_TIMESTAMP,

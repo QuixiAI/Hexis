@@ -787,3 +787,16 @@ async def test_chat_session_artifacts_list_title_and_fork(db_pool):
 
     assert missing["found"] is False
     assert missing["reason"] == "not_found"
+
+
+async def test_chat_turn_lease_functions(db_pool):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM chat_turn_leases")
+        assert await conn.fetchval("SELECT chat_turn_active()") is False
+        await conn.fetchval("SELECT chat_turn_begin('s1', 60)")
+        assert await conn.fetchval("SELECT chat_turn_active()") is True
+        await conn.fetchval("SELECT chat_turn_begin('s2', 60)")
+        await conn.execute("UPDATE chat_turn_leases SET expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE session_id = 's2'")
+        await conn.fetchval("SELECT chat_turn_end('s1')")
+        assert await conn.fetchval("SELECT chat_turn_active()") is False, "an expired lease does not count"
+        assert await conn.fetchval("SELECT count(*) FROM chat_turn_leases") == 0

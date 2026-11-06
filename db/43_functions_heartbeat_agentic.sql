@@ -100,7 +100,12 @@ AS $$
 DECLARE
     memory_id UUID;
     item RECORD;
+    hb_number INTEGER;
 BEGIN
+    SELECT active_heartbeat_number INTO hb_number
+    FROM heartbeat_state
+    WHERE id = 1 AND active_heartbeat_id::text = p_heartbeat_id;
+
     -- 1. Record the heartbeat as an episodic memory. Best-effort: a memory
     --    failure (e.g. embedding service down) must not block finalization.
     --    (The pre-move Python call used the wrong arg names/types — p_action and
@@ -111,6 +116,7 @@ BEGIN
             p_action_taken := to_jsonb('heartbeat'::text),
             p_context := jsonb_build_object(
                 'heartbeat_id', p_heartbeat_id,
+                'heartbeat_number', hb_number,
                 'energy_spent', p_energy_spent,
                 'tool_calls', p_tool_call_count,
                 'stopped_reason', p_stopped_reason,

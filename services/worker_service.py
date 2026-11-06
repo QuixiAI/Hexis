@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import socket
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -48,6 +49,7 @@ from services.connector_cognition import (
     run_user_model_synthesis_step,
 )
 from services.gmail_backfill import run_gmail_backfill_step
+from services.google_drive import run_drive_import_step
 from services.ambient_responsibilities import run_ambient_responsibility_step
 from services.summarization import run_memory_summarization_step
 from services.skill_improvement import (
@@ -895,14 +897,15 @@ class MaintenanceWorker:
             ("memory_summarization", self._run_memory_rest_if_enabled),
             ("retention_surface", self._run_retention_surface),
             ("conscious_extraction", self._run_extraction_if_enabled),
+            ("transcript_retention", self._run_transcript_retention_if_due),
             ("origin_seed", self._run_origin_seed_if_enabled),
             ("skill_improvement", self._run_skill_improvement_if_due),
             ("learning_skill_application", self._run_approved_learning_skill),
             ("gmail_backfill", self._run_gmail_backfill_jobs),
+            ("google_drive_import", self._run_drive_import_jobs),
             ("channel_backfill", self._run_channel_backfill_jobs),
             ("connector_cognition", self._run_connector_cognition),
             ("belief_update_retention", self._prune_belief_update_log),
-            ("ingestion_jobs", self._run_ingestion_jobs),
         ]
 
     async def _prune_belief_update_log(self) -> dict[str, Any]:
@@ -1148,18 +1151,6 @@ class MaintenanceWorker:
             logger.info("Contradiction review digest: %s", result)
         return result
 
-    async def _run_ingestion_jobs(self) -> dict[str, Any]:
-        """Durable ingestion jobs (#87): the queue table is the state — no
-        state-doc gate, matching outbox delivery."""
-        if not self.pool:
-            return {"skipped": True, "reason": "no_pool"}
-        from services.ingest.jobs import run_ingestion_jobs_step
-
-        handled = await run_ingestion_jobs_step(self.pool)
-        if handled:
-            return {"handled": handled}
-        return {"skipped": True, "reason": "no_due_ingestion_jobs"}
-
     async def _run_gmail_backfill_jobs(self) -> dict[str, Any]:
         if not self.pool:
             return {"skipped": True, "reason": "no_pool"}
@@ -1168,6 +1159,15 @@ class MaintenanceWorker:
             logger.info("Gmail connector backfill jobs handled: %s", handled)
             return {"handled": handled}
         return {"skipped": True, "reason": "no_due_gmail_backfill_jobs"}
+
+    async def _run_drive_import_jobs(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        handled = await run_drive_import_step(self.pool)
+        if handled:
+            logger.info("Google Drive imports handled: %s", handled)
+            return {"handled": handled}
+        return {"skipped": True, "reason": "no_due_google_drive_imports"}
 
     async def _run_channel_backfill_jobs(self) -> dict[str, Any]:
         if not self.pool:
@@ -1268,18 +1268,39 @@ class MaintenanceWorker:
         the pipeline never blocks on the embedding sidecar)."""
         if not self.pool:
             return {"skipped": True, "reason": "no_pool"}
-        async with self.pool.acquire() as conn:
-            result = await run_source_chunk_embed_step(conn)
+        result = await self._drain(run_source_chunk_embed_step)
         if not result.get("skipped"):
             logger.info("Source chunk embed step: %s", result)
         return result
+
+    async def _drain(self, step, budget_seconds: float = 60.0) -> dict[str, Any]:
+        """Run an embed step until its backlog is empty or the time budget is
+        spent, so new memories become searchable as fast as they are created
+        instead of one batch per maintenance tick."""
+        totals: dict[str, Any] = {}
+        deadline = time.monotonic() + budget_seconds
+        batches = 0
+        while True:
+            async with self.pool.acquire() as conn:
+                result = await step(conn)
+            if result.get("skipped"):
+                break
+            batches += 1
+            for key, value in result.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    totals[key] = totals.get(key, 0) + value
+            if not result.get("claimed") or time.monotonic() >= deadline:
+                break
+        if not batches:
+            return result
+        totals["batches"] = batches
+        return totals
 
     async def _run_memory_embedding(self) -> dict[str, Any]:
         """Embed pending durable memories off the memory-creation path."""
         if not self.pool:
             return {"skipped": True, "reason": "no_pool"}
-        async with self.pool.acquire() as conn:
-            result = await run_memory_embed_step(conn)
+        result = await self._drain(run_memory_embed_step)
         if not result.get("skipped"):
             logger.info("Memory embed step: %s", result)
         return result
@@ -1307,6 +1328,31 @@ class MaintenanceWorker:
             return {"skipped": True, "reason": "no_pool"}
         async with self.pool.acquire() as conn:
             return await publish_retention_surface(conn)
+
+    async def _run_transcript_retention_if_due(self) -> dict[str, Any]:
+        """Once a day, delete raw transcripts past their retention limits
+        (db: run_transcript_retention; memories are not affected)."""
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        async with self.pool.acquire() as conn:
+            due = await conn.fetchval(
+                """
+                SELECT COALESCE(
+                    (SELECT (value #>> '{}')::timestamptz FROM config
+                     WHERE key = 'retention.transcripts_last_run'),
+                    '-infinity'::timestamptz) < CURRENT_TIMESTAMP - INTERVAL '1 day'
+                """
+            )
+            if not due:
+                return {"skipped": True, "reason": "ran_today"}
+            raw = await conn.fetchval("SELECT run_transcript_retention()")
+            result = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            await conn.execute(
+                "SELECT set_config('retention.transcripts_last_run', to_jsonb(CURRENT_TIMESTAMP::text))"
+            )
+        if isinstance(result, dict) and any(isinstance(v, int) and v for v in result.values()):
+            logger.info("Transcript retention: %s", result)
+        return result if isinstance(result, dict) else {}
 
     async def _run_extraction_if_enabled(self) -> dict[str, Any]:
         """Sweep conscious episodes (chat turns + heartbeat episodes) into
@@ -1530,9 +1576,16 @@ async def _amain(mode: str, instance: str | None = None) -> None:
     # Build the gateway consumer
     consumer = GatewayConsumer(consumer_pool, poll_interval=POLL_INTERVAL)
 
+    from services.ingest_worker import IngestWorker
+
+    # Reading has its own loop: it LISTENs for queued documents and reads them
+    # as they arrive, so a document never waits behind the maintenance steps.
+    ingest_worker = IngestWorker(instance)
+
     def _stop_all():
         hb_timer.stop()
         maint_worker.stop()
+        ingest_worker.stop()
         consumer.stop()
 
     heartbeat_handler = create_heartbeat_handler(
@@ -1562,10 +1615,14 @@ async def _amain(mode: str, instance: str | None = None) -> None:
             await asyncio.gather(hb_timer.run(), consumer.run())
         elif mode == "maintenance":
             await maint_worker.run()
+        elif mode == "ingest":
+            await ingest_worker.run()
         elif mode == "both":
-            await asyncio.gather(hb_timer.run(), consumer.run(), maint_worker.run())
+            await asyncio.gather(
+                hb_timer.run(), consumer.run(), maint_worker.run(), ingest_worker.run()
+            )
         else:
-            raise ValueError("mode must be one of: heartbeat, maintenance, both")
+            raise ValueError("mode must be one of: heartbeat, maintenance, ingest, both")
     finally:
         # Cleanup consumer resources
         if mcp_manager:
@@ -1588,7 +1645,7 @@ def main() -> int:
     )
     p.add_argument(
         "--mode",
-        choices=["heartbeat", "maintenance", "both"],
+        choices=["heartbeat", "maintenance", "ingest", "both"],
         default=os.getenv("HEXIS_WORKER_MODE", "both"),
         help="Which worker to run.",
     )

@@ -29,7 +29,8 @@ SET search_path = public, ag_catalog, "$user";
 """
 
 
-def main() -> None:
+def render() -> tuple[str, int]:
+    """The seed file's text and how many modules it holds."""
     blocks = [HEADER]
     files = sorted(PROMPTS.glob("*.md"))
 
@@ -62,7 +63,12 @@ def main() -> None:
             emit(f"personhood.{key}", block, "services/prompts/personhood.md")
             n_modules += 1
 
-    OUT.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+    return "\n\n".join(blocks) + "\n", n_modules
+
+
+def main() -> None:
+    text, n_modules = render()
+    OUT.write_text(text, encoding="utf-8")
     print(f"Wrote {OUT.relative_to(ROOT)}: {n_modules} modules, {OUT.stat().st_size} bytes")
 
 

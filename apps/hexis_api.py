@@ -24,6 +24,7 @@ import html
 import json
 import logging
 import os
+import re
 import time
 import uuid
 import urllib.parse
@@ -46,6 +47,7 @@ from core.cli_api import status_payload_rich
 from core.gateway import EventSource, Gateway
 from core.rabbitmq_bridge import RabbitMQBridge
 from core.tools import create_default_registry, create_full_registry
+from core.chat_priority import begin_chat_turn, end_chat_turn
 from services.chat import resolve_prompt_addenda, stream_chat_events
 
 logger = logging.getLogger(__name__)
@@ -359,6 +361,36 @@ class InitAuthCompleteRequest(BaseModel):
     authorization_input: str
 
 
+class InitAuthTokenRequest(BaseModel):
+    provider: str
+    token: str = Field(max_length=4096)
+
+
+class InitAuthForgetRequest(BaseModel):
+    provider: str
+
+
+class InitLlmRoleConfig(BaseModel):
+    provider: str = ""
+    model: str = ""
+    endpoint: str = ""
+    api_key: str = ""
+
+
+class InitLlmSetupRequest(BaseModel):
+    conscious: InitLlmRoleConfig
+    subconscious: InitLlmRoleConfig | None = None
+    reuse_primary: bool = False
+
+
+class InitLlmRoleRequest(BaseModel):
+    role: Literal["conscious", "subconscious"] = "conscious"
+    provider: str = ""
+    model: str = ""
+    endpoint: str = ""
+    api_key: str = ""
+
+
 # ---------------------------------------------------------------------------
 # SSE helpers
 # ---------------------------------------------------------------------------
@@ -636,6 +668,106 @@ async def init_auth_complete(req: InitAuthCompleteRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/init/auth/setup-token")
+async def init_auth_setup_token(req: InitAuthTokenRequest):
+    """Store a pasted subscription token (a Claude Code setup token)."""
+    try:
+        return auth_flow_coordinator.save_token(req.provider, req.token)
+    except AuthFlowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/init/auth/forget")
+async def init_auth_forget(req: InitAuthForgetRequest):
+    """Delete a stored sign-in or token at the user's request."""
+    try:
+        return auth_flow_coordinator.forget(req.provider)
+    except AuthFlowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Model setup (the Python side owns keys and config; the UI only proxies)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/init/llm")
+async def init_llm_setup(req: InitLlmSetupRequest):
+    """Save both model roles: typed keys to the auth store, config to the DB."""
+    from core.init_api import save_llm_setup
+
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    roles = {
+        "conscious": req.conscious.model_dump(),
+        "subconscious": (req.subconscious or req.conscious).model_dump(),
+    }
+    try:
+        result = await save_llm_setup(pool, roles, reuse_primary=req.reuse_primary)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/init/llm/models")
+async def init_llm_models(req: InitLlmRoleRequest):
+    """Model ids the chosen endpoint lists with the resolved credential."""
+    from core.init_api import list_models
+
+    return JSONResponse(jsonable_encoder(await list_models(req.role, req.model_dump())))
+
+
+@app.post("/api/init/llm/test")
+async def init_llm_test(req: InitLlmRoleRequest):
+    """One tiny real call with the form's provider, model and credential."""
+    from core.init_api import test_llm_setup
+
+    return JSONResponse(jsonable_encoder(await test_llm_setup(req.role, req.model_dump())))
+
+
+class InitLlmCompleteRequest(BaseModel):
+    system: str = ""
+    user: str
+    temperature: float = 0.3
+    max_tokens: int = Field(default=4000, ge=1, le=32000)
+    json_mode: bool = False
+
+
+@app.post("/api/init/llm/complete")
+async def init_llm_complete(req: InitLlmCompleteRequest):
+    """One plain completion with the conscious model, for setup helpers such
+    as the character-card importer. The dashboard never holds a key."""
+    from core.llm import chat_completion
+    from core.llm_config import resolve_llm_config
+
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        config = await resolve_llm_config(pool, "llm.chat", fallback_key="llm.heartbeat")
+        if not config.get("model"):
+            return JSONResponse({"error": "LLM not configured. Complete the Models step first."}, status_code=400)
+        messages: list[dict[str, Any]] = []
+        if req.system.strip():
+            messages.append({"role": "system", "content": req.system})
+        messages.append({"role": "user", "content": req.user})
+        result = await chat_completion(
+            provider=config["provider"],
+            model=config["model"],
+            endpoint=config.get("endpoint"),
+            api_key=config.get("api_key"),
+            auth_mode=config.get("auth_mode"),
+            messages=messages,
+            temperature=req.temperature,
+            max_tokens=req.max_tokens,
+            response_format={"type": "json_object"} if req.json_mode else None,
+        )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc).strip() or type(exc).__name__}, status_code=502)
+    return JSONResponse({"content": result.get("content") or "", "provider": config["provider"], "model": config["model"]})
+
+
 @app.get("/api/init/models/openai-codex")
 async def init_openai_codex_models():
     """Return the authenticated workspace catalog minus recent hard rejections."""
@@ -837,9 +969,10 @@ async def _handle_gmail_oauth_callback(request: Request) -> HTMLResponse:
         )
 
     account = completed.display_name or completed.account_key
+    service = "Google Drive" if getattr(completed, "connector_id", "gmail") == "google_drive" else "Gmail"
     return _gmail_callback_page(
-        title="Gmail connected",
-        message=f"{account} is connected to Hexis with the Gmail permissions you approved.",
+        title=f"{service} connected",
+        message=f"{account} is connected to Hexis with the {service} permissions you approved.",
         status="connected",
     )
 
@@ -1125,6 +1258,124 @@ async def _integration_status_payload(
     }
     payload["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return payload
+
+
+class DriveFolderRequest(BaseModel):
+    link: str = ""
+    id: str = ""
+
+
+def _drive_error(exc: Exception) -> JSONResponse:
+    # Codes for the page to explain; Google's own message otherwise.
+    message = str(exc)
+    code = message if re.fullmatch(r"[a-z_]+", message) else "drive_error"
+    return JSONResponse({"error_code": code, "error": message}, status_code=400)
+
+
+@app.get("/api/integrations/google_drive")
+async def google_drive_status_endpoint():
+    from services.google_drive import status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/connect")
+async def google_drive_connect_endpoint():
+    """Start Google sign-in for read-only Drive access; returns Google's page."""
+    from core.auth.google_gmail import GmailOAuthError, start_gmail_oauth
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        started = await start_gmail_oauth(_pool, connector_id="google_drive", source_channel="web")
+    except GmailOAuthError as exc:
+        return JSONResponse({"error_code": "drive_error", "error": str(exc)}, status_code=400)
+    if isinstance(started, dict):
+        # No Google sign-in client yet; it is set up once, on the Gmail card.
+        return JSONResponse({"error_code": "needs_google_setup"}, status_code=409)
+    return {"authorization_url": started.attempt_payload.get("authorization_url")}
+
+
+@app.post("/api/integrations/google_drive/disconnect")
+async def google_drive_disconnect_endpoint():
+    from services.google_drive import disconnect, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    await disconnect(_pool)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/folders")
+async def google_drive_add_folder_endpoint(req: DriveFolderRequest):
+    from services.google_drive import DriveError, add_folder, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        await add_folder(_pool, req.link)
+    except DriveError as exc:
+        return _drive_error(exc)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/folders/remove")
+async def google_drive_remove_folder_endpoint(req: DriveFolderRequest):
+    from services.google_drive import remove_folder, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    await remove_folder(_pool, req.id)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+@app.post("/api/integrations/google_drive/import")
+async def google_drive_import_endpoint():
+    """Queue an import of the chosen folders; the maintenance worker reads them."""
+    from services.google_drive import DriveError, start_import, status
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        await start_import(_pool)
+    except DriveError as exc:
+        return _drive_error(exc)
+    return JSONResponse(jsonable_encoder(await status(_pool)))
+
+
+class OutreachRequest(BaseModel):
+    destination: str | None = None
+    slack_user_id: str | None = None
+    telegram_chat_id: str | None = None
+
+
+@app.get("/api/outreach")
+async def outreach_status_endpoint():
+    """Where the agent's messages to the user go, and what can reach them."""
+    from core.outreach_destination import state
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    return JSONResponse(jsonable_encoder(await state(_pool)))
+
+
+@app.post("/api/outreach")
+async def outreach_save_endpoint(req: OutreachRequest):
+    from core.outreach_destination import save
+
+    if _pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        return JSONResponse(jsonable_encoder(await save(
+            _pool,
+            destination=req.destination,
+            slack_user_id=req.slack_user_id,
+            telegram_chat_id=req.telegram_chat_id,
+        )))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
 
 
 @app.get("/api/integrations/status")
@@ -1740,6 +1991,9 @@ async def connector_importance(
     total = int(items[0].get("total") or 0) if items else 0
     for item in items:
         item.pop("total", None)
+        # asyncpg returns jsonb as text; the page expects arrays and objects.
+        for key in ("reasons", "recommended_actions", "metadata"):
+            item[key] = _json_value(item.get(key))
     return JSONResponse(
         jsonable_encoder(
             {"items": items, "total": total, "limit": limit, "offset": offset}
@@ -1903,6 +2157,45 @@ async def event_stream():
     )
 
 
+@app.post("/api/heartbeat/pause")
+async def pause_heartbeats():
+    """Stop the agent's own heartbeats (autonomy off)."""
+    return await _set_heartbeat_paused("pause")
+
+
+@app.post("/api/heartbeat/resume")
+async def resume_heartbeats():
+    """Let the agent run its own heartbeats again (autonomy on)."""
+    return await _set_heartbeat_paused("resume")
+
+
+async def _set_heartbeat_paused(action: str):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    async with pool.acquire() as conn:
+        if action == "resume":
+            ready = await conn.fetchval("SELECT is_agent_configured() AND is_init_complete() AND NOT is_agent_terminated()")
+            if not ready:
+                return JSONResponse(
+                    {"error": "Complete initialization before resuming heartbeats."}, status_code=409,
+                )
+        paused = await conn.fetchval(
+            """
+            UPDATE heartbeat_state
+            SET is_paused = $1,
+                -- an overdue heartbeat runs on the next tick after resuming
+                next_heartbeat_at = CASE WHEN $1 THEN next_heartbeat_at
+                                         ELSE LEAST(COALESCE(next_heartbeat_at, CURRENT_TIMESTAMP), CURRENT_TIMESTAMP) END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            RETURNING is_paused
+            """,
+            action == "pause",
+        )
+    return {"heartbeat_paused": bool(paused)}
+
+
 @app.post("/api/heartbeat/run")
 async def run_heartbeat_now():
     """Run an explicit heartbeat and stream its complete observable lifecycle."""
@@ -1916,11 +2209,14 @@ async def run_heartbeat_now():
     )
 
 
+# Manual heartbeats run to completion even if the page that started them
+# closes; the stream only relays their events. Strong references keep the
+# tasks alive until they finish.
+_manual_heartbeat_tasks: set[Any] = set()
+
+
 async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
     import asyncio
-
-    from services.heartbeat_agentic import finalize_heartbeat, run_agentic_heartbeat
-    from services.worker_service import _extract_heartbeat_context
 
     async with pool.acquire() as conn:
         state = await conn.fetchrow("""
@@ -1928,102 +2224,124 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
                    is_init_complete() AS initialized,
                    is_agent_terminated() AS terminated,
                    is_paused,
-                   active_heartbeat_id
+                   heartbeat_in_progress() AS running
             FROM heartbeat_state
             WHERE id = 1
             """)
-        if not state or not state["configured"] or not state["initialized"]:
-            yield _sse_event(
-                "error",
-                {"message": "Complete initialization before running a heartbeat."},
-            )
-            return
-        if state["terminated"]:
-            yield _sse_event(
-                "error",
-                {"message": "The agent is terminated and cannot run a heartbeat."},
-            )
-            return
-        if state["is_paused"]:
-            yield _sse_event(
-                "error",
-                {"message": "Heartbeat is paused. Resume it before running one now."},
-            )
-            return
-        if state["active_heartbeat_id"]:
-            yield _sse_event("error", {"message": "A heartbeat is already running."})
-            return
-
-        raw_payload = await conn.fetchval("SELECT start_heartbeat()")
-        payload = (
-            raw_payload
-            if isinstance(raw_payload, dict)
-            else json.loads(raw_payload)
-            if isinstance(raw_payload, str)
-            else {}
-        )
-        heartbeat_id = str(payload.get("heartbeat_id") or "")
-        if not heartbeat_id:
-            yield _sse_event("error", {"message": "Hexis could not start a heartbeat."})
-            return
-
-        heartbeat_number = payload.get("heartbeat_number")
+    if not state or not state["configured"] or not state["initialized"]:
         yield _sse_event(
-            "heartbeat_start",
-            {
-                "heartbeat_id": heartbeat_id,
-                "heartbeat_number": heartbeat_number,
-            },
+            "error",
+            {"message": "Complete initialization before running a heartbeat."},
         )
-
-        queue: asyncio.Queue[AgentEventData] = asyncio.Queue()
-
-        async def on_event(event: AgentEventData) -> None:
-            await queue.put(event)
-
-        registry = await create_full_registry(pool)
-        context = _extract_heartbeat_context(payload)
-        task = asyncio.create_task(
-            run_agentic_heartbeat(
-                conn,
-                pool=pool,
-                registry=registry,
-                heartbeat_id=heartbeat_id,
-                context=context,
-                on_event=on_event,
-            )
+        return
+    if state["terminated"]:
+        yield _sse_event(
+            "error",
+            {"message": "The agent is terminated and cannot run a heartbeat."},
         )
+        return
+    if state["is_paused"]:
+        yield _sse_event(
+            "error",
+            {"message": "Heartbeat is paused. Resume it before running one now."},
+        )
+        return
+    if state["running"]:
+        yield _sse_event("error", {"message": "A heartbeat is already running."})
+        return
 
-        try:
-            while not task.done() or not queue.empty():
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    continue
-                yield _heartbeat_agent_sse(event)
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    task = asyncio.create_task(_run_manual_heartbeat(pool, queue))
+    _manual_heartbeat_tasks.add(task)
+    task.add_done_callback(_manual_heartbeat_tasks.discard)
 
-            result = await task
-            finalized = await finalize_heartbeat(
-                conn,
-                heartbeat_id=heartbeat_id,
-                result=result,
+    while True:
+        message = await queue.get()
+        if message is None:
+            return
+        yield message
+
+
+async def _run_manual_heartbeat(pool: asyncpg.Pool, queue: "asyncio.Queue[str | None]") -> None:
+    """Start, run and finalize one heartbeat on its own connection, posting SSE
+    messages to ``queue`` and ``None`` when done.
+
+    Runs as its own task so that a closed page (which cancels the stream) never
+    cancels the heartbeat mid-run and leaves its claim active.
+    """
+    from services.heartbeat_agentic import finalize_heartbeat, run_agentic_heartbeat
+    from services.worker_service import _extract_heartbeat_context
+
+    heartbeat_id = ""
+    try:
+        async with pool.acquire() as conn:
+            raw_payload = await conn.fetchval("SELECT start_heartbeat()")
+            payload = (
+                raw_payload
+                if isinstance(raw_payload, dict)
+                else json.loads(raw_payload)
+                if isinstance(raw_payload, str)
+                else {}
             )
-            yield _sse_event(
-                "heartbeat_done",
-                {
-                    "heartbeat_id": heartbeat_id,
-                    "heartbeat_number": heartbeat_number,
-                    "text": result.get("text") or "",
-                    "tool_calls": result.get("tool_calls_made") or [],
-                    "energy_spent": result.get("energy_spent") or 0,
-                    "stopped_reason": result.get("stopped_reason") or "completed",
-                    "memory_id": finalized.get("memory_id"),
-                },
+            heartbeat_id = str(payload.get("heartbeat_id") or "")
+            if not heartbeat_id:
+                # start_heartbeat refuses while another heartbeat runs (one at a time).
+                running = await conn.fetchval("SELECT heartbeat_in_progress()")
+                message = "A heartbeat is already running." if running else "Hexis could not start a heartbeat."
+                await queue.put(_sse_event("error", {"message": message}))
+                return
+
+            heartbeat_number = payload.get("heartbeat_number")
+            await queue.put(
+                _sse_event(
+                    "heartbeat_start",
+                    {
+                        "heartbeat_id": heartbeat_id,
+                        "heartbeat_number": heartbeat_number,
+                    },
+                )
             )
-        except Exception as exc:
-            logger.exception("Manual heartbeat failed")
-            await conn.fetchval("SELECT release_active_heartbeat($1)", heartbeat_id)
-            yield _sse_event("error", {"message": str(exc)})
+
+            async def on_event(event: AgentEventData) -> None:
+                await queue.put(_heartbeat_agent_sse(event))
+
+            try:
+                registry = await create_full_registry(pool)
+                result = await run_agentic_heartbeat(
+                    conn,
+                    pool=pool,
+                    registry=registry,
+                    heartbeat_id=heartbeat_id,
+                    context=_extract_heartbeat_context(payload),
+                    on_event=on_event,
+                )
+                finalized = await finalize_heartbeat(
+                    conn,
+                    heartbeat_id=heartbeat_id,
+                    result=result,
+                )
+            except BaseException:
+                await conn.fetchval("SELECT release_active_heartbeat($1)", heartbeat_id)
+                raise
+            await queue.put(
+                _sse_event(
+                    "heartbeat_done",
+                    {
+                        "heartbeat_id": heartbeat_id,
+                        "heartbeat_number": heartbeat_number,
+                        "text": result.get("text") or "",
+                        "tool_calls": result.get("tool_calls_made") or [],
+                        "energy_spent": result.get("energy_spent") or 0,
+                        "stopped_reason": result.get("stopped_reason") or "completed",
+                        "memory_id": finalized.get("memory_id"),
+                    },
+                )
+            )
+    except Exception as exc:
+        logger.exception("Manual heartbeat failed")
+        await queue.put(_sse_event("error", {"message": str(exc)}))
+    finally:
+        await queue.put(None)
 
 
 def _heartbeat_agent_sse(event: AgentEventData) -> str:
@@ -3068,7 +3386,14 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     failure_message = "Unknown error"
     reasoning_last_sent = 0.0
     visual_attachment_count = len(req.visual_attachments or [])
+    # One chat turn ends in a visible error, never a spinner: the agent loop
+    # stops itself after its own limit, and this outer bound catches a model
+    # call that hangs before or after it. Chat also comes first: the turn
+    # holds a lease so background model calls wait instead of competing.
+    turn_timeout_s = await _chat_turn_timeout_s(pool)
+    await begin_chat_turn(pool, session_id, ttl_seconds=int(turn_timeout_s or 360))
     citation_sources = {}
+    question_asked = False
 
     def build_done_payload() -> dict[str, Any]:
         payload: dict[str, Any] = {"assistant": full_text, "session_id": session_id}
@@ -3076,6 +3401,10 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             payload["presentation"] = presentation_from_text(
                 full_text, citation_sources.values()
             ).to_dict()
+        # The final event says plainly when the turn produced no answer, so a
+        # client never has to infer failure from an empty bubble.
+        elif not question_asked:
+            payload["error"] = "The model returned no answer."
         return payload
 
     def build_failed_payload() -> dict[str, Any]:
@@ -3101,7 +3430,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 },
             )
 
-        async for event in stream_chat_events(
+        events = stream_chat_events(
             user_message=user_message,
             history=history,
             session_id=session_id,
@@ -3122,7 +3451,8 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 attachment.model_dump(exclude_none=True)
                 for attachment in (req.attachments or [])[:16]
             ],
-        ):
+        )
+        async for event in _with_turn_deadline(events, turn_timeout_s):
             if event.event == AgentEvent.PHASE_CHANGE:
                 phase = event.data.get("phase", "")
                 status = event.data.get("status", "")
@@ -3252,6 +3582,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 yield _sse_event("ui", event.data)
 
             elif event.event == AgentEvent.QUESTION:
+                question_asked = True
                 yield _sse_event("question", event.data)
 
             elif event.event == AgentEvent.CLAIM_FLAGGED:
@@ -3323,6 +3654,14 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             else:
                 yield _sse_event("done", build_done_payload())
 
+    except _ChatTurnTimeout:
+        logger.error("Chat turn exceeded chat.turn_timeout_s (%ss)", turn_timeout_s)
+        if not done_sent:
+            failure_message = f"No answer within {int(turn_timeout_s)} seconds. The model may be overloaded."
+            yield _sse_event("error", {"message": failure_message})
+            if conscious_started:
+                yield _sse_event("phase_end", {"phase": active_stream_phase})
+            yield _sse_event("failed", build_failed_payload())
     except Exception as exc:
         logger.exception("Chat stream error")
         if done_sent:
@@ -3334,6 +3673,47 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         if conscious_started:
             yield _sse_event("phase_end", {"phase": active_stream_phase})
         yield _sse_event("failed", build_failed_payload())
+    finally:
+        await end_chat_turn(pool, session_id)
+
+
+class _ChatTurnTimeout(Exception):
+    """The outer chat turn limit (chat.turn_timeout_s) passed."""
+
+
+async def _chat_turn_timeout_s(pool: Any) -> float:
+    """Outer time limit for one chat turn; 0 disables it."""
+    try:
+        async with pool.acquire() as conn:
+            raw = await conn.fetchval("SELECT get_config_float('chat.turn_timeout_s')")
+        return max(0.0, float(raw)) if raw is not None else 360.0
+    except Exception:
+        return 360.0
+
+
+async def _with_turn_deadline(events: AsyncIterator[Any], timeout_s: float) -> AsyncIterator[Any]:
+    """Yield the turn's events, raising _ChatTurnTimeout once the deadline passes.
+
+    The deadline covers the whole turn, however long any one event takes:
+    each wait is capped by what is left of it.
+    """
+    if not timeout_s:
+        async for event in events:
+            yield event
+        return
+    deadline = time.monotonic() + timeout_s
+    iterator = events.__aiter__()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _ChatTurnTimeout()
+        try:
+            event = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError as exc:
+            raise _ChatTurnTimeout() from exc
+        yield event
 
 
 def _resolve_fallback_api_key(provider: str, role: str) -> str | None:
@@ -3350,7 +3730,6 @@ def _resolve_fallback_api_key(provider: str, role: str) -> str | None:
     # Then provider-specific conventional env vars.
     mapping = {
         "openai": "OPENAI_API_KEY",
-        "atlascloud": "ATLASCLOUD_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "grok": "XAI_API_KEY",
         "gemini": "GEMINI_API_KEY",
@@ -3500,6 +3879,7 @@ async def init_consent_request(req: InitConsentRequest):
 
     # Resolve OAuth (Codex) + check for existing records.
     existing: dict[str, Any] | None = None
+    auth_mode: str | None = None
     if provider == "openai-codex":
         async with pool.acquire() as conn:
             from core.auth.openai_codex import ensure_fresh_openai_codex_credentials
@@ -3531,16 +3911,26 @@ async def init_consent_request(req: InitConsentRequest):
                     )
                 )
     else:
-        # Resolve API key for non-OAuth providers
+        # Resolve the credential the way the running agent will: a typed key,
+        # else the key saved by setup, else the environment, else a sign-in
+        # or setup token.
+        from core.init_api import API_KEY_REQUIRED, OAUTH_PROVIDERS, resolve_setup_credentials
+
         if not api_key:
             api_key = _resolve_fallback_api_key(provider, role)
+        try:
+            resolved = await resolve_setup_credentials(role, {
+                "provider": provider, "model": model, "endpoint": endpoint or "", "api_key": api_key or "",
+            })
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        api_key = resolved.get("api_key") or api_key
+        auth_mode = resolved.get("auth_mode")
+        if provider in OAUTH_PROVIDERS:
+            endpoint = resolved.get("endpoint") or endpoint
 
         # Fail early if we need a key (unless mocked).
-        if (
-            not use_mock_consent
-            and provider in {"openai", "atlascloud", "anthropic", "grok", "gemini"}
-            and not api_key
-        ):
+        if not use_mock_consent and provider in API_KEY_REQUIRED and not api_key:
             return JSONResponse({"error": "Missing API key"}, status_code=400)
 
         async with pool.acquire() as conn:
@@ -3641,6 +4031,7 @@ async def init_consent_request(req: InitConsentRequest):
                 model=model,
                 endpoint=endpoint,
                 api_key=api_key,
+                auth_mode=auth_mode,
                 messages=messages,
                 tools=[sign_consent_tool],
                 temperature=0.2,

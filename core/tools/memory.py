@@ -479,10 +479,11 @@ class RememberHandler(ToolHandler):
         return ToolSpec(
             name="remember",
             description=(
-                "Store a durable memory. Equivalent recent writes in the same "
-                "chat session reuse the existing memory. Use this to save important "
-                "information, "
-                "events, or learnings for future recall. When the memory comes "
+                "Store a durable memory: one fact or conclusion per call, never a "
+                "bundle. What people say in conversation is encoded automatically "
+                "afterwards, so use this when asked to remember something or for "
+                "your own conclusions. Equivalent recent writes in the same chat "
+                "session reuse the existing memory. When the memory comes "
                 "from a document, conversation, or other source, cite it in "
                 "`sources` — provenance is what makes a belief revisable and "
                 "explainable later."
@@ -2282,8 +2283,11 @@ class QueueUserMessageHandler(ToolHandler):
         return ToolSpec(
             name="queue_user_message",
             description=(
-                "Queue a user-facing note. In chat, this delivers immediately "
-                "to the dashboard inbox; in heartbeat, it queues for the normal outbox relay."
+                "Send the user a note. It always reaches the dashboard inbox, and also "
+                "their Slack DM, Telegram chat or email, depending on Settings -> Messages. "
+                "When they let you choose and several are set up, pick with `channel`: a "
+                "chat app for quick things, email for longer or less urgent ones. The "
+                "result says where it went."
             ),
             parameters={
                 "type": "object",
@@ -2295,6 +2299,11 @@ class QueueUserMessageHandler(ToolHandler):
                     "intent": {
                         "type": "string",
                         "description": "Optional intent/category (e.g. 'reminder', 'status', 'question').",
+                    },
+                    "channel": {
+                        "type": "string",
+                        "enum": ["slack", "telegram", "email", "inbox"],
+                        "description": "Where to send it, when the user lets you choose. Omit for the default.",
                     },
                 },
                 "required": ["message"],
@@ -2321,6 +2330,30 @@ class QueueUserMessageHandler(ToolHandler):
         intent = arguments.get("intent")
 
         try:
+            from core.outreach_destination import choose
+
+            channel, current = await choose(context.registry.pool, arguments.get("channel"))
+            if channel != "inbox":
+                # The outbox tees every user message to the dashboard inbox and
+                # sends it on to the chosen channel (channels/outbox.py).
+                async with context.registry.pool.acquire() as conn:
+                    outbox_id = await conn.fetchval(
+                        "SELECT queue_outbox_message($1::text, $2::text, 'tool', $3::jsonb)",
+                        message,
+                        intent,
+                        json.dumps({"mode": "user", "channel": channel}),
+                    )
+                return ToolResult.success_result(
+                    output={
+                        "queued": True,
+                        "outbox_id": str(outbox_id),
+                        "delivered_to": [channel, "inbox"],
+                        "channels_available": current["available"],
+                        "message": message[:50],
+                    },
+                    display_output=f"Sending to the user's {channel} and inbox: {message[:50]}...",
+                )
+
             async with context.registry.pool.acquire() as conn:
                 if context.tool_context == ToolContext.CHAT:
                     raw = await conn.fetchval(
@@ -2348,7 +2381,12 @@ class QueueUserMessageHandler(ToolHandler):
                 display = f"Queued message: {message[:50]}..."
 
             return ToolResult.success_result(
-                output={**result, "message": message[:50]},
+                output={
+                    **result,
+                    "delivered_to": ["inbox"],
+                    "channels_available": current["available"],
+                    "message": message[:50],
+                },
                 display_output=display,
             )
 

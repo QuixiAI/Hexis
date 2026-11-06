@@ -168,20 +168,19 @@ class GenerateImageHandler(ToolHandler):
         style: str,
         quality: str,
     ) -> dict[str, Any]:
-        """Call the OpenAI Images API."""
-        try:
-            import openai
-        except ImportError:
-            raise RuntimeError("openai package is required for image generation (pip install openai).")
+        """Call the OpenAI Images API through LiteLLM."""
+        from core.llm import litellm
 
-        client = openai.AsyncOpenAI(api_key=api_key)
-        response = await client.images.generate(
-            model="dall-e-3",
+        if litellm is None:
+            raise RuntimeError("The litellm package is required for image generation (pip install litellm).")
+        response = await litellm.aimage_generation(
+            model="openai/dall-e-3",
             prompt=prompt,
             size=size,
             style=style,
             quality=quality,
             n=1,
+            api_key=api_key,
         )
         image = response.data[0]
         return {

@@ -7,14 +7,15 @@ import pytest
 
 
 class TestChatRLMFlagDefault:
-    """Verify that chat.use_rlm defaults to true."""
+    """chat.use_rlm is off by default: the REPL prompt carries no persona or
+    memory context, so every chat turn goes through the agent loop. The RLM
+    chat path stays available as an opt-in."""
 
     @pytest.mark.asyncio(loop_scope="session")
-    async def test_chat_rlm_flag_defaults_true(self, db_pool):
-        """chat.use_rlm defaults to true."""
+    async def test_chat_rlm_flag_defaults_false(self, db_pool):
         async with db_pool.acquire() as conn:
             result = await conn.fetchval("SELECT get_config_bool('chat.use_rlm')")
-            assert result is True
+            assert result is False
 
 
 class TestRLMChatSession:
@@ -78,7 +79,7 @@ class TestRLMChatLoop:
             "FINAL(Hi hon.)",
         ])
 
-        async def fake_completion(messages, llm_config, max_tokens=4096):
+        async def fake_completion(messages, llm_config, max_tokens=4096, **_kwargs):
             return next(responses)
 
         monkeypatch.setattr(rlm, "_llm_completion", fake_completion)
@@ -109,7 +110,7 @@ class TestRLMChatLoop:
         import services.hexis_rlm as rlm
         from services.rlm_repl import HexisLocalREPL
 
-        async def fake_completion(messages, llm_config, max_tokens=4096):
+        async def fake_completion(messages, llm_config, max_tokens=4096, **_kwargs):
             return """```repl
 response = "Hi hon."
 ```

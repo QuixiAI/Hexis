@@ -268,3 +268,17 @@ BEGIN
     );
 END;
 $$;
+
+-- "Scheduled. I'll remind you…" with no reminder behind it is caught: the
+-- scheduling pattern used to match only "I (have) scheduled / set up a
+-- reminder", not a bare "Scheduled." or the promise "I'll remind you".
+INSERT INTO action_claim_patterns (claim_kind, pattern, satisfied_by_tools, notes)
+SELECT 'scheduled', v.pattern,
+       ARRAY['schedule_task','update_scheduled_task','manage_schedule','calendar_create','calendar_update','manage_responsibility'],
+       v.notes
+FROM (VALUES
+    ('^\s*(scheduled|reminder (is |has been )?set|all set)\M', 'Bare confirmation: "Scheduled." / "Reminder set."'),
+    ('\mI(''|’)ll (remind|ping|nudge) you\M', 'A promise to remind claims a reminder exists'),
+    ('\mI(''ve| have) set (a|the|your|that) reminder\M', 'Set a reminder')
+) AS v(pattern, notes)
+WHERE NOT EXISTS (SELECT 1 FROM action_claim_patterns p WHERE p.pattern = v.pattern);

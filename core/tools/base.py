@@ -407,6 +407,15 @@ class ToolHandler(ABC):
         """
         ...
 
+    async def readiness(self, context: "ToolExecutionContext | None" = None) -> str | None:
+        """None when the tool can run now; otherwise the setup step it needs.
+
+        Tools that depend on credentials or a connected account override this,
+        so a capability answer reflects what is connected rather than what is
+        installed.
+        """
+        return None
+
     def validate(self, arguments: dict[str, Any]) -> list[str]:
         """
         Validate arguments against schema.

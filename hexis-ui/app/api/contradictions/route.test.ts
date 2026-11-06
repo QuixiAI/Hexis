@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 import { GET } from "./route";
 import { prisma } from "@/lib/prisma";
@@ -18,7 +19,7 @@ describe("/api/contradictions", () => {
     ]);
 
     const response = await GET(
-      new Request("http://localhost/api/contradictions?status=resolved")
+      new NextRequest("http://localhost/api/contradictions?status=resolved")
     );
 
     expect(response.status).toBe(200);
@@ -33,7 +34,7 @@ describe("/api/contradictions", () => {
 
   it("rejects unknown ledger states without querying", async () => {
     const response = await GET(
-      new Request("http://localhost/api/contradictions?status=deleted")
+      new NextRequest("http://localhost/api/contradictions?status=deleted")
     );
 
     expect(response.status).toBe(422);

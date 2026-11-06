@@ -22,6 +22,13 @@ BEGIN
         RETURN NULL;
     END IF;
 
+    -- One heartbeat at a time: the timer, the dashboard and the CLI all start
+    -- here, so take the row first and refuse while another is running.
+    PERFORM 1 FROM heartbeat_state WHERE id = 1 FOR UPDATE;
+    IF heartbeat_in_progress() THEN
+        RETURN NULL;
+    END IF;
+
     PERFORM ensure_emotion_bootstrap();
     PERFORM ensure_self_node();
     PERFORM ensure_current_life_chapter();

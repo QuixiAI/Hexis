@@ -43,16 +43,19 @@ async def test_embedded_memory_invariant_is_enforced_at_write(db_pool):
     assert "vector_norm(embedding)" in constraint
 
 
-async def test_memory_ann_query_is_eligible_for_partial_hnsw_index(db_pool):
+async def test_memory_ann_query_is_eligible_for_the_hnsw_index(db_pool):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
             # On an empty or tiny test database PostgreSQL reasonably prefers a
-            # sequential scan. Disabling it for this EXPLAIN proves that the
-            # predicate is eligible for the partial HNSW index; production use
-            # is separately observable through pg_stat_user_indexes.idx_scan.
+            # sequential scan, or a cheaper btree index plus a sort. Disabling
+            # both for this EXPLAIN proves that the query is eligible for the
+            # HNSW index (which is no longer partial, so every similarity query
+            # can use it); production use is separately observable through
+            # pg_stat_user_indexes.idx_scan.
             await conn.execute("SET LOCAL enable_seqscan = off")
+            await conn.execute("SET LOCAL enable_sort = off")
             query_vector = await conn.fetchval(
                 "SELECT array_fill(0.1::float, ARRAY[embedding_dimension()])::vector::text"
             )

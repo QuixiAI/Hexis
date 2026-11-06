@@ -88,6 +88,12 @@ def _target_allowed(config: dict[str, Any], key: str, target: Any) -> bool:
 class DiscordSendHandler(ToolHandler):
     """Send messages to Discord via webhook or bot API."""
 
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        config = (self._config_resolver() if self._config_resolver else None) or {}
+        if config.get("webhook_url") or config.get("bot_token"):
+            return None
+        return "Discord is not configured. Set a Discord webhook URL or bot token."
+
     def __init__(
         self,
         config_resolver: Callable[[], dict[str, Any] | None] | None = None,
@@ -327,21 +333,14 @@ class SlackSendHandler(ToolHandler):
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
-    async def execute(
-        self,
-        arguments: dict[str, Any],
-        context: ToolExecutionContext,
-    ) -> ToolResult:
+    async def _resolve_config(
+        self, context: ToolExecutionContext | None
+    ) -> tuple[dict[str, Any], str | None]:
+        """The Slack channel config and bot token this tool would send with."""
         config = self._config_resolver() if self._config_resolver else None
-        if not config:
+        if not config and context is not None:
             config = await _load_db_channel_config(context, "slack")
         config = config or {}
-
-        message = arguments["message"]
-        channel = arguments.get("channel")
-        webhook_url = arguments.get("webhook_url") or config.get("webhook_url")
-        blocks = arguments.get("blocks")
-        thread_ts = arguments.get("thread_ts")
         bot_token = config.get("bot_token")
         try:
             from channels.slack_adapter import _resolve_token as _resolve_slack_token
@@ -354,6 +353,26 @@ class SlackSendHandler(ToolHandler):
             logger.debug(
                 "Slack token resolution via channel adapter failed", exc_info=True
             )
+        return config, bot_token
+
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        config, bot_token = await self._resolve_config(context)
+        if bot_token or config.get("webhook_url"):
+            return None
+        return "Slack is not configured. Set a Slack bot token or webhook URL."
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        config, bot_token = await self._resolve_config(context)
+
+        message = arguments["message"]
+        channel = arguments.get("channel")
+        webhook_url = arguments.get("webhook_url") or config.get("webhook_url")
+        blocks = arguments.get("blocks")
+        thread_ts = arguments.get("thread_ts")
 
         # Prefer webhook if available
         if webhook_url:
@@ -543,16 +562,14 @@ class TelegramSendHandler(ToolHandler):
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
-    async def execute(
-        self,
-        arguments: dict[str, Any],
-        context: ToolExecutionContext,
-    ) -> ToolResult:
+    async def _resolve_config(
+        self, context: ToolExecutionContext | None
+    ) -> tuple[dict[str, Any], str | None]:
+        """The Telegram channel config and bot token this tool would send with."""
         config = self._config_resolver() if self._config_resolver else None
-        if not config:
+        if not config and context is not None:
             config = await _load_db_channel_config(context, "telegram")
         config = config or {}
-
         bot_token = config.get("bot_token")
         try:
             from channels.telegram_adapter import (
@@ -564,6 +581,20 @@ class TelegramSendHandler(ToolHandler):
             logger.debug(
                 "Telegram token resolution via channel adapter failed", exc_info=True
             )
+        return config, bot_token
+
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        _config, bot_token = await self._resolve_config(context)
+        if bot_token:
+            return None
+        return "Telegram is not configured. Set a Telegram bot token."
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        config, bot_token = await self._resolve_config(context)
         if not bot_token:
             return ToolResult(
                 success=False,

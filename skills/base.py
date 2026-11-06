@@ -205,6 +205,7 @@ class SkillSpec:
         self,
         available_tools: set[str],
         config_server_names: set[str] | None = None,
+        unready_tools: dict[str, str] | None = None,
     ) -> tuple[str, list[str], str | None]:
         """Tri-state capability status (#39): ``usable`` | ``needs_setup`` |
         ``unavailable``, with what's missing and the exact next step — a
@@ -239,6 +240,16 @@ class SkillSpec:
                 "unavailable",
                 [f"missing tool: {t}" for t in missing_tools],
                 "These native tools are not registered in this runtime; enable them in tools config.",
+            )
+
+        # Registered is not the same as runnable: a tool backed by credentials
+        # or a connected account reports the setup step it is waiting on.
+        not_ready = [t for t in self.requires_tools if unready_tools and t in unready_tools]
+        if not_ready:
+            return (
+                "needs_setup",
+                [f"not set up: {t}" for t in not_ready],
+                unready_tools[not_ready[0]],
             )
 
         if self.mcp_binding and self.mcp_binding.command is None:

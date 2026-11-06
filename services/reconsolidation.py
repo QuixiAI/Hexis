@@ -16,6 +16,7 @@ import json
 import logging
 from typing import Any
 
+from core.chat_priority import wait_for_chat_idle
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
 from services.prompt_resources import load_reconsolidation_prompt
@@ -130,6 +131,7 @@ async def run_reconsolidation_step(conn) -> dict[str, Any]:
             })
 
             # 5. LLM call
+            await wait_for_chat_idle(conn)  # chat comes first
             doc, _raw_response = await chat_json(
                 llm_config=llm_config,
                 messages=[

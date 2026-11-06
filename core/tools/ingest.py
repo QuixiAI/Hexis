@@ -52,6 +52,24 @@ async def _build_ingest_config(pool, **overrides: Any) -> "Config":
     return Config(**defaults)
 
 
+# Sensitivity marking (#92): "private" keeps the resulting memories out of
+# group-channel recall and default HMX export.
+_SENSITIVITY_PROPERTY = {
+    "type": "string",
+    "enum": ["private"],
+    "description": (
+        "Mark the resulting memories private: excluded from group-channel "
+        "recall and default HMX export."
+    ),
+}
+
+
+def _sensitivity_override(arguments: dict[str, Any]) -> dict[str, Any]:
+    if str(arguments.get("sensitivity") or "").strip().lower() == "private":
+        return {"sensitivity": "private"}
+    return {}
+
+
 def _acquisition_override(arguments: dict[str, Any], context: "ToolExecutionContext") -> dict[str, Any]:
     """Acquisition provenance: heartbeat-initiated ingestion is the agent's
     own choice ('agent'); chat/MCP ingestion acts on the user's behalf
@@ -99,6 +117,7 @@ class FastIngestHandler(ToolHandler):
                         "type": "string",
                         "description": "Optional title for the content.",
                     },
+                    "sensitivity": _SENSITIVITY_PROPERTY,
                 },
                 "required": ["path"],
             },
@@ -131,7 +150,7 @@ class FastIngestHandler(ToolHandler):
             )
 
         pool = context.registry.pool
-        config = await _build_ingest_config(pool, mode=IngestionMode.FAST, **_acquisition_override(arguments, context))
+        config = await _build_ingest_config(pool, mode=IngestionMode.FAST, **_sensitivity_override(arguments), **_acquisition_override(arguments, context))
         pipeline = IngestionPipeline(config)
 
         try:
@@ -190,6 +209,7 @@ class SlowIngestHandler(ToolHandler):
                         "type": "string",
                         "description": "Optional title for the content.",
                     },
+                    "sensitivity": _SENSITIVITY_PROPERTY,
                 },
                 "required": ["path"],
             },
@@ -222,7 +242,7 @@ class SlowIngestHandler(ToolHandler):
             )
 
         pool = context.registry.pool
-        config = await _build_ingest_config(pool, mode=IngestionMode.SLOW, **_acquisition_override(arguments, context))
+        config = await _build_ingest_config(pool, mode=IngestionMode.SLOW, **_sensitivity_override(arguments), **_acquisition_override(arguments, context))
         pipeline = IngestionPipeline(config)
 
         try:
@@ -278,6 +298,7 @@ class HybridIngestHandler(ToolHandler):
                         "type": "string",
                         "description": "Optional title for the content.",
                     },
+                    "sensitivity": _SENSITIVITY_PROPERTY,
                 },
                 "required": ["path"],
             },
@@ -310,7 +331,7 @@ class HybridIngestHandler(ToolHandler):
             )
 
         pool = context.registry.pool
-        config = await _build_ingest_config(pool, mode=IngestionMode.HYBRID, **_acquisition_override(arguments, context))
+        config = await _build_ingest_config(pool, mode=IngestionMode.HYBRID, **_sensitivity_override(arguments), **_acquisition_override(arguments, context))
         pipeline = IngestionPipeline(config)
 
         try:
@@ -367,6 +388,7 @@ class GitIngestHandler(ToolHandler):
                             "acquisition provenance; helps future retention decisions)."
                         ),
                     },
+                    "sensitivity": _SENSITIVITY_PROPERTY,
                 },
                 "required": ["url"],
             },
@@ -400,7 +422,7 @@ class GitIngestHandler(ToolHandler):
         branch = arguments.get("branch")
 
         pool = context.registry.pool
-        config = await _build_ingest_config(pool, mode=IngestionMode.FAST, **_acquisition_override(arguments, context))
+        config = await _build_ingest_config(pool, mode=IngestionMode.FAST, **_sensitivity_override(arguments), **_acquisition_override(arguments, context))
         pipeline = IngestionPipeline(config)
         tmpdir = tempfile.mkdtemp(prefix="hexis_git_")
 
@@ -521,6 +543,7 @@ class URLIngestHandler(ToolHandler):
                             "acquisition provenance; helps future retention decisions)."
                         ),
                     },
+                    "sensitivity": _SENSITIVITY_PROPERTY,
                 },
                 "required": ["url"],
             },
@@ -570,6 +593,7 @@ class URLIngestHandler(ToolHandler):
             "source_type": source_type,
         }
         payload.update(_acquisition_override(arguments, context))
+        payload.update(_sensitivity_override(arguments))
 
         content_hash = f"url:{hashlib.sha256(url.encode('utf-8')).hexdigest()}"
         try:

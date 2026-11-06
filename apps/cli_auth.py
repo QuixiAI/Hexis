@@ -129,6 +129,20 @@ def register_auth_subparsers(
     _mmo.set_defaults(func="auth_minimax_portal_logout")
     mm.set_defaults(func="auth_minimax_portal")
 
+    # ── xAI (SuperGrok / X account) ───────────────────────────────
+    xa = auth_sub.add_parser("xai-oauth", parents=[db_parent], help="xAI SuperGrok / X account (device code)")
+    xa_sub = xa.add_subparsers(dest="xai_oauth_command")
+    _xal = xa_sub.add_parser("login", parents=[db_parent], help="Login via device code flow")
+    _xal.add_argument("--timeout-seconds", type=int, default=300, help="Polling timeout")
+    _xal.set_defaults(func="auth_xai_oauth_login")
+    _xas = xa_sub.add_parser("status", parents=[db_parent], help="Show status")
+    _xas.add_argument("--json", action="store_true", help="Output JSON")
+    _xas.set_defaults(func="auth_xai_oauth_status")
+    _xao = xa_sub.add_parser("logout", parents=[db_parent], help="Delete stored credentials")
+    _xao.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    _xao.set_defaults(func="auth_xai_oauth_logout")
+    xa.set_defaults(func="auth_xai_oauth")
+
     # ── Google Gemini CLI ─────────────────────────────────────────
     _register_pkce_provider(auth_sub, db_parent, "google-gemini-cli", "Google Gemini CLI (Cloud Code Assist)")
 
@@ -265,6 +279,16 @@ def dispatch_auth_command(func: str, args: Any, dsn: str) -> int | None:
     if func == "auth_google_antigravity_logout":
         return asyncio.run(_generic_logout(dsn, ws, "google-antigravity", getattr(args, "yes", False)))
 
+    # ── xAI (SuperGrok / X account) ──
+    if func == "auth_xai_oauth":
+        return asyncio.run(_generic_oauth_status(dsn, ws, "xai-oauth", as_json=False))
+    if func == "auth_xai_oauth_login":
+        return asyncio.run(_xai_oauth_login(dsn, ws, args))
+    if func == "auth_xai_oauth_status":
+        return asyncio.run(_generic_oauth_status(dsn, ws, "xai-oauth", as_json=bool(getattr(args, "json", False))))
+    if func == "auth_xai_oauth_logout":
+        return asyncio.run(_generic_logout(dsn, ws, "xai-oauth", getattr(args, "yes", False)))
+
     return None  # not handled
 
 
@@ -281,6 +305,7 @@ def _provider_module(provider: str):  # noqa: ANN202
         "minimax-portal": "core.auth.minimax_portal",
         "google-gemini-cli": "core.auth.google_gemini_cli",
         "google-antigravity": "core.auth.google_antigravity",
+        "xai-oauth": "core.auth.xai_oauth",
     }
     import importlib
     return importlib.import_module(_map[provider])
@@ -293,6 +318,7 @@ _PROVIDER_LABELS = {
     "minimax-portal": "MiniMax Portal",
     "google-gemini-cli": "Google Gemini CLI",
     "google-antigravity": "Google Antigravity",
+    "xai-oauth": "xAI",
 }
 
 
@@ -977,6 +1003,51 @@ async def _github_copilot_login(dsn: str, wait_seconds: int, args: Any) -> int:
     save_credentials(creds)
     console.print(f"[ok]Logged in.[/ok] base_url={creds.base_url}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# xAI (SuperGrok / X account) login
+# ---------------------------------------------------------------------------
+
+async def _xai_oauth_login(dsn: str, wait_seconds: int, args: Any) -> int:
+    """RFC 8628 device flow against xAI; the access token is then the Grok API key."""
+    from core.browser import open_url
+
+    from apps.cli_theme import console
+    from core.auth import xai_oauth
+
+    timeout_seconds = int(getattr(args, "timeout_seconds", 300) or 300)
+
+    console.print("\n[bold]xAI (device code flow)[/bold]")
+    device = await xai_oauth.request_device_code()
+
+    console.print(f"\n1. Open: [link]{device.verification_url}[/link]")
+    console.print(f"2. Enter code: [bold]{device.user_code}[/bold]\n")
+
+    try:
+        open_url(device.verification_url)
+    except Exception:
+        pass
+
+    console.print("[accent]Waiting for authorization...[/accent]")
+    deadline = time.time() + min(timeout_seconds, device.expires_in)
+    interval = device.interval
+    while time.time() < deadline:
+        await asyncio.sleep(interval)
+        try:
+            creds = await xai_oauth.poll_device_code(device)
+        except xai_oauth.SlowDown:
+            interval += 5
+            continue
+        except xai_oauth.SignInEnded as exc:
+            _print_err(str(exc))
+            return 1
+        if creds is not None:
+            xai_oauth.save_xai_credentials(creds)
+            console.print("[ok]Logged in.[/ok] Grok models are now available under provider `xai-oauth`.")
+            return 0
+    _print_err("The xAI login code expired before it was entered. Run `hexis auth xai-oauth login` again.")
+    return 1
 
 
 # ---------------------------------------------------------------------------

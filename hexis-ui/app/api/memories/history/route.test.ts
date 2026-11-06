@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 import { prisma } from "@/lib/prisma";
 import { GET } from "./route";
@@ -23,7 +24,7 @@ describe("/api/memories/history", () => {
     ]);
 
     const response = await GET(
-      new Request(
+      new NextRequest(
         "http://localhost/api/memories/history?mode=snapshot&q=Manning&as_of=2026-06-01T12:00:00Z"
       )
     );
@@ -52,7 +53,7 @@ describe("/api/memories/history", () => {
     ]);
 
     const response = await GET(
-      new Request(
+      new NextRequest(
         "http://localhost/api/memories/history?mode=diff&q=Manning&from_time=2026-08-01T00:00:00Z&to_time=2026-06-01T00:00:00Z"
       )
     );
@@ -66,7 +67,7 @@ describe("/api/memories/history", () => {
 
   it("rejects an unknown view before querying", async () => {
     const response = await GET(
-      new Request("http://localhost/api/memories/history?mode=erase&q=Manning")
+      new NextRequest("http://localhost/api/memories/history?mode=erase&q=Manning")
     );
 
     expect(response.status).toBe(422);

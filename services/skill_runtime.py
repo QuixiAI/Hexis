@@ -107,6 +107,9 @@ class SkillSelection:
     # Full catalog for this context — used for the compact skill index in the
     # system prompt, so the model can discover skills without a list_skills call.
     available: list[SkillSpec] = field(default_factory=list)
+    # Skills in `available` that cannot run yet, mapped to the setup step each
+    # needs. They stay listed so the model can say what setup is missing.
+    setup_steps: dict[str, str] = field(default_factory=dict)
 
 
 def tool_context_to_skill_context(context: ToolContext) -> SkillContext:
@@ -438,6 +441,43 @@ def _select_by_distribution(
     return sorted(picked, key=lambda item: (-item[0], item[1]))
 
 
+async def _unready_tools(registry: "ToolRegistry", context: ToolContext) -> dict[str, str]:
+    """Registered tools that cannot run yet (no credentials, no connected
+    account), mapped to the setup step each needs. A probe failure means
+    "assume ready": the tool itself still reports its setup step when called."""
+    try:
+        return dict(await registry.unready_tools(context) or {})
+    except Exception:
+        logger.debug("Tool readiness probe failed", exc_info=True)
+        return {}
+
+
+async def _setup_steps_for(
+    registry: "ToolRegistry",
+    skills: list[SkillSpec],
+    unready: dict[str, str],
+) -> dict[str, str]:
+    if not unready:
+        return {}
+    available_tools = set(registry.list_names())
+    server_names = {c.name for c in await _mcp_configs(registry) if c.enabled}
+    steps: dict[str, str] = {}
+    for s in skills:
+        status, missing, next_step = s.usability(available_tools, server_names, unready)
+        if status != "usable":
+            steps[s.name] = next_step or "; ".join(missing)
+    return steps
+
+
+async def skill_setup_steps(
+    registry: "ToolRegistry",
+    context: ToolContext,
+    skills: list[SkillSpec],
+) -> dict[str, str]:
+    """Skills that are installed but cannot run yet, with the step each needs."""
+    return await _setup_steps_for(registry, skills, await _unready_tools(registry, context))
+
+
 async def select_skills(
     registry: "ToolRegistry",
     tool_context: ToolContext,
@@ -450,6 +490,11 @@ async def select_skills(
     skills = load_available_skills(
         registry, tool_context, mcp_configs=await _mcp_configs(registry)
     )
+    # A skill whose tools are registered but not set up (no credentials, no
+    # connected account) is never auto-activated and is listed apart, so the
+    # agent offers only what is actually set up.
+    unready = await _unready_tools(registry, tool_context)
+    setup_steps = await _setup_steps_for(registry, skills, unready)
 
     default_names = (
         set(HEARTBEAT_DEFAULT_SKILL_NAMES)
@@ -466,7 +511,9 @@ async def select_skills(
     selected_names = {s.name for s in selected}
     q_tokens = _tokens(query)
     considered: list[dict[str, Any]] = []
-    candidates = [s for s in skills if s.name not in selected_names]
+    candidates = [
+        s for s in skills if s.name not in selected_names and s.name not in setup_steps
+    ]
     by_name = {s.name: s for s in candidates}
 
     ranked: list[tuple[float, str]] = []
@@ -525,12 +572,15 @@ async def select_skills(
         allowed.update(t for t in ALWAYS_AVAILABLE_TOOL_NAMES if t in available_tools)
     for skill in selected:
         allowed.update(t for t in skill_bound_tools(skill) if t in available_tools)
+    # Unready tools stay callable: each answers with its own setup step, so a
+    # capability question never dead-ends. They are simply not offered.
 
     return SkillSelection(
         skills=selected,
         allowed_tool_names=allowed,
         available=skills,
         considered=sorted(considered, key=lambda item: -item["score"]),
+        setup_steps=setup_steps,
     )
 
 
@@ -620,6 +670,7 @@ def _uuid_or_none(value: str | None) -> str | None:
 def format_skills_prompt(
     active: list[SkillSpec],
     available: list[SkillSpec] | None = None,
+    setup_steps: dict[str, str] | None = None,
 ) -> str:
     """Compact skill section for the system prompt.
 
@@ -640,11 +691,20 @@ def format_skills_prompt(
     if active:
         lines.append("Active now:\n" + "\n".join(s.to_index_line() for s in active))
     active_names = {s.name for s in active}
+    steps = setup_steps or {}
     inactive = [s for s in (available or []) if s.name not in active_names]
-    if inactive:
+    ready = [s for s in inactive if s.name not in steps]
+    unset = [s for s in inactive if s.name in steps]
+    if ready:
         lines.append(
             "Available (activate with `use_skill`):\n"
-            + "\n".join(s.to_index_line() for s in inactive)
+            + "\n".join(s.to_index_line() for s in ready)
+        )
+    if unset:
+        lines.append(
+            "Installed but not set up, so you cannot do these yet. Do not offer "
+            "them as things you can do; if asked, say what setup is missing:\n"
+            + "\n".join(f"{s.to_index_line()} (needs: {steps[s.name]})" for s in unset)
         )
     return "\n\n".join(lines)
 
@@ -661,9 +721,10 @@ async def skill_catalog(
     skills = load_available_skills(
         registry, context, include_unmet=True, mcp_configs=mcp_configs
     )
+    unready = await _unready_tools(registry, context)
     catalog: list[dict[str, Any]] = []
     for s in skills:
-        status, missing, next_step = s.usability(available_tools, server_names)
+        status, missing, next_step = s.usability(available_tools, server_names, unready)
         if s.mcp_binding is not None:
             # MCP tools exist only after activation: list them from the
             # manifest, not from the live registry.

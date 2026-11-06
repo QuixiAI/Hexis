@@ -449,3 +449,32 @@ END;
 $$ LANGUAGE plpgsql;
 
 SET check_function_bodies = on;
+
+-- A goal the person set (goal_origin = user_request) and made active: the
+-- heartbeat gets larger limits while one exists, and work on it is free.
+CREATE OR REPLACE FUNCTION has_active_user_goal() RETURNS BOOLEAN
+    LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM memories
+        WHERE type = 'goal' AND status = 'active'
+          AND metadata->>'priority' = 'active'
+          AND goal_origin = 'user_request'::goal_source);
+$$;
+
+-- Heartbeat model tokens used today, and whether work on the user's goals is
+-- still free (heartbeat.free_work_daily_token_cap; 0 = no cap).
+-- plpgsql (not sql): api_usage (db/29) is created after this file loads.
+CREATE OR REPLACE FUNCTION free_goal_work_status() RETURNS JSONB
+    LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    cap_tokens BIGINT := COALESCE(get_config_int('heartbeat.free_work_daily_token_cap'), 0);
+    used_tokens BIGINT;
+BEGIN
+    SELECT COALESCE(sum(total_tokens), 0)::bigint INTO used_tokens FROM api_usage
+    WHERE source IN ('heartbeat', 'rlm') AND created_at >= date_trunc('day', CURRENT_TIMESTAMP);
+    RETURN jsonb_build_object(
+        'free', cap_tokens = 0 OR used_tokens < cap_tokens,
+        'tokens_today', used_tokens,
+        'daily_cap', cap_tokens);
+END;
+$$;

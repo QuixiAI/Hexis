@@ -1,6 +1,31 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+
+/**
+ * Subscription sign-ins and pasted tokens, shown inside a provider's form.
+ *
+ * A vendor is one entry in the provider list; its form offers an API key and,
+ * where the vendor has one, a subscription login: ChatGPT under OpenAI (the
+ * `openai-codex` provider), SuperGrok / X under Grok (`xai-oauth`), Google
+ * under Gemini (`google-gemini-cli`, `google-antigravity`), Qwen Portal under
+ * Alibaba Qwen, MiniMax Portal under MiniMax, and a Claude Code setup token
+ * under Anthropic. Chutes and GitHub Copilot are login-only.
+ *
+ * `active` means this model uses the account rather than an API key. `onUse`
+ * switches the model to the account once it is signed in; `onLeave` goes back
+ * to an API key (absent for login-only providers).
+ */
+
+export type OAuthProvider =
+  | "openai-codex"
+  | "xai-oauth"
+  | "chutes"
+  | "github-copilot"
+  | "qwen-portal"
+  | "minimax-portal"
+  | "google-gemini-cli"
+  | "google-antigravity";
 
 export type OAuthCredentialStatus = {
   provider: string;
@@ -19,13 +44,7 @@ type OAuthSession = {
   session_id: string;
   provider: string;
   flow: "authorization_code" | "device_code";
-  status:
-    | "awaiting_code"
-    | "waiting_for_user"
-    | "exchanging"
-    | "complete"
-    | "error"
-    | "expired";
+  status: "awaiting_code" | "waiting_for_user" | "exchanging" | "complete" | "error" | "expired";
   expires_in_seconds: number;
   callback_active?: boolean;
   authorization_url?: string;
@@ -43,13 +62,6 @@ type OAuthOptions = {
   region: "global" | "cn";
 };
 
-type Props = {
-  provider: string;
-  label: string;
-  refreshKey: number;
-  onAuthenticated: (provider: string) => void;
-};
-
 const initialOptions: OAuthOptions = {
   client_id: "",
   client_secret: "",
@@ -58,110 +70,142 @@ const initialOptions: OAuthOptions = {
   region: "global",
 };
 
+// What the account is called, per sign-in.
+export const ACCOUNT_LABEL: Record<OAuthProvider, { name: string; site: string; hint: string }> = {
+  "openai-codex": {
+    name: "ChatGPT", site: "OpenAI",
+    hint: "Use your ChatGPT Plus/Pro subscription instead of an API key.",
+  },
+  "xai-oauth": {
+    name: "xAI", site: "xAI",
+    hint: "Use your SuperGrok or X Premium subscription instead of an API key.",
+  },
+  chutes: { name: "Chutes", site: "Chutes", hint: "Free inference with a Chutes account. No API key is needed." },
+  "github-copilot": {
+    name: "GitHub Copilot", site: "GitHub",
+    hint: "Use your GitHub Copilot subscription. No API key is needed.",
+  },
+  "qwen-portal": {
+    name: "Qwen Portal", site: "Qwen",
+    hint: "Use a free Qwen Portal account instead of a Model Studio API key.",
+  },
+  "minimax-portal": {
+    name: "MiniMax Portal", site: "MiniMax",
+    hint: "Use your MiniMax Portal account instead of an API key.",
+  },
+  "google-gemini-cli": {
+    name: "Google (Gemini CLI)", site: "Google",
+    hint: "Use your Google account through Cloud Code Assist, as the Gemini CLI does.",
+  },
+  "google-antigravity": {
+    name: "Google (Antigravity)", site: "Google",
+    hint: "Use your Google account through the Antigravity Cloud Code Assist sandbox.",
+  },
+};
+
 async function authRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { cache: "no-store", ...init });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = payload?.detail || payload?.error || payload?.message;
-    throw new Error(typeof message === "string" ? message : `Authorization request failed (${response.status}).`);
+    const error = new Error(
+      typeof message === "string" ? message : `Authorization request failed (${response.status}).`,
+    ) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
   }
   return payload as T;
 }
 
-export async function getOAuthStatus(
-  provider: string,
-  validate = false
-): Promise<OAuthCredentialStatus> {
+export async function getOAuthStatus(provider: string, validate = false): Promise<OAuthCredentialStatus> {
   const params = new URLSearchParams({ provider });
   if (validate) params.set("validate", "true");
-  return authRequest<OAuthCredentialStatus>(
-    `/api/init/auth/status?${params.toString()}`
-  );
+  return authRequest<OAuthCredentialStatus>(`/api/init/auth/status?${params.toString()}`);
 }
 
 function credentialIdentity(status: OAuthCredentialStatus): string | null {
-  return (
-    status.email ||
-    status.account_id ||
-    status.project_id ||
-    status.base_url ||
-    status.resource_url ||
-    null
-  );
+  return status.email || status.account_id || status.project_id || status.base_url || status.resource_url || null;
 }
 
-export function OAuthControl({ provider, label, refreshKey, onAuthenticated }: Props) {
+const buttonClass =
+  "rounded-full bg-[var(--foreground)] px-5 py-2 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)] disabled:opacity-50";
+const secondaryButtonClass =
+  "rounded-full border border-[var(--outline)] px-4 py-2 text-sm font-semibold transition hover:border-[var(--accent-strong)] disabled:opacity-50";
+const linkClass = "text-sm text-[var(--accent-strong)] underline disabled:opacity-50";
+const inputClass =
+  "mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-3 py-2 text-sm normal-case tracking-normal text-[var(--foreground)]";
+const optionLabelClass = "block text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]";
+
+export function OAuthControl({ provider, active, onUse, onLeave }: {
+  provider: OAuthProvider;
+  active: boolean;
+  onUse: () => void;
+  onLeave?: () => void;
+}) {
+  const label = ACCOUNT_LABEL[provider];
   const [credential, setCredential] = useState<OAuthCredentialStatus | null>(null);
+  const [loading, setLoading] = useState(true);
   const [session, setSession] = useState<OAuthSession | null>(null);
   const [authorizationInput, setAuthorizationInput] = useState("");
   const [options, setOptions] = useState<OAuthOptions>(initialOptions);
+  const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const loadStatus = useCallback(async () => {
-    setLoading(true);
-    try {
-      const next = await getOAuthStatus(provider);
-      setCredential(next);
-      setError(null);
-    } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setLoading(false);
-    }
+  // The parent keys this control by provider, so a fresh mount is a fresh status check.
+  useEffect(() => {
+    let cancelled = false;
+    getOAuthStatus(provider)
+      .then((status) => { if (!cancelled) { setCredential(status); setError(null); } })
+      .catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [provider]);
 
-  useEffect(() => {
+  const signedIn = useCallback((next?: OAuthCredentialStatus) => {
+    setCredential(next ?? { provider, configured: true });
     setSession(null);
     setAuthorizationInput("");
-    loadStatus();
-  }, [loadStatus, refreshKey]);
+    setError(null);
+    onUse();
+  }, [onUse, provider]);
 
+  // Wait for the user to approve the code (device flow) or for the browser
+  // callback (authorization-code flow with a reachable callback port).
   useEffect(() => {
-    if (!session || session.status === "complete" || session.status === "error" || session.status === "expired") {
-      return;
-    }
-    if (session.flow === "authorization_code" && !session.callback_active && session.status === "awaiting_code") {
-      return;
-    }
-
+    if (!session || session.status === "complete" || session.status === "error" || session.status === "expired") return;
+    if (session.flow === "authorization_code" && !session.callback_active && session.status === "awaiting_code") return;
+    let cancelled = false;
     const timer = window.setInterval(async () => {
       try {
-        const next = await authRequest<OAuthSession>(
-          `/api/init/auth/session/${encodeURIComponent(session.session_id)}`
-        );
-        setSession(next);
+        const next = await authRequest<OAuthSession>(`/api/init/auth/session/${encodeURIComponent(session.session_id)}`);
+        if (cancelled) return;
         if (next.status === "complete") {
-          if (next.credential) setCredential(next.credential);
-          setError(null);
-          onAuthenticated(provider);
+          signedIn(next.credential);
         } else if (next.status === "error" || next.status === "expired") {
-          setError(next.error || "This authorization attempt expired. Start a new one.");
+          setSession(null);
+          setError(next.error || "This sign-in attempt expired. Start again.");
+        } else {
+          setSession(next);
         }
       } catch (reason: unknown) {
+        if (cancelled) return;
+        setSession(null);
         setError(reason instanceof Error ? reason.message : String(reason));
       }
     }, 1500);
-    return () => window.clearInterval(timer);
-  }, [onAuthenticated, provider, session]);
-
-  const publicOptions = useMemo(() => {
-    const entries = Object.entries(options).filter(([, value]) => value.trim());
-    return Object.fromEntries(entries);
-  }, [options]);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [session, signedIn]);
 
   const start = async () => {
-    setBusy(true);
-    setError(null);
-    setAuthorizationInput("");
+    setBusy(true); setError(null); setAuthorizationInput(""); setCopied(false);
     try {
-      const next = await authRequest<OAuthSession>("/api/init/auth/start", {
+      const publicOptions = Object.fromEntries(Object.entries(options).filter(([, value]) => value.trim()));
+      setSession(await authRequest<OAuthSession>("/api/init/auth/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ provider, options: publicOptions }),
-      });
-      setSession(next);
+      }));
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -169,22 +213,20 @@ export function OAuthControl({ provider, label, refreshKey, onAuthenticated }: P
     }
   };
 
+  // Already signed in from an earlier setup: no need to go through the provider again.
+  const login = () => (credential?.configured ? onUse() : void start());
+
   const complete = async () => {
     if (!session) return;
-    setBusy(true);
-    setError(null);
+    setBusy(true); setError(null);
     try {
       const next = await authRequest<OAuthSession>("/api/init/auth/complete", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          session_id: session.session_id,
-          authorization_input: authorizationInput,
-        }),
+        body: JSON.stringify({ session_id: session.session_id, authorization_input: authorizationInput }),
       });
-      setSession(next);
-      if (next.credential) setCredential(next.credential);
-      onAuthenticated(provider);
+      if (next.status === "complete") signedIn(next.credential);
+      else setSession(next);
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -192,192 +234,253 @@ export function OAuthControl({ provider, label, refreshKey, onAuthenticated }: P
     }
   };
 
+  const forget = async () => {
+    setBusy(true); setError(null);
+    try {
+      setCredential(await authRequest<OAuthCredentialStatus>("/api/init/auth/forget", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider }),
+      }));
+      setSession(null);
+      if (active) onLeave?.();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyAndOpen = async () => {
+    if (!session?.verification_uri) return;
+    window.open(session.verification_uri, "_blank", "noopener,noreferrer");
+    try {
+      if (session.user_code) await navigator.clipboard.writeText(session.user_code);
+      setCopied(Boolean(session.user_code));
+    } catch {
+      setCopied(false);
+    }
+  };
+
   const identity = credential ? credentialIdentity(credential) : null;
-  const needsClientCredentials =
-    provider === "google-gemini-cli" || provider === "google-antigravity";
+  const idle = !session || session.status === "complete" || session.status === "error" || session.status === "expired";
+  const needsGoogleClient = provider === "google-gemini-cli" || provider === "google-antigravity";
 
   return (
-    <div className="rounded-xl border border-[var(--outline)] bg-[var(--surface)] px-4 py-4 text-sm text-[var(--ink)]">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p className="font-semibold">
-            {loading ? "Checking login..." : credential?.configured ? "Login stored" : "Authentication required"}
+    <div className="rounded-xl border border-[var(--outline)] bg-[var(--surface)] p-4 text-sm">
+      {session && session.flow === "device_code" && session.status !== "complete" ? (
+        <div className="space-y-3">
+          <p>Enter this code on {label.site}&apos;s sign-in page:</p>
+          <p className="select-all font-mono text-2xl font-semibold tracking-[0.2em]" aria-label="Login code">
+            {session.user_code}
           </p>
-          {credential?.configured ? (
-            <p className="mt-1 break-words text-[var(--ink-soft)]">
-              {identity ? `${label}: ${identity}` : `${label} is authorized for Hexis.`}
-            </p>
-          ) : (
-            <p className="mt-1 text-[var(--ink-soft)]">
-              Authorize {label} here before continuing. No API key is needed.
-            </p>
-          )}
-        </div>
-        {!session || session.status === "complete" || session.status === "error" || session.status === "expired" ? (
-          <button
-            type="button"
-            className="rounded-full border border-[var(--foreground)] px-4 py-2 font-semibold transition hover:bg-[var(--foreground)] hover:text-white disabled:opacity-50"
-            onClick={start}
-            disabled={busy || loading}
-          >
-            {credential?.configured ? "Authenticate again" : "Start authorization"}
-          </button>
-        ) : null}
-      </div>
-
-      {provider === "chutes" && (!session || session.status === "error" || session.status === "expired") ? (
-        <div className="mt-4 grid gap-3 sm:grid-cols-2">
-          <OptionInput
-            label="Chutes client ID"
-            value={options.client_id}
-            onChange={(value) => setOptions((current) => ({ ...current, client_id: value }))}
-            placeholder="Required unless configured on the server"
-          />
-          <OptionInput
-            label="Redirect URI"
-            value={options.redirect_uri}
-            onChange={(value) => setOptions((current) => ({ ...current, redirect_uri: value }))}
-            placeholder="http://localhost:11435/auth/callback"
-          />
-        </div>
-      ) : null}
-
-      {provider === "github-copilot" && (!session || session.status === "error" || session.status === "expired") ? (
-        <div className="mt-4">
-          <OptionInput
-            label="GitHub enterprise hostname"
-            value={options.enterprise_domain}
-            onChange={(value) => setOptions((current) => ({ ...current, enterprise_domain: value }))}
-            placeholder="Optional, for example github.example.com"
-          />
-        </div>
-      ) : null}
-
-      {provider === "minimax-portal" && (!session || session.status === "error" || session.status === "expired") ? (
-        <label className="mt-4 block text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-          Region
-          <select
-            className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-3 py-2 text-sm normal-case tracking-normal text-[var(--foreground)]"
-            value={options.region}
-            onChange={(event) =>
-              setOptions((current) => ({ ...current, region: event.target.value as "global" | "cn" }))
-            }
-          >
-            <option value="global">Global</option>
-            <option value="cn">China</option>
-          </select>
-        </label>
-      ) : null}
-
-      {needsClientCredentials && (!session || session.status === "error" || session.status === "expired") ? (
-        <div className="mt-4 grid gap-3 sm:grid-cols-2">
-          <OptionInput
-            label="OAuth client ID"
-            value={options.client_id}
-            onChange={(value) => setOptions((current) => ({ ...current, client_id: value }))}
-            placeholder="Uses server configuration when blank"
-          />
-          <OptionInput
-            label="OAuth client secret"
-            value={options.client_secret}
-            onChange={(value) => setOptions((current) => ({ ...current, client_secret: value }))}
-            placeholder="Uses server configuration when blank"
-            secret
-          />
-        </div>
-      ) : null}
-
-      {session?.verification_uri ? (
-        <div className="mt-4 border-t border-[var(--outline)] pt-4">
-          <p className="font-semibold">Approve this device</p>
-          <div className="mt-3 flex flex-wrap items-center gap-3">
-            {session.user_code ? (
-              <code className="rounded-lg bg-white px-3 py-2 text-base font-semibold tracking-[0.12em]">
-                {session.user_code}
-              </code>
-            ) : null}
-            <a
-              className="rounded-full bg-[var(--foreground)] px-4 py-2 font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-              href={session.verification_uri}
-              target="_blank"
-              rel="noreferrer"
-            >
-              Open authorization page
-            </a>
-            {session.user_code && typeof navigator !== "undefined" && navigator.clipboard ? (
-              <button
-                type="button"
-                className="underline decoration-[var(--outline)] underline-offset-4"
-                onClick={() => navigator.clipboard.writeText(session.user_code || "")}
-              >
-                Copy code
-              </button>
-            ) : null}
+          <div className="flex flex-wrap items-center gap-3">
+            <button type="button" onClick={copyAndOpen} className={buttonClass}>
+              Copy code and open {label.site}
+            </button>
+            {copied ? <span className="text-xs text-green-700">Code copied</span> : null}
           </div>
-          <p className="mt-3 text-[var(--ink-soft)]">Waiting for approval in the other tab...</p>
+          <p role="status" className="text-[var(--ink-soft)]">Waiting for you to approve it at {label.site}…</p>
+          <button type="button" onClick={() => setSession(null)} className={linkClass}>Cancel</button>
         </div>
-      ) : null}
-
-      {session?.authorization_url && session.status !== "complete" ? (
-        <div className="mt-4 border-t border-[var(--outline)] pt-4">
-          <a
-            className="inline-flex rounded-full bg-[var(--foreground)] px-4 py-2 font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-            href={session.authorization_url}
-            target="_blank"
-            rel="noreferrer"
-          >
-            Open authorization page
+      ) : session && session.flow === "authorization_code" && session.status !== "complete" ? (
+        <div className="space-y-3">
+          <a className={`inline-flex ${buttonClass}`} href={session.authorization_url} target="_blank" rel="noopener noreferrer">
+            Continue to {label.site}
           </a>
-          <p className="mt-3 text-[var(--ink-soft)]">
+          <p className="text-[var(--ink-soft)]">
             {session.callback_active
-              ? "After approval, this page updates automatically. If it does not, paste the redirect URL below."
-              : "After approval, paste the displayed code or full redirect URL below."}
+              ? "After approval this page updates by itself. If it does not, paste the redirect URL below."
+              : "After signing in, copy the full redirect URL from the browser address bar and paste it below. If that page cannot load, the URL still works here."}
           </p>
-          <label className="mt-3 block text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+          <label className="block">
             Authorization code or redirect URL
-            <input
-              className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-3 py-2 text-sm normal-case tracking-normal text-[var(--foreground)]"
-              value={authorizationInput}
-              onChange={(event) => setAuthorizationInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && authorizationInput.trim() && !busy) complete();
-              }}
-              autoComplete="off"
-            />
+            <input type="password" autoComplete="off" value={authorizationInput}
+              onChange={(e) => setAuthorizationInput(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && authorizationInput.trim() && !busy) void complete(); }}
+              className={inputClass} />
           </label>
-          <button
-            type="button"
-            className="mt-3 rounded-full border border-[var(--foreground)] px-4 py-2 font-semibold transition hover:bg-[var(--foreground)] hover:text-white disabled:opacity-50"
-            onClick={complete}
-            disabled={busy || !authorizationInput.trim()}
-          >
-            Complete authorization
-          </button>
+          <div className="flex flex-wrap gap-3">
+            <button type="button" onClick={complete} disabled={busy || !authorizationInput.trim()} className={secondaryButtonClass}>
+              Complete sign-in
+            </button>
+            <button type="button" onClick={() => setSession(null)} className={linkClass}>Cancel</button>
+          </div>
+          {session.status === "exchanging" ? <p className="text-[var(--ink-soft)]">Completing sign-in…</p> : null}
         </div>
-      ) : null}
-
-      {session?.status === "exchanging" ? (
-        <p className="mt-4 text-[var(--ink-soft)]">Completing authorization...</p>
-      ) : null}
-      {session?.status === "complete" ? (
-        <p className="mt-4 font-semibold text-[var(--teal)]">Authorization complete.</p>
-      ) : null}
+      ) : active && credential?.configured ? (
+        <>
+          <p className="font-semibold">Logged in with your {label.name} account</p>
+          {identity ? <p className="mt-1 break-words text-[var(--ink-soft)]">{identity}</p> : null}
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+            {onLeave ? <button type="button" onClick={onLeave} className={linkClass}>Use an API key instead</button> : null}
+            <button type="button" onClick={start} disabled={busy} className={linkClass}>Log in again</button>
+            <button type="button" onClick={forget} disabled={busy} className={linkClass}>Sign out</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <button type="button" onClick={login} disabled={busy || loading} className={buttonClass}>
+            {credential?.configured ? `Use your ${label.name} login` : `Log in with ${label.name}`}
+          </button>
+          <p className="mt-2 text-[var(--ink-soft)]">
+            {credential?.configured && identity ? `Signed in as ${identity}. ` : ""}{label.hint}
+          </p>
+          {active && onLeave ? (
+            <button type="button" onClick={onLeave} className={`mt-2 ${linkClass}`}>Use an API key instead</button>
+          ) : null}
+          {idle && provider === "chutes" ? (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <OptionInput label="Chutes client ID" value={options.client_id}
+                onChange={(value) => setOptions((c) => ({ ...c, client_id: value }))}
+                placeholder="Required unless configured on the server" />
+              <OptionInput label="Redirect URI" value={options.redirect_uri}
+                onChange={(value) => setOptions((c) => ({ ...c, redirect_uri: value }))}
+                placeholder="http://localhost:11435/auth/callback" />
+            </div>
+          ) : null}
+          {idle && provider === "github-copilot" ? (
+            <div className="mt-4">
+              <OptionInput label="GitHub enterprise hostname" value={options.enterprise_domain}
+                onChange={(value) => setOptions((c) => ({ ...c, enterprise_domain: value }))}
+                placeholder="Optional, for example github.example.com" />
+            </div>
+          ) : null}
+          {idle && provider === "minimax-portal" ? (
+            <label className={`mt-4 ${optionLabelClass}`}>
+              Region
+              <select className={inputClass} value={options.region}
+                onChange={(e) => setOptions((c) => ({ ...c, region: e.target.value as "global" | "cn" }))}>
+                <option value="global">Global</option>
+                <option value="cn">China</option>
+              </select>
+            </label>
+          ) : null}
+          {idle && needsGoogleClient ? (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <OptionInput label="OAuth client ID" value={options.client_id}
+                onChange={(value) => setOptions((c) => ({ ...c, client_id: value }))}
+                placeholder="Uses server configuration when blank" />
+              <OptionInput label="OAuth client secret" value={options.client_secret}
+                onChange={(value) => setOptions((c) => ({ ...c, client_secret: value }))}
+                placeholder="Uses server configuration when blank" secret />
+            </div>
+          ) : null}
+        </>
+      )}
       {error ? (
-        <p className="mt-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-red-700" role="alert">
-          {error}
-        </p>
+        <p role="alert" className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-red-700">{error}</p>
       ) : null}
     </div>
   );
 }
 
-function OptionInput({
-  label,
-  value,
-  onChange,
-  placeholder,
-  secret = false,
-}: {
+/**
+ * A Claude Code setup token pasted under the Anthropic form. Claude
+ * subscriptions have no OAuth flow Hexis can drive; the token comes from
+ * `claude setup-token` and is stored in Hexis's own auth store.
+ */
+export function SetupTokenControl({ active, onUse, onLeave }: {
+  active: boolean;
+  onUse: () => void;
+  onLeave: () => void;
+}) {
+  const [configured, setConfigured] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState(false);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getOAuthStatus("anthropic")
+      .then((status) => { if (!cancelled) setConfigured(Boolean(status.configured)); })
+      .catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const save = async () => {
+    setBusy(true); setError(null);
+    try {
+      await authRequest("/api/init/auth/setup-token", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: "anthropic", token }),
+      });
+      setConfigured(true); setEditing(false); setToken("");
+      onUse();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const forget = async () => {
+    setBusy(true); setError(null);
+    try {
+      await authRequest("/api/init/auth/forget", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: "anthropic" }),
+      });
+      setConfigured(false); setEditing(false);
+      if (active) onLeave();
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-[var(--outline)] bg-[var(--surface)] p-4 text-sm">
+      {editing ? (
+        <div className="space-y-3">
+          <label className="block">
+            Claude Code setup token
+            <input type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && token.trim() && !busy) void save(); }}
+              placeholder="sk-ant-oat01-…" className={inputClass} />
+          </label>
+          <p className="text-[var(--ink-soft)]">
+            Run <code>claude setup-token</code> in a terminal with the Claude Code CLI signed in, then paste the token it prints.
+          </p>
+          <div className="flex flex-wrap gap-3">
+            <button type="button" onClick={save} disabled={busy || !token.trim()} className={secondaryButtonClass}>Save token</button>
+            <button type="button" onClick={() => { setEditing(false); setToken(""); }} className={linkClass}>Cancel</button>
+          </div>
+        </div>
+      ) : active && configured ? (
+        <>
+          <p className="font-semibold">Using your Claude subscription (setup token)</p>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+            <button type="button" onClick={onLeave} className={linkClass}>Use an API key instead</button>
+            <button type="button" onClick={() => setEditing(true)} className={linkClass}>Replace token</button>
+            <button type="button" onClick={forget} disabled={busy} className={linkClass}>Sign out</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <button type="button" onClick={() => (configured ? onUse() : setEditing(true))} disabled={busy || loading} className={buttonClass}>
+            {configured ? "Use your Claude subscription" : "Use a Claude subscription"}
+          </button>
+          <p className="mt-2 text-[var(--ink-soft)]">
+            Paste a Claude Code setup token instead of an API key.
+          </p>
+          {active ? <button type="button" onClick={onLeave} className={`mt-2 ${linkClass}`}>Use an API key instead</button> : null}
+        </>
+      )}
+      {error ? (
+        <p role="alert" className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-red-700">{error}</p>
+      ) : null}
+    </div>
+  );
+}
+
+function OptionInput({ label, value, onChange, placeholder, secret = false }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
@@ -385,16 +488,10 @@ function OptionInput({
   secret?: boolean;
 }) {
   return (
-    <label className="block text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
+    <label className={optionLabelClass}>
       {label}
-      <input
-        className="mt-2 w-full rounded-xl border border-[var(--outline)] bg-white px-3 py-2 text-sm normal-case tracking-normal text-[var(--foreground)]"
-        type={secret ? "password" : "text"}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={placeholder}
-        autoComplete="off"
-      />
+      <input className={inputClass} type={secret ? "password" : "text"} value={value}
+        onChange={(event) => onChange(event.target.value)} placeholder={placeholder} autoComplete="off" />
     </label>
   );
 }
