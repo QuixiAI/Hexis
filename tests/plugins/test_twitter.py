@@ -317,6 +317,23 @@ class TestTwitterNoAuthRequired:
         }
 
     @pytest.mark.asyncio
+    async def test_twittrapi_skips_unavailable_placeholders(self):
+        handler = SearchTwitterHandler()
+        payload = {
+            "data": [
+                {"id": "7", "unavailable": True},
+                {"id": "8", "unavailable": True},
+            ],
+            "nextCursor": None,
+            "hasNextPage": False,
+        }
+
+        with patch("plugins.installed.twitter.tools.request_json", AsyncMock(return_value=payload)):
+            tweets = await handler._search_twittrapi("from:gone", 25, "twittrapi-key")
+
+        assert tweets == []
+
+    @pytest.mark.asyncio
     async def test_all_tiers_fail_returns_error(self):
         handler = SearchTwitterHandler()
         ctx = _make_context()

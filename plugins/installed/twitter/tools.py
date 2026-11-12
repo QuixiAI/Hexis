@@ -419,8 +419,12 @@ class SearchTwitterHandler(ToolHandler):
         )
 
         rows = data.get("data") if isinstance(data, dict) else []
+        # Tweets X does not return (deleted, withheld) come back as
+        # {"id": ..., "unavailable": true}; skip them so an all-placeholder
+        # page counts as empty and the next provider is tried.
+        usable = [t for t in (rows or []) if isinstance(t, dict) and not t.get("unavailable")]
         tweets: list[dict[str, Any]] = []
-        for t in (rows or [])[:max_results]:
+        for t in usable[:max_results]:
             user = t.get("author") or {}
             counts = t.get("counts") or {}
             tweets.append(
