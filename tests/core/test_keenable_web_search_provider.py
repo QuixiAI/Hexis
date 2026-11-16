@@ -65,3 +65,23 @@ async def test_keyed_endpoint(monkeypatch):
     )
     assert captured["url"] == "https://api.keenable.ai/v1/search"
     assert captured["headers"]["X-API-Key"] == "kn"
+
+
+@pytest.mark.asyncio
+async def test_registry_cache_separates_keyless_and_keyed(monkeypatch):
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    urls: list[str] = []
+
+    async def _request_json(provider, method, url, **kwargs):
+        urls.append(url)
+        return {"results": [{"title": "A", "url": "https://a.example/x", "snippet": "s"}]}
+
+    monkeypatch.setattr(wsp, "request_json", _request_json)
+    registry = wsp.create_default_web_search_registry()
+    await registry.search(query="q", max_results=3, config=ToolsConfig(web_search={"provider": "keenable"}))
+    await registry.search(
+        query="q",
+        max_results=3,
+        config=ToolsConfig(web_search={"provider": "keenable"}, api_keys={"keenable": "kn"}),
+    )
+    assert urls == ["https://api.keenable.ai/v1/search/public", "https://api.keenable.ai/v1/search"]

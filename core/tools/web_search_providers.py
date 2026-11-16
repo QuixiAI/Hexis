@@ -152,6 +152,10 @@ class WebSearchProvider(ABC):
     ) -> WebSearchResponse:
         """Execute a search and return normalized results."""
 
+    def cache_variant(self, config: ToolsConfig) -> str:
+        """Extra cache-key part for providers whose results depend on config (e.g. keyed vs keyless)."""
+        return ""
+
 
 def _env(name: str) -> str | None:
     value = (os.getenv(name) or "").strip()
@@ -386,6 +390,10 @@ class KeenableSearchProvider(WebSearchProvider):
 
     def is_available(self, config: ToolsConfig) -> bool:
         return _configured_provider(config) == self.id or bool(self._api_key(config))
+
+    def cache_variant(self, config: ToolsConfig) -> str:
+        # Keyed and public endpoints are different requests, so don't share cached results
+        return "keyed" if self._api_key(config) else "public"
 
     async def search(
         self,
@@ -700,11 +708,16 @@ class WebSearchProviderRegistry:
             )
         return statuses
 
-    def _cache_key(self, provider: WebSearchProvider, query: str, max_results: int) -> str:
-        return f"{provider.id}\0{max_results}\0{query.strip().lower()}"
+    def _cache_key(
+        self, provider: WebSearchProvider, query: str, max_results: int, config: ToolsConfig | None = None
+    ) -> str:
+        variant = provider.cache_variant(config) if config is not None else ""
+        return f"{provider.id}\0{variant}\0{max_results}\0{query.strip().lower()}"
 
-    def _cached(self, provider: WebSearchProvider, query: str, max_results: int) -> WebSearchResponse | None:
-        key = self._cache_key(provider, query, max_results)
+    def _cached(
+        self, provider: WebSearchProvider, query: str, max_results: int, config: ToolsConfig | None = None
+    ) -> WebSearchResponse | None:
+        key = self._cache_key(provider, query, max_results, config)
         item = self._cache.get(key)
         if not item:
             return None
@@ -722,8 +735,15 @@ class WebSearchProviderRegistry:
             metadata=response.metadata,
         )
 
-    def _store_cache(self, provider: WebSearchProvider, query: str, max_results: int, response: WebSearchResponse) -> None:
-        self._cache[self._cache_key(provider, query, max_results)] = (
+    def _store_cache(
+        self,
+        provider: WebSearchProvider,
+        query: str,
+        max_results: int,
+        response: WebSearchResponse,
+        config: ToolsConfig | None = None,
+    ) -> None:
+        self._cache[self._cache_key(provider, query, max_results, config)] = (
             time.monotonic() + _CACHE_TTL_SECONDS,
             response,
         )
@@ -750,7 +770,7 @@ class WebSearchProviderRegistry:
 
         errors: list[str] = []
         for provider in candidates:
-            cached = self._cached(provider, query, max_results)
+            cached = self._cached(provider, query, max_results, config)
             if cached:
                 return cached, errors
             try:
@@ -759,7 +779,7 @@ class WebSearchProviderRegistry:
                     max_results=max_results,
                     config=config,
                 )
-                self._store_cache(provider, query, max_results, response)
+                self._store_cache(provider, query, max_results, response, config)
                 return response, errors
             except WebSearchProviderError as exc:
                 errors.append(f"{provider.label}: {exc}")
