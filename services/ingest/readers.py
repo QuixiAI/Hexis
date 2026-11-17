@@ -874,17 +874,32 @@ class PptxReader(DocumentReader):
         parts: list[str] = []
         for i, slide in enumerate(prs.slides):
             slide_texts: list[str] = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
-                        text = para.text.strip()
-                        if text:
-                            slide_texts.append(text)
+            cls._collect_shape_texts(slide.shapes, slide_texts)
             if slide_texts:
                 parts.append(f"[Slide {i + 1}]\n" + "\n".join(slide_texts))
 
         header = f"[Format: PPTX]\n[File: {file_path.name}]\n[Slides: {len(prs.slides)}]"
         return f"{header}\n\n" + "\n\n".join(parts)
+
+    @classmethod
+    def _collect_shape_texts(cls, shapes, texts: list[str]) -> None:
+        """Append the text of ``shapes`` in order, including grouped shapes and
+        tables; table rows are tab-separated, as in ``DocxReader``."""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        for shape in shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                cls._collect_shape_texts(shape.shapes, texts)
+            elif shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    text = para.text.strip()
+                    if text:
+                        texts.append(text)
+            elif getattr(shape, "has_table", False):
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        texts.append("\t".join(cells))
 
 
 class XlsxReader(DocumentReader):
