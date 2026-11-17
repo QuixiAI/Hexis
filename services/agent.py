@@ -192,6 +192,7 @@ class SubconsciousOutput:
     model: str = ""
     request_messages: list[dict[str, Any]] = field(default_factory=list)
     raw_response: Any = None
+    runtime_recoveries: list[dict[str, Any]] = field(default_factory=list)
 
     # Observational patterns (passed through for completeness)
     narrative_observations: list[dict[str, Any]] = field(default_factory=list)
@@ -227,6 +228,14 @@ async def render_subconscious_signals_db(
     text; Python only supplies the signals JSON. Empty output short-circuits
     to '' without a round-trip.
     """
+    runtime_notice = ""
+    if output.runtime_recoveries:
+        kinds = ", ".join(str(event["kind"]) for event in output.runtime_recoveries)
+        runtime_notice = (
+            "## Runtime Status\nThe subconscious inference phase encountered runtime errors or recovery: "
+            + kinds + ". Briefly acknowledge the interruption in conversation. "
+            "A missing appraisal is unavailable evidence, not evidence of emotional neutrality."
+        )
     if not (
         output.instincts
         or output.emotional_state
@@ -234,13 +243,13 @@ async def render_subconscious_signals_db(
         or output.salient_memories
         or output.subconscious_response
     ):
-        return ""
+        return runtime_notice
     signals = _subconscious_event_payload(output)["signals"]
     raw = await conn.fetchval(
         "SELECT render_subconscious_signals($1::jsonb)",
         json.dumps(signals, default=str),
     )
-    return str(raw or "")
+    return "\n\n".join(part for part in (runtime_notice, str(raw or "")) if part)
 
 
 def _subconscious_event_payload(output: SubconsciousOutput) -> dict[str, Any]:
@@ -475,7 +484,14 @@ async def render_chat_continuity_context_db(
     except Exception:
         logger.debug("Operator policy context unavailable", exc_info=True)
         policy_context = ""
-    return "\n\n".join(part for part in (continuity, policy_context) if part)
+    try:
+        runtime_context = str(await conn.fetchval(
+            "SELECT render_chat_runtime_context($1::text)", session_id,
+        ) or "").strip()
+    except Exception:
+        logger.warning("Runtime recovery context unavailable", exc_info=True)
+        runtime_context = ""
+    return "\n\n".join(part for part in (runtime_context, continuity, policy_context) if part)
 
 
 async def render_recent_conversation_carryover_db(
@@ -602,6 +618,7 @@ async def run_subconscious_appraisal(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    runtime_recoveries: list[dict[str, Any]] = []
     try:
         doc, raw = await chat_json(
             llm_config=llm_config,
@@ -614,6 +631,7 @@ async def run_subconscious_appraisal(
             # and returned an empty appraisal after most of a minute.
             reasoning_effort="low",
             usage_source="subconscious",
+            on_recovery=runtime_recoveries.append,
         )
     except Exception as exc:
         logger.warning("Subconscious appraisal failed: %s", exc)
@@ -622,6 +640,7 @@ async def run_subconscious_appraisal(
             model=str(llm_config.get("model") or ""),
             request_messages=request_messages,
             raw_response={"error": str(exc)},
+            runtime_recoveries=[*runtime_recoveries, {"kind": "subconscious_inference_failed"}],
         )
 
     if not isinstance(doc, dict):
@@ -681,6 +700,7 @@ async def run_subconscious_appraisal(
     output.model = str(llm_config.get("model") or "")
     output.request_messages = request_messages
     output.raw_response = raw
+    output.runtime_recoveries = runtime_recoveries
     return output
 
 

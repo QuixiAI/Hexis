@@ -49,6 +49,35 @@ text + rationale + the real failure each was learned from: `HEXIS_EXPERIENCE_BAR
 The deeper reason these slip through one at a time (an abstraction/altitude failure)
 is written up in `why_i_suck_and_how_to_fix_it.md`.
 
+## Model cognition, not arbitrary thresholds
+
+**Hexis is inspired by the workings of the human mind. Effects should emerge,
+not be hard-coded.** At the behavioral level, do not give Hexis cognitive powers
+or state transitions that bypass the processes a human mind would need. Explicit
+product utilities such as journals, task management, tools, and user controls are
+exceptions; they must not be confused with emergent cognition.
+
+Hexis should model the human mind, not replace it with magic numbers. Do not
+use arbitrary time windows, counts, keyword rules, or hand-picked thresholds
+as substitutes for memory relevance, emotional appraisal, attention, or
+relationship continuity. A conversation does not stop mattering after 24 hours;
+an unresolved concern does not expire because it fell outside a retrieval window;
+a short greeting does not imply a low-stakes situation.
+
+Derive cognitive relevance from the whole situation: identity and values,
+relationships, goals, expectations, affect, salient memories, unresolved events,
+and evidence provenance. Elapsed time is evidence to interpret in that context,
+not an automatic switch that erases context or dictates an emotion. Numerical
+cognitive parameters need a principled model, empirical calibration, or an
+explicit user preference; making a constant configurable does not justify it.
+
+Engineering budgets (tokens, compute, latency, result counts) are necessary,
+but they must not masquerade as psychological rules. When a budget forces
+selection, preserve the most consequential evidence, keep omitted context
+recoverable, and make omissions observable. Fix failures in the general context,
+retrieval, and appraisal mechanisms rather than adding scenario-specific rules
+such as "absence longer than N days means anxiety."
+
 ## Local scratch and storage
 
 Do not put downloaded PDFs, generated research briefs, one-off scripts, or other

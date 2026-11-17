@@ -652,6 +652,13 @@ class AgentLoop:
             },
         )
 
+        async def _on_recovery(event: dict[str, Any]) -> None:
+            await self._emit(AgentEvent.PHASE_CHANGE, {
+                "phase": "llm_recovery", "provider": llm.get("provider"),
+                "model": llm.get("model"), "iteration": self._iteration_count,
+                **event,
+            })
+
         if self._streaming:
             first_token = True
             received_text = False
@@ -687,12 +694,15 @@ class AgentLoop:
                 model=llm["model"],
                 endpoint=llm.get("endpoint"),
                 api_key=llm.get("api_key"),
+                fallbacks=llm.get("fallbacks"),
+                inference_timeout=max(0.1, cfg.timeout_seconds - (time.monotonic() - self._started_at) - 1.0),
                 messages=model_messages,
                 tools=tools if tools else None,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 on_text_delta=_on_text_delta,
                 on_reasoning_delta=_on_reasoning_delta,
+                on_recovery=_on_recovery,
                 auth_mode=llm.get("auth_mode"),
             )
             if cleaner is not None:
@@ -709,11 +719,14 @@ class AgentLoop:
                 model=llm["model"],
                 endpoint=llm.get("endpoint"),
                 api_key=llm.get("api_key"),
+                fallbacks=llm.get("fallbacks"),
+                inference_timeout=max(0.1, cfg.timeout_seconds - (time.monotonic() - self._started_at) - 1.0),
                 messages=model_messages,
                 tools=tools if tools else None,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 auth_mode=llm.get("auth_mode"),
+                on_recovery=_on_recovery,
             )
             if cleaner is not None:
                 original = result.get("content") or ""
@@ -731,8 +744,8 @@ class AgentLoop:
         session_key = cfg.session_id or cfg.heartbeat_id
         asyncio.ensure_future(
             record_llm_usage(
-                provider=llm["provider"],
-                model=llm["model"],
+                provider=result.get("provider", llm["provider"]),
+                model=result.get("model", llm["model"]),
                 raw_response=result.get("raw"),
                 operation="stream" if self._streaming else "chat",
                 session_key=session_key,
@@ -745,8 +758,8 @@ class AgentLoop:
             AgentEvent.LLM_RESPONSE,
             {
                 "iteration": self._iteration_count,
-                "provider": llm.get("provider"),
-                "model": llm.get("model"),
+                "provider": result.get("provider", llm.get("provider")),
+                "model": result.get("model", llm.get("model")),
                 "content": result.get("content") or "",
                 "tool_calls": result.get("tool_calls") or [],
             },

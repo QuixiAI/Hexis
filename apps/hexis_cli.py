@@ -401,6 +401,7 @@ _HELP_GROUPS = [
             ("ps", "List services"),
             ("logs", "Show logs"),
             ("service", "Run workers as launchd/systemd user services"),
+            ("inference", "Inspect or configure the built-in offline fallback"),
             ("start", "Start heartbeat and maintenance workers manually if stopped"),
             ("stop", "Stop workers (containers stay running)"),
         ],
@@ -694,6 +695,26 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--follow", "-f", action="store_true", help="Follow log output")
     logs.add_argument("services", nargs="*", default=[], help="Service name(s)")
     logs.set_defaults(func="logs")
+
+    inference = sub.add_parser("inference", help="Manage the built-in offline inference fallback")
+    inference_sub = inference.add_subparsers(dest="inference_action")
+    for action in ("setup", "start", "status", "stop", "disable"):
+        command = inference_sub.add_parser(action)
+        command.add_argument("--json", action="store_true")
+        command.set_defaults(func="inference")
+    configure = inference_sub.add_parser(
+        "configure",
+        help="Select managed backends or explicitly connect existing services",
+    )
+    configure.add_argument("--backend", choices=("auto", "cpu", "cuda", "vulkan"))
+    configure.add_argument("--local-url")
+    configure.add_argument("--local-model")
+    configure.add_argument("--gateway-url")
+    configure.add_argument("--gateway-model")
+    configure.add_argument("--openrouter-api-key-ref")
+    configure.add_argument("--context-tokens", type=int)
+    configure.set_defaults(func="inference")
+    inference.set_defaults(func="inference", inference_action="status", json=False)
 
     service = sub.add_parser(
         "service",
@@ -4016,6 +4037,106 @@ def _stop_owned_voice_sidecar() -> tuple[bool, bool, str | None]:
         return False, False, f"Could not stop the Hexis-owned voice process: {exc}"
 
 
+def _start_inference_runtime(instance=None, dsn=None, *, force_routing=False) -> bool:
+    """Normal startup owns provisioning; users never install companion tools."""
+    from apps.cli_theme import console
+    from core.inference_runtime import Runtime, configure_database
+
+    try:
+        runtime = Runtime(instance)
+        if not runtime.config()["enabled"]:
+            return True
+        console.print(
+            "[muted]Preparing Hexis inference fallback (first setup downloads the local model)...[/muted]"
+        )
+        result = runtime.ensure(
+            progress=lambda text: console.print(f"[muted]{text}[/muted]")
+        )
+        if not result["ready"]:
+            raise RuntimeError(
+                "Inference startup did not verify both endpoints; inspect hexis inference status."
+            )
+        registered = asyncio.run(
+            configure_database(
+                dsn or db_dsn_from_env(instance), instance, force=force_routing
+            )
+        )
+        if registered:
+            console.print("[ok]Offline inference fallback ready.[/ok]")
+        else:
+            console.print(
+                "[ok]Local inference is ready; your custom fallback routing was preserved.[/ok]"
+            )
+        return bool(result["ready"])
+    except Exception as exc:
+        console.print(
+            f"[warn]Offline fallback is not ready: {exc}[/warn]\nRun [accent]hexis inference setup[/accent] to retry or resume the download. Your primary provider remains configured."
+        )
+        return False
+
+
+def _handle_inference(args) -> int:
+    from core.inference_runtime import Runtime, configure_database
+
+    runtime = Runtime(args.instance)
+    action = args.inference_action or "status"
+    if action == "configure":
+        keys = (
+            "backend",
+            "local_url",
+            "local_model",
+            "gateway_url",
+            "gateway_model",
+            "openrouter_api_key_ref",
+            "context_tokens",
+        )
+        if args.context_tokens is not None and args.context_tokens < 1:
+            raise ValueError("--context-tokens must be positive")
+        runtime.stop()
+        runtime.configure(
+            enabled=True, **{key: getattr(args, key, None) for key in keys}
+        )
+        return (
+            0
+            if _start_inference_runtime(
+                args.instance, _get_dsn(args), force_routing=True
+            )
+            else 1
+        )
+    if action in {"setup", "start"}:
+        runtime.configure(enabled=True)
+        return (
+            0
+            if _start_inference_runtime(
+                args.instance, _get_dsn(args), force_routing=True
+            )
+            else 1
+        )
+    if action in {"stop", "disable"}:
+        result = runtime.stop(disable=action == "disable")
+    else:
+        result = runtime.status()
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+    else:
+        print(
+            "Offline fallback: "
+            + (
+                "ready"
+                if result["ready"]
+                else "disabled" if not result["enabled"] else "not ready"
+            )
+        )
+        for name in ("gateway", "local"):
+            item = result[name]
+            print(
+                f"  {name}: {item['url'] or 'not configured'} ({'external' if item['external'] else 'Hexis managed'})"
+            )
+        if result["enabled"] and not result["ready"]:
+            print("Run `hexis inference setup` to prepare or repair the fallback.")
+    return 0
+
+
 def _get_dsn(args) -> str:
     """Get DSN respecting --instance flag, --dsn flag, or defaults."""
     if hasattr(args, "dsn") and args.dsn:
@@ -7204,6 +7325,13 @@ def _uninstall(
     if voice_stopped:
         print("Stopped the local voice process started by Hexis.")
 
+    try:
+        from core.inference_runtime import uninstall_runtimes
+        uninstall_runtimes()
+    except Exception as exc:
+        _print_err(f"Could not stop owned inference companions: {exc}. The CLI was kept; run hexis inference status and retry uninstall.")
+        return 1
+
     # User services execute the installed Python package. Remove those managed
     # references before uninstalling the package so launchd/systemd cannot keep
     # retrying an executable that no longer exists. Logs remain unless --purge
@@ -7399,7 +7527,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
             }:
                 fwd_argv = ["ingest", *fwd_argv]
 
-        return _run_module(forward_map[cmd], fwd_argv)
+        rc = _run_module(forward_map[cmd], fwd_argv)
+        if cmd == "init" and rc == 0 and not any(flag in fwd_argv for flag in ("-h", "--help")):
+            _start_inference_runtime(instance)
+        return rc
 
     parser = build_parser()
     args = parser.parse_args(raw_argv)
@@ -7431,6 +7562,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     compose_file, is_source = _find_compose_file()
     stack_root = _stack_root_from_compose(compose_file) if compose_file else Path.cwd()
     env_file = resolve_env_file(stack_root)
+
+    if func == "inference":
+        return _handle_inference(args)
 
     # Instance management commands (don't need docker)
     if func == "instance":
@@ -7765,6 +7899,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             except Exception:
                 pass  # never block startup
 
+            _start_inference_runtime(args.instance)
             voice_started, voice_note = _start_configured_voice_sidecar()
             if voice_started:
                 console.print("  [ok]Local speech[/ok] Piper sidecar is ready")
@@ -7845,6 +7980,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             console.print("[ok]Local speech sidecar is ready.[/ok]")
         if voice_note:
             console.print(f"[warn]⚠ Local speech:[/warn] {voice_note}")
+        _start_inference_runtime(args.instance)
         console.print("\n[ok]Stack is running in watch mode.[/ok]")
         console.print(
             "  Edits under core/ services/ apps/ channels/ plugins/ skills/ and db/"
@@ -7886,6 +8022,8 @@ def _dispatch(argv: list[str] | None = None) -> int:
             compose_cmd or [], compose_file, stack_root, ["down"], env_file
         )
         if rc == 0:
+            from core.inference_runtime import Runtime
+            Runtime(args.instance).stop()
             stopped_sidecar, sidecar_note = _stop_owned_local_embedding_service()
             if stopped_sidecar:
                 print("Stopped the embedding service started by Hexis.")
@@ -8231,6 +8369,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
                     check_llm=bool(getattr(args, "llm", False)),
                 )
             )
+
+        from core.inference_runtime import Runtime
+        try:
+            inference = Runtime(args.instance).status()
+            checks.append({"label": "Offline inference", "status": "OK" if inference["ready"] else "WARN",
+                           "detail": "Offline inference fallback ready" if inference["ready"] else "Offline fallback disabled" if not inference["enabled"] else "Offline fallback unavailable; run hexis inference setup"})
+        except Exception as exc:
+            checks.append({"label": "Offline inference", "status": "WARN", "detail": str(exc)})
 
         if args.json:
             sys.stdout.write(json.dumps(checks, indent=2) + "\n")

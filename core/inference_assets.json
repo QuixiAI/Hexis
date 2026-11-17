@@ -1,0 +1,148 @@
+{
+  "version": 1,
+  "gateway_version": "v0.2.1",
+  "llama_version": "b12359",
+  "platforms": {
+    "darwin-arm64": {
+      "gateway": {
+        "url": "https://github.com/QuixiAI/QuixiGate/releases/download/v0.2.1/quixigate-aarch64-apple-darwin.tar.gz",
+        "sha256": "62f580c7bb09e52606e16a7a26b107c65304979be9e7c086f211ad149e642909",
+        "size": 9528068,
+        "filename": "quixigate-aarch64-apple-darwin.tar.gz"
+      },
+      "cpu": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-macos-arm64.tar.gz",
+          "sha256": "82b00abc740160e1b9980e6cc79c117345fa34af058c80e6c0a69aa8ddccde75",
+          "size": 16907811,
+          "filename": "llama-b12359-bin-macos-arm64.tar.gz"
+        }
+      ]
+    },
+    "darwin-x86_64": {
+      "gateway": {
+        "url": "https://github.com/QuixiAI/QuixiGate/releases/download/v0.2.1/quixigate-x86_64-apple-darwin.tar.gz",
+        "sha256": "bd211566a77699b692a021e16cbce37c7bb49f6a20426969cb8cf7f90014237e",
+        "size": 10258428,
+        "filename": "quixigate-x86_64-apple-darwin.tar.gz"
+      },
+      "cpu": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-macos-x64.tar.gz",
+          "sha256": "25320d529077ef5a3d16e7b5da26438f221d88c8c0930a32b0c79457f5eede56",
+          "size": 12661621,
+          "filename": "llama-b12359-bin-macos-x64.tar.gz"
+        }
+      ]
+    },
+    "linux-x86_64": {
+      "gateway": {
+        "url": "https://github.com/QuixiAI/QuixiGate/releases/download/v0.2.1/quixigate-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "3952256a6d7487974d25b56d6909335442cfeb60277531d62d2257a9ef9d5bb7",
+        "size": 10669649,
+        "filename": "quixigate-x86_64-unknown-linux-gnu.tar.gz"
+      },
+      "cpu": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-ubuntu-x64.tar.gz",
+          "sha256": "0bc1f091e8916102b6d8f2cf944233a620e90a0f856c72d0ce41150c65c2e72e",
+          "size": 23311084,
+          "filename": "llama-b12359-bin-ubuntu-x64.tar.gz"
+        }
+      ],
+      "cuda": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "sha256": "50c937bec5bbd9f74c99138034f7403283ee21f1943f2429d7b1e4c079eafc11",
+          "size": 199223370,
+          "filename": "llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        },
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+          "sha256": "75a12d227f44a391608992329241765343bd143ee9445b90dc62e154ee726e5d",
+          "size": 594371571,
+          "filename": "cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz"
+        }
+      ],
+      "vulkan": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-ubuntu-vulkan-x64.tar.gz",
+          "sha256": "19b60f00395a3f4954e46a5037695bc1d843404fc9d3124f82a612ecd8fbe9f0",
+          "size": 36153377,
+          "filename": "llama-b12359-bin-ubuntu-vulkan-x64.tar.gz"
+        }
+      ]
+    },
+    "linux-arm64": {
+      "gateway": {
+        "url": "https://github.com/QuixiAI/QuixiGate/releases/download/v0.2.1/quixigate-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "53856671975809d2d5ce210aad0d66a05a2d3e35a2727f50bae73ba3e4fb1d57",
+        "size": 9935932,
+        "filename": "quixigate-aarch64-unknown-linux-gnu.tar.gz"
+      },
+      "cpu": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-ubuntu-arm64.tar.gz",
+          "sha256": "dc7aa17a67884619b7223870aca9fd6addbc01717713b04a714add1c31137359",
+          "size": 18949862,
+          "filename": "llama-b12359-bin-ubuntu-arm64.tar.gz"
+        }
+      ],
+      "vulkan": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-ubuntu-vulkan-arm64.tar.gz",
+          "sha256": "3f8ae812a58ac92e5a596ca9fbc988f52854d147c5a7fe1264dddc90c1d085b4",
+          "size": 29435221,
+          "filename": "llama-b12359-bin-ubuntu-vulkan-arm64.tar.gz"
+        }
+      ]
+    },
+    "windows-x86_64": {
+      "gateway": {
+        "url": "https://github.com/QuixiAI/QuixiGate/releases/download/v0.2.1/quixigate-x86_64-pc-windows-msvc.zip",
+        "sha256": "51b8d8b668a5eed4ae77bff8d52cd590169f024c29802b4de92e4258f7fb435f",
+        "size": 11518639,
+        "filename": "quixigate-x86_64-pc-windows-msvc.zip"
+      },
+      "cpu": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-win-cpu-x64.zip",
+          "sha256": "837c1655e87df3b66989f4be33a792a1399c785bf259038dc75c900096683e69",
+          "size": 25097509,
+          "filename": "llama-b12359-bin-win-cpu-x64.zip"
+        }
+      ],
+      "cuda": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-win-cuda-12.4-x64.zip",
+          "sha256": "e9c0abf442e8339c06728366c1ad2c711332f9939c0c00603fb75d85fd44c914",
+          "size": 318976332,
+          "filename": "llama-b12359-bin-win-cuda-12.4-x64.zip"
+        },
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/cudart-llama-bin-win-cuda-12.4-x64.zip",
+          "sha256": "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+          "size": 391443627,
+          "filename": "cudart-llama-bin-win-cuda-12.4-x64.zip"
+        }
+      ],
+      "vulkan": [
+        {
+          "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12359/llama-b12359-bin-win-vulkan-x64.zip",
+          "sha256": "e8d18c6e4210cca87e7307c2ea78363ac8d158e4e1397358ec96ab70b53a0d5e",
+          "size": 38090643,
+          "filename": "llama-b12359-bin-win-vulkan-x64.zip"
+        }
+      ]
+    }
+  },
+  "model": {
+    "url": "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf/resolve/675cff42a74c774d6cb76f76d8eacb49b48c9b93/gemma-4-E2B_q4_0-it.gguf",
+    "sha256": "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
+    "size": 3349516256,
+    "filename": "gemma-4-E2B_q4_0-it.gguf",
+    "id": "gemma-4-E2B-q4_0-qat",
+    "license": "Apache-2.0",
+    "source": "https://huggingface.co/google/gemma-4-E2B-it-qat-q4_0-gguf"
+  }
+}

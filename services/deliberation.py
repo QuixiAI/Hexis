@@ -266,6 +266,7 @@ async def _chat(
         model=config["model"],
         endpoint=config.get("endpoint"),
         api_key=config.get("api_key"),
+        fallbacks=config.get("fallbacks"),
         auth_mode=config.get("auth_mode"),
         messages=[
             {"role": "system", "content": system},

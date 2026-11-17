@@ -117,6 +117,7 @@ Treat those statements as unverified.
 
 - A running Docker daemon with Compose — [Docker Desktop](https://docs.docker.com/get-docker/), or Docker CLI + [Colima](https://github.com/abiosoft/colima) on macOS
 - The local embedding sidecar; `hexis init` starts the published `embeddinggemma` binary and downloads the ~300M-parameter model on first use
+- Hexis also prepares its own offline inference fallback automatically: verified QuixiGate/llama.cpp runtimes and a ~3.3 GB Gemma model download on first setup; no separate runtime installation is needed
 - For the default path below: a **ChatGPT Plus/Pro subscription** (it authenticates via browser OAuth — no API key). No subscription? Use any provider under "Other providers."
 
 ```bash

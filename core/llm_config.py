@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Callable, Coroutine
 
 from core.llm import normalize_llm_config, normalize_provider
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
@@ -153,7 +156,32 @@ async def load_llm_config(
         default_model=default_model,
     )
     cfg.update(identity)
-    await apply_provider_credentials(cfg)
+    if "fallbacks" not in cfg:
+        fallback_routes = await conn.fetchval("SELECT get_config('llm.fallbacks')")
+        if isinstance(fallback_routes, str):
+            fallback_routes = json.loads(fallback_routes)
+        if isinstance(fallback_routes, list):
+            cfg["fallbacks"] = fallback_routes
+    # Instance markers resolve at call time so a restarted companion can
+    # move off a busy port without rewriting user configuration or stale URLs.
+    if cfg.get("fallbacks"):
+        from core.inference_runtime import resolved_routes
+        expanded = []
+        for route in cfg["fallbacks"]:
+            if isinstance(route, dict) and route.get("managed_runtime"):
+                expanded.extend(resolved_routes(route["managed_runtime"]))
+            else:
+                expanded.append(route)
+        cfg["fallbacks"] = expanded
+    try:
+        await apply_provider_credentials(cfg)
+    except Exception as exc:
+        if not cfg.get("fallbacks"):
+            raise
+        # Dispatch retries credential resolution and records any failure before
+        # using the configured fallback. Expired primary auth must not prevent
+        # loading a usable fallback route in the first place.
+        logger.warning("Primary credentials unavailable (%s); inference dispatch will try configured recovery routes", type(exc).__name__)
     return normalize_llm_config(cfg, default_model=default_model)
 
 

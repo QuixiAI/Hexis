@@ -53,6 +53,63 @@ SELECT set_config('agent.name', '"MyAgent"'::jsonb);
 | `llm.extraction.*` | text | Conscious-extraction LLM (falls back to subconscious) |
 | `llm.inbound_disposition` | object/null | Optional ambiguity-classifier override (falls back to `llm.subconscious`) |
 
+### Inference recovery
+
+Normal `hexis init`, `hexis up`, and `hexis dev` prepare the offline fallback.
+Hexis downloads pinned, SHA-256-verified QuixiGate and llama.cpp binaries into
+its own cache and the Google Gemma 4 E2B QAT Q4_0 model (~3.3 GB) on first setup.
+No separate QuixiGate, llama.cpp, or Ollama installation is required. Downloads
+resume after interruption; model weights are kept outside application images.
+
+Each instance has private ownership/configuration under `~/.hexis/inference/`.
+Companions use separate dynamically allocated ports, retain them while free,
+and move if another listener occupies one. Current ports are resolved at model
+call time, including from Docker workers. Native Linux uses the Hexis Docker
+private bridge when necessary; desktop listeners use loopback. Existing user
+processes and their stores are never adopted or stopped automatically.
+
+The verified macOS runtime supports Metal; other supported targets select a
+usable CUDA/Vulkan build when available and retain a CPU fallback. Resource
+budgets are infrastructure settings: `--context-tokens` controls the local
+context capacity. Overflow is rejected rather than silently shifting away
+part of the agent's prompt. The supervisor restarts exited companions;
+macOS launchd/Linux user services restore it on login where available.
+
+```bash
+hexis inference status --json
+hexis inference setup                 # resume setup or repair readiness
+hexis inference configure --backend cpu
+hexis inference disable               # stop owned processes, preserve assets
+hexis inference start                 # enable and start again
+```
+
+An existing QuixiGate or llama.cpp installation can be selected explicitly:
+
+```bash
+hexis inference configure --local-url http://localhost:8080/v1 --local-model YOUR_MODEL
+hexis inference configure --gateway-url http://localhost:4000/v1 --gateway-model YOUR_ROUTE
+```
+
+External services remain externally managed. Empty URL options return to the
+managed service. Free-cloud overflow is opt-in via
+`hexis inference configure --openrouter-api-key-ref YOUR_STORED_CREDENTIAL`;
+the gateway routes only through `openrouter/free`, then the local model.
+No cloud credential is required for offline recovery. A direct local route
+remains available if QuixiGate itself fails.
+
+`llm.fallbacks` is an ordered JSON array. Explicit routes use the usual LLM
+configuration fields. Hexis adds a `managed_runtime` instance marker for its
+companions rather than persisting potentially stale ports. A role's `fallbacks`
+array overrides this global list; `[]` disables fallback for that role.
+
+Recovery retries temporary transport/server failures, adapts explicitly rejected
+optional features, and preserves instructions and tools. Routes share a time
+budget so primary retries cannot consume the whole turn. Already delivered
+text/reasoning is not replayed automatically. Runtime receipts inform the model
+and agent-turn event log; failed chat replies stay in continuity until a
+subsequent successful reply, with no age cutoff. Conversational replies are
+asked to acknowledge the interruption; structured calls retain their schema.
+
 ### Community-model opening dividers
 
 Some community models emit an unwanted `---`, `***`, or `___` before their
