@@ -376,6 +376,18 @@ async def config_validate(
             if not model:
                 warnings.append(f"{name}.model is empty (will rely on worker defaults)")
 
+            # A key typed in the dashboard lives in the auth store under this reference.
+            if str(val.get("api_key_ref") or "").strip():
+                from core.llm import load_stored_api_key
+
+                if load_stored_api_key(str(val.get("api_key_ref")).strip()):
+                    return
+                errors.append(
+                    f"{name}: the saved API key ({val.get('api_key_ref')}) is missing from the "
+                    "auth store. Re-enter it in the dashboard's Models step or `hexis init`."
+                )
+                return
+
             if provider == "openai-codex":
                 oauth = cfg.get("oauth.openai_codex")
                 if (
@@ -397,6 +409,7 @@ async def config_validate(
                 "minimax-portal": "oauth.minimax_portal",
                 "google-gemini-cli": "oauth.google_gemini_cli",
                 "google-antigravity": "oauth.google_antigravity",
+                "xai-oauth": "oauth.xai",
             }
             oauth_key = _oauth_providers.get(provider)
             if oauth_key:
@@ -708,27 +721,59 @@ async def doctor_payload(
                 {"label": "Worker/schema version", "status": "WARN", "detail": str(exc)}
             )
 
-        # 3. RabbitMQ (check config, not connectivity -- avoids dependency)
+        # 2b. Released migrations unchanged since this database applied them.
         try:
-            rmq_url = await conn.fetchval(
-                "SELECT value FROM config WHERE key = 'rabbitmq.url'"
-            )
-            if rmq_url:
-                checks.append(
-                    {"label": "RabbitMQ", "status": "OK", "detail": "configured"}
-                )
+            from core.migrations import changed_migrations
+
+            changed = await changed_migrations(conn)
+            if changed:
+                checks.append({
+                    "label": "Migrations",
+                    "status": "FAIL",
+                    "detail": (
+                        f"edited after they were applied here: {', '.join(changed)}. The edits "
+                        "never ran on this database. Restore the released files; schema changes "
+                        "go in a new migration."
+                    ),
+                })
             else:
-                checks.append(
-                    {
-                        "label": "RabbitMQ",
-                        "status": "WARN",
-                        "detail": "not configured (outbox delivery disabled)",
-                    }
-                )
-        except Exception:
-            checks.append(
-                {"label": "RabbitMQ", "status": "WARN", "detail": "not configured"}
-            )
+                checks.append({"label": "Migrations", "status": "OK", "detail": "applied files unchanged"})
+        except Exception as exc:
+            checks.append({"label": "Migrations", "status": "WARN", "detail": str(exc)})
+
+        # 3. RabbitMQ: the broker the workers use, reached the same way they
+        # reach it (RABBITMQ_MANAGEMENT_URL and credentials from the
+        # environment, as in docker-compose.yml). It used to read a
+        # rabbitmq.url config key nothing sets, so it warned on every install.
+        try:
+            from core.rabbitmq_bridge import RabbitMQBridge
+
+            bridge = RabbitMQBridge(None)
+            rmq_url = bridge.management_url
+            resp = await bridge._request("GET", "/api/overview")
+            if resp.status_code == 200:
+                checks.append({"label": "RabbitMQ", "status": "OK", "detail": f"reachable at {rmq_url}"})
+            elif resp.status_code == 401:
+                checks.append({
+                    "label": "RabbitMQ",
+                    "status": "WARN",
+                    "detail": (
+                        f"{rmq_url} rejected RABBITMQ_USER/RABBITMQ_PASSWORD; they must match "
+                        "RABBITMQ_DEFAULT_USER/RABBITMQ_DEFAULT_PASS in .env (outbox delivery disabled)"
+                    ),
+                })
+            else:
+                checks.append({
+                    "label": "RabbitMQ",
+                    "status": "WARN",
+                    "detail": f"{rmq_url} answered HTTP {resp.status_code} (outbox delivery disabled)",
+                })
+        except Exception as exc:
+            checks.append({
+                "label": "RabbitMQ",
+                "status": "WARN",
+                "detail": f"cannot reach the broker: {type(exc).__name__} (outbox delivery disabled)",
+            })
 
         # 4. Agent configured
         try:
@@ -885,7 +930,7 @@ async def doctor_payload(
                 if mode not in latest_by_mode:
                     latest_by_mode[mode] = row
 
-            expected_modes = ("heartbeat", "maintenance")
+            expected_modes = ("heartbeat", "maintenance", "ingest")
             missing = [m for m in expected_modes if m not in latest_by_mode]
             stale = [
                 m

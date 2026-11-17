@@ -66,7 +66,7 @@ describe("/api/chat", () => {
 
   it("forwards configured API authentication to the stream endpoint", async () => {
     vi.stubEnv("HEXIS_API_KEY", "dashboard-api-key");
-    const fetchMock = vi.fn(async () =>
+    const fetchMock = vi.fn<typeof fetch>(async () =>
       new Response("event: done\ndata: {}\n\n", {
         headers: { "Content-Type": "text/event-stream" },
       })

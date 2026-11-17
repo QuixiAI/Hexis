@@ -917,6 +917,17 @@ BEGIN
         END IF;
     END IF;
 
+    -- An action missing its text fails alone instead of reaching a NOT NULL
+    -- insert and rolling back every action in the heartbeat.
+    IF p_action IN ('synthesize', 'reach_out_public')
+       AND NULLIF(btrim(COALESCE(p_params->>'content', '')), '') IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'error', p_action || ' requires params.content', 'action', p_action);
+    END IF;
+    IF p_action = 'reach_out_user'
+       AND NULLIF(btrim(COALESCE(p_params->>'message', '')), '') IS NULL THEN
+        RETURN jsonb_build_object('success', false, 'error', 'reach_out_user requires params.message', 'action', p_action);
+    END IF;
+
     IF p_action IN ('reach_out_user', 'reach_out_public') THEN
         IF p_action = 'reach_out_public'
            AND (
@@ -1344,14 +1355,17 @@ BEGIN
         WHEN 'reach_out_user' THEN
             queued_call := build_outbox_message(
                 'user',
-                jsonb_build_object(
+                jsonb_strip_nulls(jsonb_build_object(
                     'message', p_params->>'message',
                     'intent', p_params->>'intent',
+                    -- Where the agent wants it to reach the user
+                    -- (core.outreach_destination decides whether it may).
+                    'channel', NULLIF(p_params->>'channel', ''),
                     'heartbeat_id', p_heartbeat_id,
                     'purpose_kind', p_params->>'purpose_kind',
                     'purpose_reference', p_params->>'purpose_reference',
                     'urgency', COALESCE(p_params->>'urgency', 'normal')
-                )
+                ))
             );
             outbox_messages := outbox_messages || jsonb_build_array(queued_call);
             result := jsonb_build_object('queued', true, 'outbox_message', queued_call);

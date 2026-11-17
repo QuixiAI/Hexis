@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from core.llm_config import load_llm_config
+from core.chat_priority import wait_for_chat_idle
 from core.llm_json import chat_json
 from services.prompt_resources import load_memory_summarization_prompt
 
@@ -42,6 +43,7 @@ async def run_memory_summarization_step(conn) -> dict[str, Any]:
         memory_id = row["memory_id"]
         content = row["content"] or ""
         try:
+            await wait_for_chat_idle(conn)  # chat comes first
             doc, _raw = await chat_json(
                 llm_config=llm_config,
                 messages=[

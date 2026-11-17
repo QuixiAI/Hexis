@@ -193,3 +193,94 @@ async def test_run_gmail_backfill_step_stores_source_documents_and_ingestion_job
     assert _j(items[0]["raw_metadata"])["gmail_history_id"] == "history-msg-1"
     assert "First full email body." in opened["content"]
     assert opened["source_attribution"]["connector_id"] == "gmail"
+
+
+async def test_a_token_without_mail_access_fails_at_once_and_says_why(db_pool, monkeypatch, tmp_path):
+    """Google can sign someone in without the "read your email" permission;
+    the import then fails now with that reason instead of retrying in silence."""
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    marker = get_test_identifier("gmail-noscope")
+    account = f"eric-{marker}@example.com"
+    save_auth(
+        GMAIL_DEFAULT_CREDENTIAL_REF,
+        {
+            "type": "authorized_user",
+            "token": "access-token",
+            "refresh_token": "refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "client",
+            "client_secret": "secret",
+            "expires_ms": now_ms() + 3_600_000,
+            "account_email": account,
+            "scopes": ["https://www.googleapis.com/auth/userinfo.email", "openid"],
+        },
+    )
+    await _connected_gmail(db_pool, marker, account)
+    async with db_pool.acquire() as conn:
+        job = _j(await conn.fetchval(
+            "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages', '{}'::jsonb, '{\"test\": true}'::jsonb)",
+            account,
+        ))
+
+    async def no_gmail_calls(*args, **kwargs):
+        raise AssertionError("Gmail should not be called without mail access")
+
+    monkeypatch.setattr(gmail_backfill, "_gmail_get", no_gmail_calls)
+    # Every queued job for the account is tried; each fails at the scope check.
+    await gmail_backfill.run_gmail_backfill_step(db_pool, limit=5)
+
+    async with db_pool.acquire() as conn:
+        status = _j(await conn.fetchval("SELECT get_connector_backfill_status('gmail', $1)", account))
+        connection = await conn.fetchval(
+            "SELECT status FROM integration_connections WHERE connector_id = 'gmail' AND account_key = $1", account)
+    failed = next(j for j in status["jobs"] if j["job_id"] == job["job_id"])
+    assert failed["status"] == "failed", failed
+    assert "permission to read this mailbox" in failed["error"]
+    assert connection == "needs_reauth"  # so the Gmail page offers sign-in again
+
+
+async def test_only_mail_worth_reading_is_kept():
+    """Gmail's own sorting decides; spam, promotions and automated mail are not read."""
+    def labelled(*labels, headers=()):
+        message = _message("m", subject="s", body="b")
+        message["labelIds"] = list(labels)
+        message["payload"]["headers"] += [{"name": n, "value": v} for n, v in headers]
+        return message
+
+    worth = gmail_backfill.worth_reading
+    assert worth(labelled("INBOX", "CATEGORY_PERSONAL"))
+    assert worth(labelled("INBOX", "CATEGORY_UPDATES", "IMPORTANT"))
+    assert worth(labelled("SENT"))
+    assert worth(labelled("INBOX", "CATEGORY_PROMOTIONS", "STARRED"))
+    assert not worth(labelled("SPAM"))
+    assert not worth(labelled("INBOX", "CATEGORY_PROMOTIONS", "IMPORTANT"))
+    assert not worth(labelled("INBOX", "CATEGORY_SOCIAL"))
+    assert not worth(labelled("INBOX", "CATEGORY_UPDATES"))
+    assert not worth(labelled("INBOX", headers=[("List-Unsubscribe", "<mailto:x@example.com>")]))
+    assert worth(labelled("INBOX", "IMPORTANT", headers=[("List-Id", "team.example.com")]))
+
+
+async def test_email_text_is_cleaned_of_markup_padding_and_tracking_links():
+    """HTML in the plain-text part, preheader padding, entities and tracking links are removed."""
+    raw = (
+        '<!DOCTYPE html><html><head><style>body { margin: 0; }</style></head><body>'
+        '<!--[if mso]><xml><o:PixelsPerInch>96</o:PixelsPerInch></xml><![endif]-->'
+        'MRVL a bullish opportunity.&#847; &zwnj;͏‌  ͏'
+        '<p>Hi Eric,</p><p>Your statement   is ready.</p>'
+        '<a href="https://click.e.example.com/?qs=abcdefabcdefabcdefabcdefabcdefabcdefabcdef1234">View</a>'
+        '<br>Sam&#39;s Club</body></html>'
+    )
+    text = gmail_backfill.clean_email_text(raw)
+    assert "margin" not in text and "PixelsPerInch" not in text and "<" not in text
+    assert "͏" not in text and "&#" not in text and "&zwnj;" not in text
+    assert "Your statement is ready." in text and "Sam's Club" in text
+    assert "click.e.example.com" not in text  # an HTML link keeps only its text
+    assert "Hi Eric,\n" in text  # paragraphs survive
+
+    plain = "Track it: https://click.e.example.com/?qs=abcdefabcdefabcdefabcdefabcdefabcdefabcdef1234 today"
+    assert gmail_backfill.clean_email_text(plain) == "Track it: [link: click.e.example.com] today"
+    assert gmail_backfill.clean_email_text("See https://github.com/a/b") == "See https://github.com/a/b"
+
+    assert gmail_backfill.clean_email_text("Thanks!\n\n> On Monday you wrote:\n> old text") == "Thanks!"

@@ -32,6 +32,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+# python-telegram-bot issues its API calls through httpx, and the bot token
+# is part of the request URL. httpx logs a line per request at INFO, so
+# leaving it enabled writes the token to the logs in plaintext.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("channel_worker")
 
 CHANNEL_CONFIG_POLL_INTERVAL_S = float(
@@ -469,6 +474,9 @@ async def run_channel_worker(
 
     dsn = db_dsn_from_env(instance)
     pool = await asyncpg.create_pool(dsn=dsn, min_size=2, max_size=10)
+    from core.usage import set_usage_pool
+
+    set_usage_pool(pool)  # so model calls made here count in Usage
     logger.info("Connected to database")
     worker_id = await _register_channel_worker(pool, instance)
 

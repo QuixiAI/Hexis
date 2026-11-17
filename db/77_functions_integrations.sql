@@ -922,3 +922,74 @@ BEGIN
     );
 END;
 $$;
+
+-- Google Drive: signs in with the same Google client and callback as Gmail but
+-- keeps its own token (integration.google_drive.default) and asks only for
+-- read-only Drive access. Folders are imported as connector source items by
+-- services/google_drive.py; nothing is ever written to Drive.
+INSERT INTO integration_connectors (
+    id, display_name, category, auth_type, status,
+    capability_manifest, setup_manifest, docs_url, metadata
+)
+VALUES (
+    'google_drive',
+    'Google Drive',
+    'personal_data',
+    'oauth2',
+    'available',
+    jsonb_build_object(
+        'read', jsonb_build_object(
+            'label', 'Read files in chosen folders',
+            'scopes', jsonb_build_array('https://www.googleapis.com/auth/drive.readonly'),
+            'status', 'available',
+            'scope_kind', 'read'),
+        'ingest', jsonb_build_object(
+            'label', 'Remember what is read',
+            'scopes', jsonb_build_array(),
+            'status', 'available',
+            'scope_kind', 'local')
+    ),
+    jsonb_build_object(
+        'flow', 'oauth2_authorization_code_pkce',
+        'setup_label', 'Google Drive sign-in',
+        'default_capabilities', jsonb_build_array('read', 'ingest'),
+        'capability_order', jsonb_build_array('read', 'ingest'),
+        'required_scopes', jsonb_build_array('https://www.googleapis.com/auth/userinfo.email'),
+        'scope_order', jsonb_build_array(
+            'https://www.googleapis.com/auth/userinfo.email',
+            'https://www.googleapis.com/auth/drive.readonly'),
+        'shares_client_with', 'gmail',
+        'setup_steps', jsonb_build_array(
+            'Open the Google setup page.',
+            'Create or choose a project named Hexis.',
+            'Enable the Google Drive API for that project.',
+            'Set up the app consent screen. For a personal Google account, choose External and add your address as a test user if Google asks.',
+            'On the Credentials page, click Create credentials, choose Google''s sign-in client option, set Application type to Desktop app, and name it Hexis.',
+            'Download the setup file Google gives you, and upload it on the Gmail card, which Drive shares.')
+    ),
+    'https://console.cloud.google.com/apis/library/drive.googleapis.com',
+    jsonb_build_object('provider', 'google', 'seeded_by', 'db/77_functions_integrations.sql')
+)
+ON CONFLICT (id) DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    category = EXCLUDED.category,
+    auth_type = EXCLUDED.auth_type,
+    status = EXCLUDED.status,
+    capability_manifest = EXCLUDED.capability_manifest,
+    setup_manifest = EXCLUDED.setup_manifest,
+    docs_url = EXCLUDED.docs_url,
+    metadata = EXCLUDED.metadata,
+    updated_at = CURRENT_TIMESTAMP;
+
+-- Where the agent's messages to the user go (core/outreach_destination.py),
+-- and the Drive folders it reads (services/google_drive.py).
+INSERT INTO config_defaults (key, value, description) VALUES
+    ('outreach.destination', '"auto"'::jsonb,
+     'Where messages meant for the user go besides the dashboard inbox: auto (the agent decides), slack, telegram, email, or inbox (dashboard only)'),
+    ('outreach.slack_user_id', '""'::jsonb,
+     'The user''s own Slack account (U... id) for messages to them; empty means the channel''s operator setting, else the most recent Slack DM'),
+    ('outreach.telegram_chat_id', '""'::jsonb,
+     'The user''s Telegram chat for messages to them; empty means the most recent Telegram chat'),
+    ('integrations.google_drive.folders', '[]'::jsonb,
+     'Google Drive folders the agent reads: [{"id", "name", "url"}], managed from the Connections page')
+ON CONFLICT (key) DO NOTHING;
