@@ -123,7 +123,10 @@ class TestTwitterNoAuthRequired:
 
         with (
             patch("httpx.AsyncClient", return_value=self._dummy_client()),
-            patch("plugins.installed.twitter.tools.resolve_api_key", side_effect=_resolve_key),
+            patch(
+                "plugins.installed.twitter.tools.resolve_api_key",
+                side_effect=_resolve_key,
+            ),
         ):
             result = await handler.execute({"query": "test"}, ctx)
 
@@ -169,7 +172,10 @@ class TestTwitterNoAuthRequired:
 
         with (
             patch("httpx.AsyncClient", return_value=self._dummy_client()),
-            patch("plugins.installed.twitter.tools.resolve_api_key", side_effect=_resolve_key),
+            patch(
+                "plugins.installed.twitter.tools.resolve_api_key",
+                side_effect=_resolve_key,
+            ),
         ):
             result = await handler.execute({"query": "test"}, ctx)
 
@@ -201,7 +207,10 @@ class TestTwitterNoAuthRequired:
             "next_cursor": "",
         }
 
-        with patch("plugins.installed.twitter.tools.request_json", AsyncMock(return_value=payload)) as request_json:
+        with patch(
+            "plugins.installed.twitter.tools.request_json",
+            AsyncMock(return_value=payload),
+        ) as request_json:
             tweets = await handler._search_xquik("from:dave", 25, "xquik-key")
 
         assert tweets == [
@@ -254,7 +263,10 @@ class TestTwitterNoAuthRequired:
 
         with (
             patch("httpx.AsyncClient", return_value=self._dummy_client()),
-            patch("plugins.installed.twitter.tools.resolve_api_key", side_effect=_resolve_key),
+            patch(
+                "plugins.installed.twitter.tools.resolve_api_key",
+                side_effect=_resolve_key,
+            ),
         ):
             result = await handler.execute({"query": "test"}, ctx)
 
@@ -293,7 +305,10 @@ class TestTwitterNoAuthRequired:
             "hasNextPage": False,
         }
 
-        with patch("plugins.installed.twitter.tools.request_json", AsyncMock(return_value=payload)) as request_json:
+        with patch(
+            "plugins.installed.twitter.tools.request_json",
+            AsyncMock(return_value=payload),
+        ) as request_json:
             tweets = await handler._search_twittrapi("from:frank", 25, "twittrapi-key")
 
         assert tweets == [
@@ -328,7 +343,10 @@ class TestTwitterNoAuthRequired:
             "hasNextPage": False,
         }
 
-        with patch("plugins.installed.twitter.tools.request_json", AsyncMock(return_value=payload)):
+        with patch(
+            "plugins.installed.twitter.tools.request_json",
+            AsyncMock(return_value=payload),
+        ):
             tweets = await handler._search_twittrapi("from:gone", 25, "twittrapi-key")
 
         assert tweets == []
@@ -352,7 +370,10 @@ class TestTwitterNoAuthRequired:
 
         with (
             patch("httpx.AsyncClient", return_value=self._dummy_client()),
-            patch("plugins.installed.twitter.tools.resolve_api_key", side_effect=_resolve_none),
+            patch(
+                "plugins.installed.twitter.tools.resolve_api_key",
+                side_effect=_resolve_none,
+            ),
         ):
             result = await handler.execute({"query": "test"}, ctx)
 
@@ -374,3 +395,185 @@ class TestTwitterFactory:
         resolver = lambda: "test-key"
         tools = create_twitter_tools(api_key_resolver=resolver)
         assert tools[0]._api_key_resolver is resolver
+
+
+class TestTwittrapiResponseValidation:
+    @pytest.mark.asyncio
+    async def test_malformed_entries_do_not_hide_later_valid_tweets(self, caplog):
+        payload = {
+            "data": [
+                {},
+                None,
+                {"id": "deleted", "unavailable": True},
+                {"id": "blank", "text": "  "},
+                {"id": "bad-author", "text": "text", "author": ["not an object"]},
+                {"id": "bad-counts", "text": "text", "counts": {"likes": "invalid"}},
+                {
+                    "id": "1865200039848858023",
+                    "text": "A real tweet 🐦",
+                    "author": {"username": "alice"},
+                },
+                {"id": "extra", "text": "Not requested"},
+            ]
+        }
+        with patch(
+            "plugins.installed.twitter.tools.request_json",
+            AsyncMock(return_value=payload),
+        ):
+            tweets = await SearchTwitterHandler()._search_twittrapi("q", 1, "test-key")
+        assert len(tweets) == 1
+        assert tweets[0]["id"] == "1865200039848858023"
+        assert tweets[0]["text"] == "A real tweet 🐦"
+        assert tweets[0]["author"] == "alice"
+        assert "Skipping" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            [],
+            {},
+            {"data": None},
+            {"data": {}},
+            {"errors": [{"message": "upstream failed"}]},
+        ],
+    )
+    async def test_invalid_envelopes_are_errors_not_empty_searches(self, payload):
+        with patch(
+            "plugins.installed.twitter.tools.request_json",
+            AsyncMock(return_value=payload),
+        ):
+            with pytest.raises(ValueError, match="instead of tweets"):
+                await SearchTwitterHandler()._search_twittrapi("q", 1, "test-key")
+
+    @pytest.mark.asyncio
+    async def test_empty_page_is_valid(self):
+        with patch(
+            "plugins.installed.twitter.tools.request_json",
+            AsyncMock(return_value={"data": []}),
+        ):
+            assert (
+                await SearchTwitterHandler()._search_twittrapi("q", 1, "test-key") == []
+            )
+
+    @pytest.mark.asyncio
+    async def test_real_http_parser_preserves_the_documented_simple_format(self):
+        import httpx
+
+        client_type = httpx.AsyncClient
+        captured = []
+
+        def respond(request):
+            captured.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "1234567890123456789",
+                            "text": "A long post " + "x" * 400,
+                            "author": None,
+                            "createdAt": None,
+                            "counts": {"likes": 12, "retweets": 2, "replies": 1},
+                        }
+                    ],
+                    "nextCursor": None,
+                    "hasNextPage": False,
+                },
+            )
+
+        def client(**kwargs):
+            kwargs["transport"] = httpx.MockTransport(respond)
+            return client_type(**kwargs)
+
+        with patch("httpx.AsyncClient", side_effect=client):
+            tweets = await SearchTwitterHandler()._search_twittrapi(
+                "from:alice lang:en", 3, "test-key"
+            )
+        assert tweets[0]["id"] == "1234567890123456789"
+        assert tweets[0]["text"] == "A long post " + "x" * 400
+        assert tweets[0]["metrics"] == {"likes": 12, "retweets": 2, "replies": 1}
+        assert len(captured) == 1
+        assert captured[0].url.params["searchItem"] == "from:alice lang:en"
+        assert captured[0].url.params["format"] == "simple"
+        assert captured[0].headers["X-API-KEY"] == "test-key"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "twittr_payload",
+        [
+            {"data": []},
+            {"data": [{"id": "deleted", "unavailable": True}]},
+            {"errors": [{"message": "upstream failed"}]},
+            {"data": [{}]},
+        ],
+    )
+    async def test_configured_key_resolution_and_fallback_to_official_x(
+        self, monkeypatch, twittr_payload
+    ):
+        from core.tools.config import ToolsConfig
+
+        for name in (
+            "TWITTERAPI_IO_API_KEY",
+            "XQUIK_API_KEY",
+            "TWITTRAPI_API_KEY",
+            "X_API_BEARER_TOKEN",
+            "TWITTER_BEARER_TOKEN",
+            "XAI_API_KEY",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("HEXIS_TEST_TWITTRAPI", "test-twittr-key")
+        monkeypatch.setenv("HEXIS_TEST_X_BEARER", "test-x-key")
+        ctx = _make_context()
+        ctx.registry.get_config = AsyncMock(
+            return_value=ToolsConfig(
+                api_keys={
+                    "twittrapi": "env:HEXIS_TEST_TWITTRAPI",
+                    "x_api_bearer": "env:HEXIS_TEST_X_BEARER",
+                }
+            )
+        )
+        calls = []
+
+        async def request(provider, method, url, **kwargs):
+            calls.append(provider)
+            if provider == "fxtwitter":
+                return {"tweets": []}
+            if provider == "twittrapi":
+                assert kwargs["headers"]["X-API-KEY"] == "test-twittr-key"
+                return twittr_payload
+            if provider == "x_api":
+                return {"data": [{"id": "official", "text": "Fallback result"}]}
+            raise AssertionError(f"Unexpected provider: {provider}")
+
+        with patch("plugins.installed.twitter.tools.request_json", side_effect=request):
+            result = await SearchTwitterHandler().execute({"query": "q"}, ctx)
+        assert result.success
+        assert result.output["provider"] == "x_api_v2"
+        assert result.output["tier"] == 5
+        assert calls == ["fxtwitter", "twittrapi", "x_api"]
+
+    @pytest.mark.asyncio
+    async def test_missing_key_skips_twittrapi_and_records_the_reason(
+        self, monkeypatch
+    ):
+        from core.tools.config import ToolsConfig
+
+        for name in (
+            "TWITTERAPI_IO_API_KEY",
+            "XQUIK_API_KEY",
+            "TWITTRAPI_API_KEY",
+            "X_API_BEARER_TOKEN",
+            "TWITTER_BEARER_TOKEN",
+            "XAI_API_KEY",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        ctx = _make_context()
+        ctx.registry.get_config = AsyncMock(return_value=ToolsConfig())
+        request = AsyncMock(return_value={"tweets": []})
+        with patch("plugins.installed.twitter.tools.request_json", request):
+            result = await SearchTwitterHandler().execute({"query": "q"}, ctx)
+        assert not result.success
+        assert "TwittrAPI: skipped (no API key)" in result.error
+        assert request.await_count == 1

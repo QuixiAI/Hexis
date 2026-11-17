@@ -418,26 +418,59 @@ class SearchTwitterHandler(ToolHandler):
             max_delay=10.0,
         )
 
-        rows = data.get("data") if isinstance(data, dict) else []
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise ValueError(
+                "TwittrAPI returned an error or invalid search response instead of tweets. "
+                "Try again or check the provider status."
+            )
+        rows = data["data"]
         # Tweets X does not return (deleted, withheld) come back as
         # {"id": ..., "unavailable": true}; skip them so an all-placeholder
         # page counts as empty and the next provider is tried.
-        usable = [t for t in (rows or []) if isinstance(t, dict) and not t.get("unavailable")]
         tweets: list[dict[str, Any]] = []
-        for t in usable[:max_results]:
+        for t in rows:
+            if isinstance(t, dict) and t.get("unavailable"):
+                continue
+            if (
+                not isinstance(t, dict)
+                or not isinstance(t.get("id"), str)
+                or not t["id"].strip()
+                or not isinstance(t.get("text"), str)
+                or not t["text"].strip()
+            ):
+                logger.warning(
+                    "Skipping malformed TwittrAPI tweet without an ID or text"
+                )
+                continue
             user = t.get("author") or {}
             counts = t.get("counts") or {}
+            if not isinstance(user, dict) or not isinstance(counts, dict):
+                logger.warning(
+                    "Skipping TwittrAPI tweet with malformed author or metrics"
+                )
+                continue
+            try:
+                likes = int(counts.get("likes") or 0)
+                retweets = int(counts.get("retweets") or 0)
+                replies = int(counts.get("replies") or 0)
+            except (ValueError, TypeError, OverflowError):
+                logger.warning(
+                    "Skipping TwittrAPI tweet with invalid engagement counts"
+                )
+                continue
             tweets.append(
                 _tweet_dict(
                     tweet_id=t.get("id"),
                     text=t.get("text", ""),
                     author=user.get("username") or user.get("name") or "unknown",
                     created_at=t.get("createdAt"),
-                    likes=int(counts.get("likes") or 0),
-                    retweets=int(counts.get("retweets") or 0),
-                    replies=int(counts.get("replies") or 0),
+                    likes=likes,
+                    retweets=retweets,
+                    replies=replies,
                 )
             )
+            if len(tweets) >= max_results:
+                break
         return tweets
 
     async def _search_x_api(

@@ -22,11 +22,14 @@ hexis open   # open http://localhost:3477 in your browser
 
 - **Init Wizard** -- 3-tier initialization flow (Express, Character, Custom) with character gallery
 - **Interactive Chat** -- Streaming conversation with tool use visibility; attached files are read the moment they are attached, so the agent can answer about a PDF in the same message it arrives in (large pastes attach the same way, and each attachment has a private toggle)
-- **Agent Status** -- Memory counts, energy level, heartbeat status
+- **Agent Status** -- Memory counts, energy level, heartbeat status; Run heartbeat now, and Pause/Resume for the agent's own heartbeats (the sidebar and the overview read one shared status)
 - **Memory Browser** -- Search and inspect distilled memories; memory detail links to the exact source documents and chunks behind it
 - **Documents** -- The source-document filing cabinet: search files or passages (with page/section/sheet locators), preview with paging and a PDF page picker, see extraction warnings, and load sources onto the desk
 - **Desk** -- Mid-term working material: read items window by window, pin what stays needed, clear the rest (cleared items archive; sources stay in the cabinet)
 - **Ingest** -- Bulk ingestion: multi-file upload, paste box, URL field, and a live job list showing what ran, what is pending, and what failed and why
+- **Connections** -- Gmail and Google Drive sign-in and imports; a connection that needs signing in again says why, and a pending import that is retrying shows what its last try hit
+- **Settings → Messages** -- Where the agent's messages to you go (its own choice among the channels set up, a fixed Slack DM, Telegram chat, or email, or the dashboard only); every such message also lands in the dashboard inbox
+- **Background work** -- Imports, reading and indexing in progress show in the sidebar on every page
 - **Character Gallery** -- Browse and select from 11 preset characters with portraits
 
 ## Init Wizard
@@ -54,9 +57,12 @@ Configure `hexis-ui/.env.local`:
 
 ```bash
 DATABASE_URL=postgresql://hexis_user:hexis_password@127.0.0.1:43815/hexis_memory
-HEXIS_LLM_CONSCIOUS_API_KEY=...      # set during init wizard
-HEXIS_LLM_SUBCONSCIOUS_API_KEY=...   # optional
+HEXIS_API_URL=http://127.0.0.1:43817  # the Python API, which owns model setup
 ```
+
+API keys typed in the Models step are not written to `.env`: the Python API
+stores them in the auth store under `~/.hexis/auth`, which every service
+mounts, and the model config records only a reference to them.
 
 ```bash
 bun dev   # http://localhost:3477

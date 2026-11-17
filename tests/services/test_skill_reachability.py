@@ -184,10 +184,10 @@ def test_wave_a_manifests_only_name_real_core_or_plugin_tools(chat_skills):
 
 @pytest.mark.parametrize("query,expected", WAVE_A_REQUESTS)
 @pytest.mark.asyncio
-async def test_wave_a_requests_activate_through_the_full_selector(query, expected):
+async def test_wave_a_requests_activate_through_the_full_selector(query, expected, monkeypatch):
     """Exercise selection as the agent loop calls it, including tool exposure."""
     from core.tools.base import ToolContext
-    from core.tools.registry import create_default_registry
+    from core.tools.registry import ToolRegistry, create_default_registry
     from plugins.installed.asana.tools import create_asana_tools
     from plugins.installed.fathom.tools import create_fathom_tools
     from plugins.installed.todoist.tools import create_todoist_tools
@@ -195,6 +195,14 @@ async def test_wave_a_requests_activate_through_the_full_selector(query, expecte
     registry = create_default_registry(None)
     for factory in (create_asana_tools, create_fathom_tools, create_todoist_tools):
         registry.register_all(factory())
+
+    # Every credential-backed tool counts as set up here: a skill whose
+    # tools are not set up is deliberately never auto-activated (see
+    # test_skill_capability_catalog), and this test is about reachability.
+    async def everything_ready(self, context):
+        return {}
+
+    monkeypatch.setattr(ToolRegistry, "unready_tools", everything_ready)
 
     selection = await select_skills(registry, ToolContext.CHAT, query=query)
     selected = {skill.name: skill for skill in selection.skills}

@@ -1111,6 +1111,81 @@ class TestStreaming:
         assert registry.execute.await_count == 0
 
 
+class TestAnswerBudget:
+    @patch("core.agent_loop.chat_completion")
+    async def test_tool_round_budget_forces_an_answer(self, mock_llm):
+        """After max_tool_rounds the model gets no tools and is asked to answer."""
+        spec = {"type": "function", "function": {"name": "tool", "description": "t", "parameters": {"type": "object", "properties": {}}}}
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(tool_specs=[spec], execute_results={"tool": tool_result})
+        mock_llm.side_effect = [
+            _tool_response("", [_tool_call("tool", {})]),
+            _tool_response("", [_tool_call("tool", {})]),
+            _text_response("Could not find it; closest is X."),
+        ]
+
+        agent = AgentLoop(_make_config(registry=registry, max_tool_rounds=2))
+        result = await agent.run("Find something that is not there")
+
+        assert result.text == "Could not find it; closest is X."
+        assert result.stopped_reason == "completed"
+        offered = [call.kwargs.get("tools") for call in mock_llm.call_args_list]
+        assert offered[0] and offered[1] and not offered[2]
+        last_messages = mock_llm.call_args_list[2].kwargs["messages"]
+        assert last_messages[-1]["role"] == "user"
+        assert "Stop searching" in last_messages[-1]["content"]
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_time_reserve_forces_an_answer(self, mock_llm):
+        """With less than answer_reserve_seconds left, the next call has no tools."""
+        spec = {"type": "function", "function": {"name": "tool", "description": "t", "parameters": {"type": "object", "properties": {}}}}
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(tool_specs=[spec], execute_results={"tool": tool_result})
+
+        async def _llm(**kwargs):
+            if kwargs.get("tools"):
+                await asyncio.sleep(0.4)
+                return _tool_response("", [_tool_call("tool", {})])
+            return _text_response("Answer from what I found.")
+
+        mock_llm.side_effect = _llm
+        agent = AgentLoop(_make_config(registry=registry, timeout_seconds=5.0, answer_reserve_seconds=4.8))
+        result = await agent.run("Keep searching")
+
+        assert result.timed_out is False
+        assert result.text == "Answer from what I found."
+
+
+class TestParagraphs:
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_text_after_a_tool_round_starts_a_new_paragraph(self, mock_stream_llm):
+        """Joined as streamed, text from two model calls ran together ("…sources.Found it")."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 1
+        registry = _mock_registry(execute_results={"recall": tool_result})
+        call_count = 0
+
+        async def _fake_stream(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            cb = kwargs.get("on_text_delta")
+            if call_count == 1:
+                await cb("Let me check the sources.")
+                return _tool_response("Let me check the sources.", [_tool_call("recall", {"q": "x"})])
+            await cb("Found ")
+            await cb("it.")
+            return _text_response("Found it.")
+
+        mock_stream_llm.side_effect = _fake_stream
+        agent = AgentLoop(_make_config(registry=registry))
+        text = "".join(
+            [e.data["text"] async for e in agent.stream("Find it") if e.event == AgentEvent.TEXT_DELTA]
+        )
+        assert text == "Let me check the sources.\n\nFound it."
+
+
 # ============================================================================
 # Unit: error handling
 # ============================================================================
@@ -2284,3 +2359,94 @@ class TestActionClaimGuardrail:
                 await conn.execute(
                     "UPDATE config SET value = 'false'::jsonb WHERE key = 'guardrails.action_claims.llm_verifier_enabled'"
                 )
+
+
+class TestHeartbeatYieldsToChat:
+    @patch("core.agent_loop.chat_completion")
+    async def test_heartbeat_calls_wait_for_a_live_chat_turn(self, mock_llm, monkeypatch):
+        calls = []
+
+        async def _wait(pool, *, max_wait_seconds=None):
+            calls.append(max_wait_seconds)
+            return 0.0
+
+        monkeypatch.setattr("core.chat_priority.wait_for_chat_idle", _wait)
+        mock_llm.return_value = _text_response("done")
+        agent = AgentLoop(_make_config(tool_context=ToolContext.HEARTBEAT, heartbeat_id=str(uuid.uuid4())))
+        await agent.run("Heartbeat")
+        assert calls == [60.0]
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_chat_never_waits_for_itself(self, mock_llm, monkeypatch):
+        calls = []
+
+        async def _wait(pool, *, max_wait_seconds=None):
+            calls.append(max_wait_seconds)
+            return 0.0
+
+        monkeypatch.setattr("core.chat_priority.wait_for_chat_idle", _wait)
+        mock_llm.return_value = _text_response("hi")
+        await AgentLoop(_make_config()).run("Hello")
+        assert calls == []
+
+
+class TestDividerCompatibility:
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("reply", ["---\nReply.", "---"])
+    async def test_opt_in_cleanup_and_recovery_persist_only_the_answer(
+        self, monkeypatch, streaming, reply
+    ):
+        calls = []
+
+        async def completion(**kwargs):
+            calls.append(kwargs)
+            text = reply if len(calls) == 1 else "Recovered."
+            if streaming:
+                for token in text:
+                    await kwargs["on_text_delta"](token)
+            return _text_response(text)
+
+        monkeypatch.setattr(
+            "core.agent_loop.stream_chat_completion" if streaming
+            else "core.agent_loop.chat_completion",
+            completion,
+        )
+        llm_config = _make_llm_config()
+        llm_config["strip_leading_divider_models"] = [llm_config["model"]]
+        agent = AgentLoop(_make_config(llm_config=llm_config))
+        expected = "Reply." if reply.endswith("Reply.") else "Recovered."
+        if streaming:
+            events = [event async for event in agent.stream("Hi")]
+            visible = "".join(
+                event.data["text"] for event in events
+                if event.event == AgentEvent.TEXT_DELTA
+            )
+            assert visible == expected
+            assert not any(event.event == AgentEvent.ERROR for event in events)
+        else:
+            result = await agent.run("Hi")
+            assert result.text == expected
+            assert result.stopped_reason == "completed"
+        async with _DB_POOL.acquire() as conn:
+            messages = await conn.fetchval(
+                "SELECT messages FROM agent_turns WHERE id = $1::uuid", agent._turn_id
+            )
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+        assistant_messages = [m["content"] for m in messages if m["role"] == "assistant"]
+        assert assistant_messages == [expected]
+        assert len(calls) == (1 if reply.endswith("Reply.") else 2)
+
+    async def test_divider_only_recovery_marks_turn_failed(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.agent_loop.chat_completion", AsyncMock(return_value=_text_response("---"))
+        )
+        llm_config = _make_llm_config()
+        llm_config["strip_leading_divider_models"] = [llm_config["model"]]
+        agent = AgentLoop(_make_config(llm_config=llm_config))
+        result = await agent.run("Hi")
+        assert result.stopped_reason == "error"
+        async with _DB_POOL.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT status FROM agent_turns WHERE id = $1::uuid", agent._turn_id
+            ) == "failed"

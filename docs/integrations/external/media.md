@@ -42,6 +42,17 @@ hexis tools enable twitter_search
 TwitterAPI.io (`twitterapi_io`), Xquik (`xquik`), TwittrAPI (`twittrapi`), X API v2 (`x_api_bearer`),
 and xAI Search (`xai`). Use the provider key name that matches your account.
 
+To use TwittrAPI as an optional fallback:
+
+```bash
+hexis tools set-api-key twittrapi env:TWITTRAPI_API_KEY
+hexis tools enable twitter_search
+```
+
+The referenced environment variable must be available to the API or worker
+process running the tool. Without a TwittrAPI key, that tier is skipped; the
+other providers continue to work. No xAI key is needed to use TwittrAPI.
+
 ## Fathom
 
 ### Setup

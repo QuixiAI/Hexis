@@ -2,7 +2,7 @@
   "id": "twitter",
   "name": "Twitter",
   "version": "1.0.0",
-  "description": "X/Twitter search via xAI live search",
+  "description": "X/Twitter research with automatic search-provider fallback",
   "config_schema": {},
   "tools": [
     "twitter_search"

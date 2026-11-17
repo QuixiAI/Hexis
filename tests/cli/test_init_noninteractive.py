@@ -329,3 +329,45 @@ async def test_embedding_step_unrelated_errors_pass_through():
 
     with pytest.raises(ValueError, match="some other init problem"):
         await _run_embedding_step(_StubConn(), broken_step, interactive=False)
+
+
+# ---------------------------------------------------------------------------
+# Enterprise clouds: the target is a resource URL, a region, or a project
+# ---------------------------------------------------------------------------
+
+
+def test_azure_requires_the_resource_url(monkeypatch):
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    args = build_parser().parse_args(["--provider", "azure_openai", "--model", "my-deployment"])
+    with pytest.raises(ValueError, match="AZURE_OPENAI_ENDPOINT"):
+        _resolve_noninteractive_endpoint(args, "azure_openai")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://res.openai.azure.com")
+    assert _resolve_noninteractive_endpoint(args, "azure_openai") == (
+        "https://res.openai.azure.com", "AZURE_OPENAI_ENDPOINT",
+    )
+
+
+def test_bedrock_defaults_the_region_and_needs_no_key(monkeypatch):
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    args = build_parser().parse_args(["--provider", "bedrock", "--model", "anthropic.claude-x"])
+    assert _resolve_noninteractive_endpoint(args, "bedrock") == ("us-east-1", "default region")
+    # The server's own AWS credentials are enough.
+    assert _resolve_noninteractive_api_key_env(args, "bedrock") == ""
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    assert _resolve_noninteractive_endpoint(args, "bedrock")[0] == "eu-west-1"
+
+
+def test_vertex_needs_a_project(monkeypatch):
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    args = build_parser().parse_args(["--provider", "vertex", "--model", "gemini-2.5-pro"])
+    with pytest.raises(ValueError, match="projects/<project-id>/locations/<region>"):
+        _resolve_noninteractive_endpoint(args, "vertex")
+    assert _resolve_noninteractive_api_key_env(args, "vertex") == ""
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "my-proj")
+    assert _resolve_noninteractive_endpoint(args, "vertex") == (
+        "projects/my-proj/locations/us-central1", "GOOGLE_CLOUD_PROJECT",
+    )
+    explicit = build_parser().parse_args([
+        "--provider", "vertex", "--model", "m", "--endpoint", "projects/p/locations/us-east5",
+    ])
+    assert _resolve_noninteractive_endpoint(explicit, "vertex")[0] == "projects/p/locations/us-east5"

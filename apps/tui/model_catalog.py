@@ -35,6 +35,17 @@ PROVIDER_SLUG: dict[str, str] = {
     "minimax-portal": "minimax",
     "google-gemini-cli": "google",
     "google-antigravity": "google",
+    "xai-oauth": "xai",
+    "openrouter": "openrouter",
+    "minimax": "minimax",
+    "azure_openai": "azure",
+    "bedrock": "amazon-bedrock",
+    "vertex": "google-vertex",
+    "deepseek": "deepseek",
+    "zai": "zai",
+    "qwen": "alibaba",
+    "qwen_coding": "alibaba",
+    "meta": "meta",
 }
 
 # Non-chat model ids to hide from the dropdown (still typeable as free text).

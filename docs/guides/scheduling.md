@@ -49,6 +49,7 @@ hexis schedule delete <task_id> --force   # hard delete
 | Kind | Schedule JSON | Example |
 |------|--------------|---------|
 | `once` | `{"at": "2026-03-01T09:00:00"}` | One-time execution |
+| `once` (as a string) | `"2026-11-10T09:00:00+09:00"` or `"once:2026-11-10 09:00"` | A date and time; without an offset it is read in the schedule's timezone |
 | `interval` | `{"seconds": 3600}` | Every hour |
 | `daily` | `{"time": "09:00"}` | Every day at 9 AM |
 | `weekly` | `{"day": "monday", "time": "09:00"}` | Every Monday at 9 AM |

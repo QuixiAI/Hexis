@@ -15,6 +15,11 @@ const colorClasses: Record<string, string> = {
   red: "bg-red-500",
 };
 
+function formatCount(value: number): string {
+  // Energy and similar scores arrive as floats; never show binary noise.
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
 export function ProgressBar({
   value,
   max,
@@ -32,7 +37,7 @@ export function ProgressBar({
           {label && <span>{label}</span>}
           {showValue && (
             <span>
-              {value}/{max}
+              {formatCount(value)}/{formatCount(max)}
             </span>
           )}
         </div>

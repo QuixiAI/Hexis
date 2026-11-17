@@ -236,6 +236,7 @@ Providers: `openai-codex`, `anthropic`, `chutes`, `github-copilot`, `qwen-portal
 | `hexis goals create <title> [-d DESC] [--priority P] [--source S]` | Create goal |
 | `hexis goals update <id> --priority P [--reason TEXT]` | Update priority |
 | `hexis goals complete <id> [--reason TEXT]` | Mark complete |
+| `hexis goals abandon <id> [--reason TEXT]` | Abandon: archived with its reason, kept in history, not marked complete |
 
 Priorities: `active`, `queued`, `backburner`, `completed`, `abandoned`
 

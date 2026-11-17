@@ -74,6 +74,24 @@ async def _checksum_mismatches(
     return mismatches
 
 
+async def changed_migrations(
+    conn: asyncpg.Connection, *, migrations_dir: Path | None = None
+) -> list[str]:
+    """Applied migrations whose file no longer matches what was applied.
+
+    A released migration must never be edited: databases that already applied
+    it never run the new text, so they silently differ from fresh installs.
+    Change the schema with a new migration instead. Rows without a checksum
+    (legacy runners) are not compared.
+    """
+    files = _list_migration_files(migrations_dir or MIGRATIONS_DIR)
+    if not files:
+        return []
+    table = await _ensure_table(conn)
+    mismatches = await _checksum_mismatches(conn, table, files)
+    return sorted(m["version"] for m in mismatches if m["recorded_checksum"] != "NULL")
+
+
 def _checksum_error(mismatches: list[dict[str, str]]) -> MigrationChecksumError:
     details = "; ".join(
         f"{item['version']} (recorded {item['recorded_checksum']}, "

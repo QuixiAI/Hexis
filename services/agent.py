@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, TYPE_CHECKING
@@ -18,6 +19,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Literal, TYPE_CHECKI
 from core.agent_loop import AgentEvent, AgentEventData, AgentLoop, AgentLoopConfig
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
+from core.subconscious import character_block
 from core.tools.base import ToolContext
 from core.tools.config import ContextOverrides
 from services.prompt_resources import (
@@ -30,6 +32,7 @@ from services.prompt_resources import (
 from services.skill_runtime import (
     format_skills_prompt,
     load_available_skills,
+    skill_setup_steps as resolve_skill_setup_steps,
     record_selection,
     select_skills,
 )
@@ -47,6 +50,92 @@ logger = logging.getLogger(__name__)
 _SUBCONSCIOUS_MEMORY_CONTEXT_CHARS = 4000
 _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS = 7000
 _MAX_VISUAL_ATTACHMENTS_PER_TURN = 8
+
+
+# Scripts a message can be written in. Kana marks Japanese and Hangul Korean
+# (kanji alone may be a name); Latin words mark a Latin-script language.
+_SCRIPTS: list[tuple[str, "re.Pattern[str]"]] = [
+    ("Japanese", re.compile(r"[\u3040-\u30ff]")),
+    ("Korean", re.compile(r"[\uac00-\ud7af]")),
+    ("Cyrillic", re.compile(r"[\u0400-\u04ff]")),
+    ("Arabic", re.compile(r"[\u0600-\u06ff]")),
+    ("Hebrew", re.compile(r"[\u0590-\u05ff]")),
+    ("Thai", re.compile(r"[\u0e00-\u0e7f]")),
+    ("Devanagari", re.compile(r"[\u0900-\u097f]")),
+    ("Greek", re.compile(r"[\u0370-\u03ff]")),
+]
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uff00-\uffef]")
+_LATIN_WORD = re.compile(r"[A-Za-z]{2,}")
+
+
+def _reply_language(user_message: str) -> str | None:
+    """A script name, "latin" for a Latin-script language, or None when the
+    message can't tell (names, numbers or code only)."""
+    for name, pattern in _SCRIPTS:
+        if pattern.search(user_message):
+            return name
+    words = len(_LATIN_WORD.findall(user_message))
+    if words >= 3 or (words >= 2 and not _CJK.search(user_message)):
+        return "latin"
+    return None
+
+
+# A system-prompt rule alone lost to a context full of another language:
+# after one Japanese turn, with Japanese memories recalled, or once foreign
+# tool results came back, English questions got answers in that language. So
+# each turn states its language twice: in the system prompt, which stays in
+# view through every tool round, and right after the message.
+def _reply_language_note(user_message: str) -> str | None:
+    lang = _reply_language(user_message)
+    if lang is None:
+        return None
+    if lang == "latin":
+        return (
+            "[REPLY LANGUAGE] The language the user wrote this message in, "
+            "even if earlier turns, recalled memories or tool results are in another language."
+        )
+    return f"[REPLY LANGUAGE] {lang}: the user wrote this message in {lang}."
+
+
+def _reply_language_addendum(user_message: str) -> list[str]:
+    lang = _reply_language(user_message)
+    if lang is None:
+        return []
+    written = "the language of the user's latest message" if lang == "latin" else lang
+    return [
+        "## Reply language (this turn)\n"
+        f"Write everything you say this turn in {written}: the answer and any text before "
+        "or between tool calls, even when tool results, recalled memories or earlier turns "
+        "are in another language. Quote sources in their original language when quoting."
+    ]
+
+
+USER_MESSAGE_MARKER = "[USER MESSAGE]"
+REMEMBERED_DIVIDER = (
+    "--- What you remember (context for this reply, not part of the message) ---"
+)
+
+
+def compose_chat_turn(user_message: str, *context: str | None) -> str:
+    """The person's words first, then what the agent remembers around them.
+
+    The model answers what it reads first: with several thousand characters
+    of signals, continuity and memory ahead of a short message, replies
+    followed the context more than the person. The divider says the rest is
+    the agent's own recollection, not part of what was said. `hexis
+    transcript` splits on the marker and the divider (apps/hexis_cli.py).
+    """
+    turn = f"{USER_MESSAGE_MARKER}\n{user_message}"
+    parts = [str(c).strip() for c in context if c and str(c).strip()]
+    if not parts:
+        return turn
+    return "\n\n".join([turn, REMEMBERED_DIVIDER, *parts])
+
+
+def _with_reply_language(user_message: str) -> str:
+    """The person's message, followed by the language to answer it in."""
+    note = _reply_language_note(user_message)
+    return user_message + (f"\n\n{note}" if note else "")
 
 
 def _visual_attachment_parts(
@@ -110,6 +199,23 @@ class SubconsciousOutput:
     contradiction_observations: list[dict[str, Any]] = field(default_factory=list)
     emotional_observations: list[dict[str, Any]] = field(default_factory=list)
     consolidation_observations: list[dict[str, Any]] = field(default_factory=list)
+
+
+async def _chat_answer_budget(pool: "asyncpg.Pool", timeout_seconds: float) -> dict[str, Any]:
+    """Tool-round and time budgets that make a chat turn end in an answer."""
+    try:
+        row = await pool.fetchrow(
+            "SELECT get_config_int('chat.max_tool_rounds') AS rounds, "
+            "get_config_float('chat.answer_reserve_s') AS reserve"
+        )
+    except Exception:
+        row = None
+    rounds = row["rounds"] if row and row["rounds"] is not None else 5
+    reserve = row["reserve"] if row and row["reserve"] is not None else 30.0
+    return {
+        "max_tool_rounds": max(0, int(rounds)),
+        "answer_reserve_seconds": min(max(0.0, float(reserve)), timeout_seconds / 2),
+    }
 
 
 async def render_subconscious_signals_db(
@@ -484,8 +590,16 @@ async def run_subconscious_appraisal(
     total_chars = int(limits.get("total_chars") or _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS)
     user_prompt = "Context (JSON):\n" + _bounded_subconscious_json(payload, total_chars)
 
+    system_prompt = load_subconscious_inline_prompt().strip()
+    character = ""
+    try:
+        character = character_block(await conn.fetchval("SELECT get_agent_profile_context()"))
+    except Exception as exc:
+        logger.warning("Character unavailable for subconscious prompt: %s", exc)
+    if character:
+        system_prompt = f"{character}\n\n{system_prompt}"
     request_messages = [
-        {"role": "system", "content": load_subconscious_inline_prompt().strip()},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     try:
@@ -495,6 +609,11 @@ async def run_subconscious_appraisal(
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             fallback={},
+            # The appraisal is a fast pre-phase the user waits on. Left at
+            # its default, a thinking model spent the whole budget thinking
+            # and returned an empty appraisal after most of a minute.
+            reasoning_effort="low",
+            usage_source="subconscious",
         )
     except Exception as exc:
         logger.warning("Subconscious appraisal failed: %s", exc)
@@ -688,6 +807,7 @@ async def build_system_prompt(
     surface: str = "chat",
     active_skills: list["SkillSpec"] | None = None,
     available_skills: list["SkillSpec"] | None = None,
+    skill_setup_steps: dict[str, str] | None = None,
     allowed_tool_names: set[str] | None = None,
     prompt_addenda: list[str] | None = None,
 ) -> str:
@@ -773,13 +893,15 @@ async def build_system_prompt(
     tool_context = ToolContext.CHAT if mode == "chat" else ToolContext.HEARTBEAT
     if registry is not None or active_skills:
         available = available_skills
+        setup_steps = skill_setup_steps
         if available is None and registry is not None:
             try:
                 available = load_available_skills(registry, tool_context)
+                setup_steps = await resolve_skill_setup_steps(registry, tool_context, available)
             except Exception:
-                available = []
+                available = available or []
                 logger.debug("Failed to load skill catalog for prompt", exc_info=True)
-        volatile.append(format_skills_prompt(active_skills or [], available or []))
+        volatile.append(format_skills_prompt(active_skills or [], available or [], setup_steps))
 
     # Energy costs, derived from the actual ToolSpecs of this turn's allowed
     # tools (#44) — never hardcoded prose. Heartbeat only: chat is unbudgeted.
@@ -1040,32 +1162,23 @@ async def run_agent(
         surface=surface,
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
+        skill_setup_steps=skill_selection.setup_steps,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
+        prompt_addenda=_reply_language_addendum(user_message) if mode == "chat" else None,
     )
 
-    # 5. Build enriched user message
-    enriched_parts: list[str] = []
-
-    # Add subconscious signals (rendered by the DB inside the conn scope)
-    if sub_signals:
-        enriched_parts.append(sub_signals)
-
-    if continuity_context:
-        enriched_parts.append(continuity_context)
-
-    # Add memory context (chat mode)
-    if memory_context:
-        enriched_parts.append(memory_context)
-
-    # Add the actual user message
+    # 5. Build enriched user message: in chat, the person's words come first
+    # and what the agent remembers follows; other modes keep context first.
     if mode == "chat":
-        enriched_parts.append(f"[USER MESSAGE]\n{user_message}")
+        enriched_user_message = compose_chat_turn(
+            _with_reply_language(user_message), sub_signals, continuity_context, memory_context
+        )
     else:
+        enriched_parts = [
+            part for part in (sub_signals, continuity_context, memory_context) if part
+        ]
         enriched_parts.append(user_message)
-
-    enriched_user_message = (
-        "\n\n".join(enriched_parts) if enriched_parts else user_message
-    )
+        enriched_user_message = "\n\n".join(enriched_parts)
     enriched_user_content = _user_content_with_visuals(
         enriched_user_message,
         visual_attachments if mode == "chat" else None,
@@ -1097,7 +1210,9 @@ async def run_agent(
             + question_wait_extension
         )
         effective_max_tokens = max_tokens or 4096
+        answer_budget = await _chat_answer_budget(pool, effective_timeout)
         loop_config = AgentLoopConfig(
+            **answer_budget,
             tool_context=tool_context,
             system_prompt=system_prompt,
             llm_config=llm_config,
@@ -1328,20 +1443,16 @@ async def stream_agent(
         surface=surface,
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
+        skill_setup_steps=skill_selection.setup_steps,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
-        prompt_addenda=prompt_addenda,
+        prompt_addenda=[*(prompt_addenda or []), *(_reply_language_addendum(user_message) if mode == "chat" else [])],
     )
 
-    # Build enriched user message (signals were rendered by the DB in-scope)
-    enriched_parts: list[str] = []
-    if sub_signals:
-        enriched_parts.append(sub_signals)
-    if continuity_context:
-        enriched_parts.append(continuity_context)
-    if memory_context:
-        enriched_parts.append(memory_context)
-    enriched_parts.append(f"[USER MESSAGE]\n{user_message}")
-    enriched_user_message = "\n\n".join(enriched_parts)
+    # Build enriched user message (signals were rendered by the DB in-scope):
+    # the person's words first, then what the agent remembers.
+    enriched_user_message = compose_chat_turn(
+        _with_reply_language(user_message), sub_signals, continuity_context, memory_context
+    )
     enriched_user_content = _user_content_with_visuals(
         enriched_user_message,
         visual_attachments if mode == "chat" else None,
@@ -1376,7 +1487,9 @@ async def stream_agent(
     effective_temperature = (
         temperature if temperature is not None else _cfg_num("temperature", 0.7)
     )
+    answer_budget = await _chat_answer_budget(pool, effective_timeout) if mode == "chat" else {}
     loop_config = AgentLoopConfig(
+        **answer_budget,
         tool_context=tool_context,
         system_prompt=system_prompt,
         llm_config=llm_config,

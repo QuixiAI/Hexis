@@ -152,6 +152,10 @@ class WebSearchProvider(ABC):
     ) -> WebSearchResponse:
         """Execute a search and return normalized results."""
 
+    def cache_variant(self, config: ToolsConfig) -> str:
+        """Extra cache-key part for providers whose results depend on config (e.g. keyed vs keyless)."""
+        return ""
+
 
 def _env(name: str) -> str | None:
     value = (os.getenv(name) or "").strip()
@@ -353,6 +357,87 @@ class BraveSearchProvider(WebSearchProvider):
             )
             for item in data.get("web", {}).get("results", [])
             if isinstance(item, dict)
+        ]
+        return WebSearchResponse(
+            query=query,
+            provider_id=self.id,
+            provider_label=self.label,
+            results=results[:max_results],
+            took_ms=int((time.monotonic() - started) * 1000),
+        )
+
+
+class KeenableSearchProvider(WebSearchProvider):
+    """Keenable web search. Works without a key via the public endpoint.
+
+    Opt-in: it only joins the automatic chain when a Keenable key is
+    configured, or runs when selected explicitly (``provider: keenable``),
+    in which case no key is needed.
+    """
+
+    id = "keenable"
+    label = "Keenable"
+    requires_credential = False
+    credential_hint = (
+        "Select provider 'keenable' (no key needed), or set KEENABLE_API_KEY / "
+        "api_keys.keenable to include it in automatic selection."
+    )
+    _PUBLIC_ENDPOINT = "https://api.keenable.ai/v1/search/public"
+    _KEYED_ENDPOINT = "https://api.keenable.ai/v1/search"
+
+    def _api_key(self, config: ToolsConfig) -> str | None:
+        return _resolve_api_key(config, "keenable") or _env("KEENABLE_API_KEY")
+
+    def is_available(self, config: ToolsConfig) -> bool:
+        return _configured_provider(config) == self.id or bool(self._api_key(config))
+
+    def cache_variant(self, config: ToolsConfig) -> str:
+        # Keyed and public endpoints are different requests, so don't share cached results
+        return "keyed" if self._api_key(config) else "public"
+
+    async def search(
+        self,
+        *,
+        query: str,
+        max_results: int,
+        config: ToolsConfig,
+    ) -> WebSearchResponse:
+        api_key = self._api_key(config)
+        headers = {"X-Keenable-Title": "Hexis"}
+        endpoint = self._PUBLIC_ENDPOINT
+        if api_key:
+            headers["X-API-Key"] = api_key
+            endpoint = self._KEYED_ENDPOINT
+
+        started = time.monotonic()
+        try:
+            data = await request_json(
+                "keenable",
+                "POST",
+                endpoint,
+                headers=headers,
+                json_body={"query": query, "max_results": max_results},
+                timeout=15.0,
+                attempts=3,
+                max_delay=15.0,
+                retry_unsafe_methods=True,
+            )
+        except IntegrationHttpError as exc:
+            _raise_web_search_error("Keenable", exc)
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            raise WebSearchProviderError(
+                "Keenable returned an invalid search response. Try again or choose another web search provider.",
+                ToolErrorType.HTTP_ERROR,
+            )
+        results = [
+            WebSearchResult(
+                title=str(item.get("title") or ""),
+                url=str(item["url"]),
+                snippet=str(item.get("description") or item.get("snippet") or "")[:500],
+                site_name=_site_name(str(item["url"])),
+            )
+            for item in data["results"]
+            if isinstance(item, dict) and item.get("url")
         ]
         return WebSearchResponse(
             query=query,
@@ -626,11 +711,16 @@ class WebSearchProviderRegistry:
             )
         return statuses
 
-    def _cache_key(self, provider: WebSearchProvider, query: str, max_results: int) -> str:
-        return f"{provider.id}\0{max_results}\0{query.strip().lower()}"
+    def _cache_key(
+        self, provider: WebSearchProvider, query: str, max_results: int, config: ToolsConfig | None = None
+    ) -> str:
+        variant = provider.cache_variant(config) if config is not None else ""
+        return f"{provider.id}\0{variant}\0{max_results}\0{query.strip().lower()}"
 
-    def _cached(self, provider: WebSearchProvider, query: str, max_results: int) -> WebSearchResponse | None:
-        key = self._cache_key(provider, query, max_results)
+    def _cached(
+        self, provider: WebSearchProvider, query: str, max_results: int, config: ToolsConfig | None = None
+    ) -> WebSearchResponse | None:
+        key = self._cache_key(provider, query, max_results, config)
         item = self._cache.get(key)
         if not item:
             return None
@@ -648,8 +738,18 @@ class WebSearchProviderRegistry:
             metadata=response.metadata,
         )
 
-    def _store_cache(self, provider: WebSearchProvider, query: str, max_results: int, response: WebSearchResponse) -> None:
-        self._cache[self._cache_key(provider, query, max_results)] = (
+    def _store_cache(
+        self,
+        provider: WebSearchProvider,
+        query: str,
+        max_results: int,
+        response: WebSearchResponse,
+        config: ToolsConfig | None = None,
+        key: str | None = None,
+    ) -> None:
+        if key is None:
+            key = self._cache_key(provider, query, max_results, config)
+        self._cache[key] = (
             time.monotonic() + _CACHE_TTL_SECONDS,
             response,
         )
@@ -676,16 +776,20 @@ class WebSearchProviderRegistry:
 
         errors: list[str] = []
         for provider in candidates:
-            cached = self._cached(provider, query, max_results)
+            cached = self._cached(provider, query, max_results, config)
             if cached:
                 return cached, errors
+            # Capture the cache identity before awaiting: the config (e.g. an
+            # API key) can change while the request is in flight, and the
+            # response must be stored under the variant it was fetched with.
+            cache_key = self._cache_key(provider, query, max_results, config)
             try:
                 response = await provider.search(
                     query=query,
                     max_results=max_results,
                     config=config,
                 )
-                self._store_cache(provider, query, max_results, response)
+                self._store_cache(provider, query, max_results, response, config, key=cache_key)
                 return response, errors
             except WebSearchProviderError as exc:
                 errors.append(f"{provider.label}: {exc}")
@@ -709,6 +813,7 @@ def create_default_web_search_registry(
     return WebSearchProviderRegistry([
         TavilySearchProvider(tavily_api_key_resolver),
         BraveSearchProvider(),
+        KeenableSearchProvider(),
         SearxngSearchProvider(),
         DuckDuckGoLiteSearchProvider(),
         BingRssSearchProvider(),

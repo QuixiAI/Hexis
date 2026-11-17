@@ -20,6 +20,11 @@ async def test_channel_messages_preserve_raw_source_and_queue_inbound_ingestion(
         tr = conn.transaction()
         await tr.start()
         try:
+            # Off by default (live turns are remembered once, by the encoder);
+            # this test covers the queueing path when it is switched on.
+            await conn.execute(
+                "SELECT set_config('channel.source_artifacts_enqueue_inbound', 'true'::jsonb)"
+            )
             prepared = _j(await conn.fetchval(
                 "SELECT prepare_channel_turn($1::jsonb)",
                 json.dumps({

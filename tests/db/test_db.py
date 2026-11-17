@@ -9051,6 +9051,50 @@ async def test_change_goal_priority_sets_timestamps_and_logs(db_pool):
             await tr.rollback()
 
 
+async def test_recent_heartbeats_includes_dashboard_runs(db_pool):
+    """A heartbeat run from the dashboard is finalized by finalize_agentic_heartbeat."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            hb = str(await conn.fetchval("SELECT gen_random_uuid()"))
+            await conn.execute(
+                "UPDATE heartbeat_state SET active_heartbeat_id = $1::uuid, active_heartbeat_number = 12 WHERE id = 1", hb
+            )
+            await conn.execute("SELECT finalize_agentic_heartbeat($1, 'manual run summary', 3, 2, 'completed', false)", hb)
+            row = await conn.fetchrow(
+                "SELECT heartbeat_number, narrative FROM recent_heartbeats WHERE heartbeat_id = $1::uuid", hb
+            )
+            assert row is not None
+            assert (row["heartbeat_number"], row["narrative"]) == (12, "manual run summary")
+            assert await conn.fetchval("SELECT active_heartbeat_id FROM heartbeat_state WHERE id = 1") is None
+        finally:
+            await tr.rollback()
+
+
+async def test_recent_heartbeats_lists_each_heartbeat_once(db_pool):
+    """A memory saved during a heartbeat carries its heartbeat_id but is not the heartbeat."""
+    from uuid import uuid4
+
+    hb = str(uuid4())
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute(
+                "SELECT create_episodic_memory($1, NULL, $2::jsonb)",
+                "noted during the heartbeat", json.dumps({"heartbeat_id": hb}),
+            )
+            await conn.execute(
+                "SELECT create_episodic_memory($1, NULL, $2::jsonb)",
+                "Heartbeat #7: done", json.dumps({"heartbeat_id": hb, "heartbeat_number": 7}),
+            )
+            rows = await conn.fetch("SELECT narrative FROM recent_heartbeats WHERE heartbeat_id = $1::uuid", hb)
+            assert [r["narrative"] for r in rows] == ["Heartbeat #7: done"]
+        finally:
+            await tr.rollback()
+
+
 async def test_heartbeat_views_query(db_pool):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM heartbeat_health")
