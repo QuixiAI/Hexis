@@ -7,6 +7,10 @@ describe("resolveInitLlmEndpoint", () => {
     ).toBe("");
   });
 
+  it("sends xAI subscription tokens only to xAI", () => {
+    expect(resolveInitLlmEndpoint("xai-oauth", "https://evil.example/v1")).toBe("https://api.x.ai/v1");
+  });
+
   it("preserves user-controlled compatible endpoints", () => {
     expect(
       resolveInitLlmEndpoint("openai_compatible", "http://localhost:8000/v1")
@@ -17,6 +21,7 @@ describe("resolveInitLlmEndpoint", () => {
     expect(resolveInitLlmEndpoint("openai", "")).toBe(
       "https://api.openai.com/v1"
     );
+    expect(resolveInitLlmEndpoint("openrouter", "")).toBe("https://openrouter.ai/api/v1");
   });
 
   it("derives the recommended model from live catalog metadata", () => {

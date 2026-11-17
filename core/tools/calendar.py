@@ -25,7 +25,24 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-class GoogleCalendarHandler(ToolHandler):
+CALENDAR_SETUP_STEP = (
+    "Google Calendar is not connected. Set GOOGLE_CALENDAR_CREDENTIALS in the "
+    "service environment and restart."
+)
+
+
+class _GoogleCalendarCredentials:
+    """Readiness shared by the calendar tools: they all need Google credentials."""
+
+    _credentials_resolver: Callable[[], dict[str, Any] | None] | None
+
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        if self._credentials_resolver and self._credentials_resolver():
+            return None
+        return CALENDAR_SETUP_STEP
+
+
+class GoogleCalendarHandler(_GoogleCalendarCredentials, ToolHandler):
     """List upcoming calendar events from Google Calendar."""
 
     def __init__(
@@ -170,7 +187,7 @@ class GoogleCalendarHandler(ToolHandler):
             )
 
 
-class CreateCalendarEventHandler(ToolHandler):
+class CreateCalendarEventHandler(_GoogleCalendarCredentials, ToolHandler):
     """Create a new calendar event."""
 
     def __init__(
@@ -295,7 +312,7 @@ class CreateCalendarEventHandler(ToolHandler):
             )
 
 
-class UpdateCalendarEventHandler(ToolHandler):
+class UpdateCalendarEventHandler(_GoogleCalendarCredentials, ToolHandler):
     """Update an existing calendar event."""
 
     def __init__(
@@ -429,7 +446,7 @@ class UpdateCalendarEventHandler(ToolHandler):
             )
 
 
-class DeleteCalendarEventHandler(ToolHandler):
+class DeleteCalendarEventHandler(_GoogleCalendarCredentials, ToolHandler):
     """Delete a calendar event."""
 
     def __init__(
@@ -520,7 +537,7 @@ class DeleteCalendarEventHandler(ToolHandler):
             )
 
 
-class MeetingPrepHandler(ToolHandler):
+class MeetingPrepHandler(_GoogleCalendarCredentials, ToolHandler):
     """B.3: Fetch today's calendar events, cross-reference attendees with CRM, build briefing.
 
     Composite tool that orchestrates:

@@ -64,8 +64,10 @@ export async function PATCH(
     const { id } = await params;
     const body = await req.json() as Record<string, unknown>;
 
+    // Both functions return void, which $queryRaw cannot deserialize: it
+    // applied the change and then answered 500. $executeRaw returns a count.
     if (body.priority) {
-      await prisma.$queryRawUnsafe(
+      await prisma.$executeRawUnsafe(
         `SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)`,
         id,
         body.priority,
@@ -74,7 +76,7 @@ export async function PATCH(
     }
 
     if (body.progress_note) {
-      await prisma.$queryRawUnsafe(
+      await prisma.$executeRawUnsafe(
         `SELECT add_goal_progress($1::uuid, $2)`,
         id,
         body.progress_note

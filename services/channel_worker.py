@@ -469,6 +469,9 @@ async def run_channel_worker(
 
     dsn = db_dsn_from_env(instance)
     pool = await asyncpg.create_pool(dsn=dsn, min_size=2, max_size=10)
+    from core.usage import set_usage_pool
+
+    set_usage_pool(pool)  # so model calls made here count in Usage
     logger.info("Connected to database")
     worker_id = await _register_channel_worker(pool, instance)
 

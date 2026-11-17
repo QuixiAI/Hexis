@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 import { POST } from "./route";
 import { prisma } from "@/lib/prisma";
 
@@ -11,7 +12,7 @@ describe("/api/retention/decide", () => {
 
   it("journals only after the explicit request", async () => {
     query.mockResolvedValueOnce([{ result: { ok: true, decision: "journal", status: "released" } }]);
-    const response = await POST(new Request("http://localhost/api/retention/decide", {
+    const response = await POST(new NextRequest("http://localhost/api/retention/decide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: ID, decision: "journal", journal_content: "Keep the lesson." }),
@@ -27,7 +28,7 @@ describe("/api/retention/decide", () => {
 
   it("keeps finite-budget refusal actionable", async () => {
     query.mockResolvedValueOnce([{ result: { ok: false, error: "no_retention_budget", message: "Nothing changed." } }]);
-    const response = await POST(new Request("http://localhost/api/retention/decide", {
+    const response = await POST(new NextRequest("http://localhost/api/retention/decide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: ID, decision: "keep" }),

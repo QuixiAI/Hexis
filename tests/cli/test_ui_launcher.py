@@ -258,11 +258,11 @@ def test_handle_ui_container_runs_foreground_and_stops_owned_services(
     assert rc == 0
     # The always-on loops come up first, detached, and are never stopped:
     # closing the dashboard must not stop the agent from thinking.
-    assert calls[0] == ["up", "-d", "heartbeat_worker", "maintenance_worker"]
+    assert calls[0] == ["up", "-d", "heartbeat_worker", "maintenance_worker", "ingest_worker"]
     assert calls[1] == ["up", "api", "ui"]
     assert calls[-1] == ["stop", "ui", "api"]
     assert not any(
-        "heartbeat_worker" in call or "maintenance_worker" in call
+        "heartbeat_worker" in call or "maintenance_worker" in call or "ingest_worker" in call
         for call in calls
         if call and call[0] == "stop"
     )

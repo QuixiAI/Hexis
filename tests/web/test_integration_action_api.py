@@ -159,3 +159,26 @@ async def test_gmail_oauth_callback_completes_attempt_without_manual_paste(monke
     assert "Gmail connected" in response.text
     assert "eric@example.com" in response.text
     assert calls and "code=oauth-code" in calls[0]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_heartbeats_can_be_paused_and_resumed(db_pool, monkeypatch) -> None:
+    """The dashboard's Pause/Resume: resuming needs an initialized agent."""
+    monkeypatch.setattr(hexis_api, "_pool", db_pool)
+    async with db_pool.acquire() as conn:
+        before = await conn.fetchrow("SELECT is_paused, next_heartbeat_at FROM heartbeat_state WHERE id = 1")
+        ready = await conn.fetchval("SELECT is_agent_configured() AND is_init_complete() AND NOT is_agent_terminated()")
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.post("/api/heartbeat/pause")).json() == {"heartbeat_paused": True}
+            resumed = await client.post("/api/heartbeat/resume")
+            if ready:
+                assert resumed.json() == {"heartbeat_paused": False}
+            else:
+                assert resumed.status_code == 409
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE heartbeat_state SET is_paused = $1, next_heartbeat_at = $2 WHERE id = 1",
+                before["is_paused"], before["next_heartbeat_at"],
+            )

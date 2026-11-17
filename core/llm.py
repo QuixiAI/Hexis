@@ -1,36 +1,158 @@
+"""One LLM library for every provider: LiteLLM.
+
+Every chat, heartbeat, subconscious and ingestion call goes through
+``litellm.acompletion``. The hexis-specific sign-ins (ChatGPT, Copilot, Chutes,
+Qwen Portal, MiniMax Portal, Anthropic setup tokens) stay owned by
+``core.auth``; this module only maps each provider onto LiteLLM's model prefix
+and connection arguments.
+
+The two Google Code Assist providers (``google-gemini-cli``,
+``google-antigravity``) speak a protocol LiteLLM does not know (the
+``v1internal`` Cloud Code Assist API), so they keep their own client in
+``core.providers.google_code_assist`` behind the same ``chat_completion`` door.
+"""
+
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import re
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
-import httpx
+from core.auth.store import AUTH_DIR
 
-from core.integration_reliability import IntegrationHttpError, iter_sse_json_events
+# Every provider is reached through LiteLLM's SDK. Left at its defaults,
+# importing LiteLLM loads any .env in the working directory into the process
+# environment ("DEV" mode) and fetches its model price list from GitHub; the
+# first could pull in unrelated secrets or settings, and a locked-down network
+# must not depend on the second.
+os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+# LiteLLM's chatgpt/ provider (Codex) reads its tokens from this folder; the
+# sign-in in core.auth.openai_codex keeps them there, in the shared auth store.
+os.environ.setdefault("CHATGPT_TOKEN_DIR", str(AUTH_DIR / "litellm-chatgpt"))
+# The chatgpt/ provider otherwise puts the Codex CLI prompt ("You are Codex…
+# a coding agent", ~3,000 words) in front of every request, which drowns the
+# agent's character. ChatGPT's backend accepts other instructions; ours defer
+# to the prompt each caller sends (chat, heartbeat, subconscious, …).
+os.environ.setdefault(
+    "CHATGPT_DEFAULT_INSTRUCTIONS",
+    "You are the mind of a persistent AI built on Hexis. "
+    "Follow the instructions that come next.",
+)
+try:
+    import litellm
+except Exception:  # pragma: no cover
+    litellm = None  # type: ignore[assignment]
+else:
+    litellm.suppress_debug_info = True
 
 logger = logging.getLogger(__name__)
 
-try:
-    import openai
-except Exception:  # pragma: no cover
-    openai = None  # type: ignore[assignment]
 
-try:
-    import anthropic
-except Exception:  # pragma: no cover
-    anthropic = None  # type: ignore[assignment]
+def _keep_parallel_tool_arguments() -> None:
+    """Don't lose the arguments of parallel tool calls on the ChatGPT stream.
 
-try:
-    from google import genai  # type: ignore[import-not-found]
-    from google.genai import types as gemini_types  # type: ignore[import-not-found]
-except Exception:  # pragma: no cover
-    genai = None  # type: ignore[assignment]
-    gemini_types = None  # type: ignore[assignment]
+    LiteLLM turns the Responses API's ``output_item.done`` for a function call
+    into an empty chunk, assuming the arguments already arrived as
+    ``function_call_arguments.delta`` events. ChatGPT's backend sends those
+    for a single call, but when the model calls several tools at once it sends
+    the arguments only in ``output_item.done``, so every call came through as
+    ``{}`` and failed for "missing required arguments" (seen with litellm
+    1.104.3). When a call finishes with no argument deltas, emit its complete
+    arguments from the finished item.
+    """
+    try:
+        from litellm.completion_extras.litellm_responses_transformation.transformation import (
+            OpenAiResponsesToChatCompletionStreamIterator as Iterator,
+        )
+        from litellm.types.llms.openai import ChatCompletionToolCallFunctionChunk
+        from litellm.types.utils import ChatCompletionToolCallChunk, Delta, ModelResponseStream, StreamingChoices
+    except Exception:  # pragma: no cover - a LiteLLM layout change
+        logger.warning("Could not patch LiteLLM's ChatGPT stream; parallel tool calls may lose arguments")
+        return
+    original = Iterator.chunk_parser
+    if getattr(original, "_hexis_patched", False):
+        return
+
+    def chunk_parser(self, chunk):  # type: ignore[no-untyped-def]
+        seen = self.__dict__.setdefault("_hexis_argument_deltas", set())
+        event = chunk.get("type") if isinstance(chunk, dict) else None
+        event = getattr(event, "value", event)
+        output_index = chunk.get("output_index", 0) if isinstance(chunk, dict) else 0
+        if event == "response.function_call_arguments.delta" and chunk.get("delta"):
+            seen.add(output_index)
+        elif event == "response.output_item.done":
+            item = chunk.get("item") or {}
+            arguments = item.get("arguments")
+            if item.get("type") == "function_call" and arguments and output_index not in seen:
+                index = Iterator._sequential_tool_call_index(self._tool_call_index_map, output_index)
+                return self._with_stream_scoped_id(ModelResponseStream(choices=[StreamingChoices(
+                    index=0,
+                    delta=Delta(tool_calls=[ChatCompletionToolCallChunk(
+                        id=None, index=index, type="function",
+                        function=ChatCompletionToolCallFunctionChunk(name=None, arguments=arguments),
+                    )]),
+                    finish_reason=None,
+                )]))
+        return original(self, chunk)
+
+    chunk_parser._hexis_patched = True  # type: ignore[attr-defined]
+    Iterator.chunk_parser = chunk_parser
 
 
+def _no_interactive_chatgpt_login() -> None:
+    """Never let LiteLLM's ChatGPT provider wait for a device-code login.
+
+    Hexis owns the ChatGPT sign-in (core.auth.openai_codex) and refreshes it
+    before each call. When LiteLLM can't read its token file at that moment
+    (the auth folder is shared with the containers, and a read can miss the
+    file while it is replaced), it would print a login code to the worker's
+    log and wait up to 15 minutes for someone to enter it. Instead, read the
+    file again; if there is still no token, fail the call so the caller
+    retries, and say where to sign in.
+    """
+    try:
+        from litellm.llms.chatgpt.authenticator import Authenticator
+    except Exception:  # pragma: no cover - a LiteLLM layout change
+        logger.warning("Could not patch LiteLLM's ChatGPT sign-in; it may wait for a device-code login")
+        return
+    if getattr(Authenticator._login_device_code, "_hexis_patched", False):
+        return
+
+    def _login_device_code(self: Any) -> dict[str, str]:
+        import time
+
+        for _ in range(5):
+            time.sleep(0.2)
+            data = self._read_auth_file() or {}
+            token = data.get("access_token")
+            if isinstance(token, str) and token and not self._is_token_expired(data, token):
+                return {"access_token": token}
+        raise RuntimeError(
+            "The ChatGPT sign-in is missing or expired. Sign in again with "
+            "`hexis auth openai-codex login` or from the dashboard's setup page."
+        )
+
+    _login_device_code._hexis_patched = True  # type: ignore[attr-defined]
+    Authenticator._login_device_code = _login_device_code
+    # A device code requested earlier makes LiteLLM wait out a cooldown first.
+    Authenticator._get_device_code_cooldown_remaining = lambda self, auth_data: 0.0
+
+
+if litellm is not None:
+    _keep_parallel_tool_arguments()
+    _no_interactive_chatgpt_login()
+
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+# Providers that speak the OpenAI Chat Completions protocol (directly or
+# through a gateway).
 OPENAI_COMPATIBLE = {
     "openai",
     "openai_compatible",
@@ -39,43 +161,76 @@ OPENAI_COMPATIBLE = {
     "chutes",
     "github-copilot",
     "qwen-portal",
+    "azure_openai",
+    "openrouter",
+    "zai",
+    "deepseek",
+    "qwen",
+    "qwen_coding",
+    "meta",
+    "minimax",
 }
 
-# OpenAI Codex (ChatGPT subscription) backend
+# Providers that speak the Anthropic Messages protocol.
+ANTHROPIC_COMPATIBLE = {"anthropic", "minimax-portal"}
+
+# Google Cloud Code Assist (a Gemini CLI / Antigravity sign-in). Not a protocol
+# LiteLLM speaks; see core.providers.google_code_assist.
+CODE_ASSIST_PROVIDERS = {"google-gemini-cli", "google-antigravity"}
+
+# Codex uses the ChatGPT subscription OAuth backend.
 _CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
-_CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth"
+# Bedrock and Vertex AI serve several model families; LiteLLM picks the
+# request format from the model id.
+SUPPORTED_PROVIDERS = (
+    OPENAI_COMPATIBLE
+    | ANTHROPIC_COMPATIBLE
+    | CODE_ASSIST_PROVIDERS
+    | {"gemini", "openai-codex", "xai-oauth", "bedrock", "vertex"}
+)
+DEFAULT_BEDROCK_REGION = "us-east-1"
+DEFAULT_VERTEX_LOCATION = "us-central1"
+_MINIMAX_DEFAULT_ENDPOINT = "https://api.minimax.io/anthropic"
 
-# OpenAI client cache: (api_key, base_url, provider, headers) -> client
-_openai_clients: dict[
-    tuple[str, str, str, tuple[tuple[str, Any], ...]],
-    Any,
-] = {}
 
-# The OpenAI SDK requires a non-empty credential even when a compatible local
-# server does not authenticate. This value is only an SDK adapter sentinel; it
-# is never persisted and is used only for the explicitly key-optional provider.
-_LOCAL_OPENAI_COMPATIBLE_API_KEY = "local-key"
+def _unsupported_provider(provider: str) -> ValueError:
+    return ValueError(
+        f"Unsupported LLM provider: {provider!r}. Supported providers: "
+        f"{', '.join(sorted(SUPPORTED_PROVIDERS))}. Run `hexis init` to choose one."
+    )
 
-# LLM retry configuration
+
+def parse_vertex_endpoint(endpoint: str | None) -> tuple[str, str]:
+    """``projects/<project>/locations/<location>`` -> (project, location)."""
+    parts = (endpoint or "").strip().strip("/").split("/")
+    project = parts[1] if len(parts) >= 2 and parts[0] == "projects" else ""
+    location = parts[3] if len(parts) >= 4 and parts[2] == "locations" else ""
+    return project, location or DEFAULT_VERTEX_LOCATION
+
+
+# ---------------------------------------------------------------------------
+# Retry
+# ---------------------------------------------------------------------------
+
 _LLM_MAX_RETRIES = 4
 _LLM_RETRY_BACKOFF_BASE = 2  # seconds
 _LLM_RETRY_MAX_WAIT = 60.0  # seconds; cap for Retry-After honoring
 
 
-def _codex_http_error(resp: Any, body: bytes) -> RuntimeError:
-    """Build the Codex HTTP error with retry metadata attached, so
-    _retry_on_transient can recognize the status and honor Retry-After."""
-    err = RuntimeError(
-        f"OpenAI Codex request failed: HTTP {resp.status_code}: {body.decode('utf-8', errors='replace')}"
+def is_transient_error(exc: BaseException) -> bool:
+    """True for failures that go away on their own: rate limits, server
+    errors, timeouts, dropped connections. Same rule for every provider."""
+    exc_str = str(exc).lower()
+    status = getattr(exc, 'status_code', None) or getattr(exc, 'status', None)
+    return (
+        status in (429, 500, 502, 503, 504, 529)
+        or 'rate' in exc_str
+        or 'overloaded' in exc_str
+        or 'timeout' in exc_str
+        or 'timed out' in exc_str
+        or 'connection' in exc_str
+        or isinstance(exc, (ConnectionError, TimeoutError, OSError))
     )
-    err.status_code = resp.status_code
-    retry_after = resp.headers.get("retry-after")
-    if retry_after:
-        try:
-            err.retry_after = float(retry_after)
-        except ValueError:
-            pass
-    return err
 
 
 async def _retry_on_transient(
@@ -99,16 +254,7 @@ async def _retry_on_transient(
             return await coro_factory()
         except Exception as exc:
             last_exc = exc
-            exc_str = str(exc).lower()
-            status = getattr(exc, 'status_code', None) or getattr(exc, 'status', None)
-            is_transient = (
-                status in (429, 500, 502, 503, 504, 529)
-                or 'rate' in exc_str
-                or 'overloaded' in exc_str
-                or 'timeout' in exc_str
-                or 'connection' in exc_str
-                or isinstance(exc, (ConnectionError, TimeoutError, OSError))
-            )
+            is_transient = is_transient_error(exc)
             if should_retry is not None and not should_retry():
                 is_transient = False
             if is_transient and attempt < max_retries - 1:
@@ -127,481 +273,101 @@ async def _retry_on_transient(
     raise last_exc  # Should not reach here, but just in case
 
 
-async def _close_async_stream(stream: Any) -> None:
-    """Close an SDK stream without masking the provider error."""
-    import inspect
-
-    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
-    if not callable(close):
-        response = getattr(stream, "response", None)
-        close = getattr(response, "aclose", None)
-    if not callable(close):
-        return
-    try:
-        result = close()
-        if inspect.isawaitable(result):
-            await result
-    except Exception:
-        logger.debug("Failed to close provider stream", exc_info=True)
-
-
-def _get_openai_client(api_key: str | None, base_url: str | None, provider: str, default_headers: dict[str, Any] | None = None) -> Any:
-    """Get or create a cached OpenAI client."""
-    if openai is None:
-        raise RuntimeError("openai package is required for OpenAI-compatible providers.")
-
-    effective_api_key = api_key
-    if provider == "openai_compatible" and not effective_api_key:
-        effective_api_key = _LOCAL_OPENAI_COMPATIBLE_API_KEY
-
-    # Include headers in cache key to handle cases like github-copilot
-    headers_key = tuple(sorted((default_headers or {}).items())) if default_headers else ()
-    cache_key = (effective_api_key or "", base_url or "", provider, headers_key)
-    if cache_key in _openai_clients:
-        return _openai_clients[cache_key]
-
-    client_kwargs: dict[str, Any] = {"api_key": effective_api_key, "base_url": base_url}
-    if default_headers:
-        client_kwargs["default_headers"] = default_headers
-
-    client = openai.AsyncOpenAI(**client_kwargs)
-    _openai_clients[cache_key] = client
-    return client
-
-
-def _clear_openai_client_cache() -> None:
-    """Clear the OpenAI client cache. Useful for testing."""
-    _openai_clients.clear()
-
-
-def _b64url_decode(raw: str) -> bytes:
-    s = (raw or "").strip()
-    if not s:
-        return b""
-    pad = "=" * ((4 - (len(s) % 4)) % 4)
-    return base64.urlsafe_b64decode(s + pad)
-
-
-def _extract_codex_account_id(token: str) -> str:
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            raise ValueError("Invalid JWT")
-        payload = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
-        account_id = payload.get(_CODEX_JWT_CLAIM_PATH, {}).get("chatgpt_account_id")
-        if not isinstance(account_id, str) or not account_id:
-            raise ValueError("Missing account id in token")
-        return account_id
-    except Exception as exc:
-        raise ValueError("Failed to extract accountId from token") from exc
-
-
-def _resolve_codex_url(base_url: str | None) -> str:
-    raw = (base_url or _CODEX_DEFAULT_BASE_URL).strip()
-    normalized = raw.rstrip("/")
-    if normalized.endswith("/codex/responses"):
-        return normalized
-    if normalized.endswith("/codex"):
-        return f"{normalized}/responses"
-    return f"{normalized}/codex/responses"
-
-
-def _messages_to_codex_responses_input(
-    messages: list[dict[str, Any]],
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """
-    Convert Chat Completions-style messages into Responses API input items in the
-    structured content-part format Codex expects.
-    """
-    system_parts: list[str] = []
-    input_items: list[dict[str, Any]] = []
-
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "") or ""
-
-        if role == "system":
-            text = _content_text(content)
-            if text.strip():
-                system_parts.append(text)
-            continue
-
-        if role == "user":
-            input_items.append({
-                "role": "user",
-                "content": _content_to_responses_parts(content),
-            })
-            continue
-
-        if role == "assistant":
-            if content:
-                input_items.append({
-                    "role": "assistant",
-                    "content": _content_to_responses_parts(content, assistant=True),
-                })
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                args = fn.get("arguments", "{}")
-                if isinstance(args, dict):
-                    args = json.dumps(args)
-                input_items.append({
-                    "type": "function_call",
-                    "call_id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "arguments": args,
-                })
-            continue
-
-        if role == "tool":
-            input_items.append({
-                "type": "function_call_output",
-                "call_id": msg.get("tool_call_id", ""),
-                "output": str(content),
-            })
-            continue
-
-    instructions = "\n\n".join(p for p in system_parts if p.strip()) or None
-    return instructions, input_items
-
-
-async def _iter_sse_events_json(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
-    """
-    Parse SSE responses where each event is JSON in one or more `data:` lines.
-    Mirrors the parsing strategy used by OpenClaw/pi-ai for Codex.
-    """
-    data_lines: list[str] = []
-    async for line in response.aiter_lines():
-        if line.startswith("data:"):
-            data_lines.append(line[5:].strip())
-            continue
-        if line.strip() != "":
-            # Ignore non-data SSE fields (event:, id:, retry:, etc.)
-            continue
-        if not data_lines:
-            continue
-        data = "\n".join(data_lines).strip()
-        data_lines = []
-        if not data or data == "[DONE]":
-            continue
-        try:
-            obj = json.loads(data)
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            yield obj
-
-
-async def _codex_responses_completion(
-    *,
-    model: str,
-    endpoint: str | None,
-    api_key: str | None,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-    temperature: float,
-    max_tokens: int,
-    on_text_delta: Any | None = None,
-) -> dict[str, Any]:
-    if not api_key:
-        raise RuntimeError("Missing OpenAI Codex OAuth access token (api_key).")
-
-    account_id = _extract_codex_account_id(api_key)
-    url = _resolve_codex_url(endpoint)
-    instructions, input_items = _messages_to_codex_responses_input(messages)
-    responses_tools = _tools_to_responses(tools)
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "store": False,
-        "stream": True,
-        "input": input_items,
-        "text": {"verbosity": "medium"},
-        "include": ["reasoning.encrypted_content"],
-    }
-    if instructions:
-        payload["instructions"] = instructions
-    # Codex Responses API does not support temperature or max_tokens; omit both.
-    _ = temperature, max_tokens  # kept for signature parity
-
-    if responses_tools:
-        payload["tools"] = responses_tools
-        payload["tool_choice"] = "auto"
-        payload["parallel_tool_calls"] = True
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "chatgpt-account-id": account_id,
-        "OpenAI-Beta": "responses=experimental",
-        "originator": "pi",
-        "accept": "text/event-stream",
-        "content-type": "application/json",
-        "user-agent": f"hexis (python; {os.uname().sysname if hasattr(os, 'uname') else 'unknown'})",
-    }
-
-    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-    return await _codex_responses_attempt(
-        url=url,
-        headers=headers,
-        payload=payload,
-        timeout=timeout,
-        on_text_delta=on_text_delta,
-    )
-
-
-async def _codex_responses_attempt(
-    *,
-    url: str,
-    headers: dict[str, str],
-    payload: dict[str, Any],
-    timeout: Any,
-    on_text_delta: Any | None = None,
-) -> dict[str, Any]:
-    """Single attempt at a Codex Responses API streaming call."""
-    content_parts: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
-    # Current function call (arguments stream)
-    current_fc: dict[str, Any] | None = None
-
-    try:
-        async for event in iter_sse_json_events(
-            "openai-codex",
-            "POST",
-            url,
-            headers=headers,
-            json_body=payload,
-            timeout=timeout,
-            attempts=3,
-            max_delay=_LLM_RETRY_MAX_WAIT,
-            retry_unsafe_methods=True,
-        ):
-            event_type = event.get("type")
-
-            if event_type == "response.output_text.delta":
-                delta = event.get("delta", "")
-                if isinstance(delta, str) and delta:
-                    content_parts.append(delta)
-                    if on_text_delta:
-                        import asyncio
-
-                        result = on_text_delta(delta)
-                        if asyncio.iscoroutine(result):
-                            await result
-                continue
-
-            if event_type == "response.output_item.added":
-                item = event.get("item") or {}
-                if isinstance(item, dict) and item.get("type") == "function_call":
-                    current_fc = {
-                        "call_id": item.get("call_id"),
-                        "name": item.get("name"),
-                        "args_buf": item.get("arguments") or "",
-                    }
-                continue
-
-            if event_type == "response.function_call_arguments.delta":
-                if current_fc is not None:
-                    delta = event.get("delta", "")
-                    if isinstance(delta, str) and delta:
-                        current_fc["args_buf"] = (current_fc.get("args_buf") or "") + delta
-                continue
-
-            if event_type == "response.function_call_arguments.done":
-                if current_fc is not None:
-                    args = event.get("arguments", "")
-                    if isinstance(args, str) and args:
-                        current_fc["args_buf"] = args
-                continue
-
-            if event_type in {"response.done", "response.completed"}:
-                break
-
-            if event_type in {"error", "response.failed"}:
-                message = (
-                    event.get("message")
-                    or (event.get("error") or {}).get("message")
-                    or "Codex request failed"
-                )
-                raise RuntimeError(str(message))
-
-            if event_type == "response.output_item.done":
-                item = event.get("item") or {}
-                if not isinstance(item, dict) or item.get("type") != "function_call":
-                    continue
-                call_id = item.get("call_id") or (current_fc or {}).get("call_id")
-                name = item.get("name") or (current_fc or {}).get("name")
-                args_str = item.get("arguments") or (current_fc or {}).get("args_buf") or ""
-
-                try:
-                    args = json.loads(args_str) if isinstance(args_str, str) and args_str else {}
-                except Exception:
-                    logger.debug("Failed to parse tool arguments: %r", str(args_str)[:200])
-                    args = {}
-                tool_calls.append({
-                    "id": call_id,
-                    "name": name or "",
-                    "arguments": args,
-                })
-                current_fc = None
-                continue
-    except IntegrationHttpError as exc:
-        raise RuntimeError(str(exc)) from exc
-
-    return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
-
-
 # ---------------------------------------------------------------------------
-# Responses API capability detection
+# Per-endpoint memory of what a model rejects
 # ---------------------------------------------------------------------------
-
-_HAS_RESPONSES_API: bool = False
-if openai is not None:
-    try:
-        from openai.resources import responses as _responses_mod  # noqa: F401
-        _HAS_RESPONSES_API = True
-    except ImportError:
-        pass
-
-# Per-endpoint cache: normalized URL -> True (supported) / False (unsupported)
-_endpoint_responses_support: dict[str, bool] = {}
-
 
 def _endpoint_cache_key(endpoint: str | None) -> str:
     return (endpoint or "default").rstrip("/")
 
 
-def _should_try_responses(
-    endpoint: str | None,
-    *,
-    provider: str | None = None,
-) -> bool:
-    # A generic compatible endpoint promises Chat Completions, not the
-    # Responses event grammar. Some servers expose /responses nominally but
-    # emit tool/reasoning items the official SDK cannot parse safely.
-    if provider in {"openai_compatible", "openai-chat-completions-endpoint"}:
-        return False
-    if not _HAS_RESPONSES_API:
-        return False
-    key = _endpoint_cache_key(endpoint)
-    cached = _endpoint_responses_support.get(key)
-    if cached is False:
-        return False
-    return True
+_endpoint_schema_support: dict[str, bool] = {}
 
 
-def _cache_responses_support(endpoint: str | None, supported: bool) -> None:
-    _endpoint_responses_support[_endpoint_cache_key(endpoint)] = supported
+def _schema_from_response_format(response_format: dict[str, Any] | None) -> tuple[str, dict[str, Any]] | None:
+    """(name, JSON schema) when response_format asks for json_schema, else None."""
+    if not response_format or response_format.get("type") != "json_schema":
+        return None
+    spec = response_format.get("json_schema") or {}
+    schema = spec.get("schema") if isinstance(spec, dict) else None
+    if not isinstance(schema, dict):
+        return None
+    return str(spec.get("name") or "result"), schema
 
 
-def _is_responses_unsupported_error(exc: Exception) -> bool:
-    """Return True if the error means the endpoint lacks Responses API support."""
-    if openai is None:
+def _is_request_rejected(exc: Exception) -> bool:
+    """True for a 4xx validation rejection of the request (400 or 422).
+
+    A server or gateway that cannot honour a structured-output request words
+    the rejection its own way: "response_format is not supported" (Ollama,
+    LM Studio, older vLLM), or, behind LiteLLM, the forced tool_choice the
+    gateway translated it into ("tool_choice ... not supported" from Bedrock).
+    So a request carrying response_format that is rejected is re-asked once
+    without it; the constraint is taken to be the cause only if that retry
+    succeeds (see _remember_schema_unsupported).
+    """
+    return litellm is not None and isinstance(exc, (litellm.BadRequestError, litellm.UnprocessableEntityError))
+
+
+def _schema_key(endpoint: str | None, model: str) -> str:
+    # Per model: behind one gateway some models take a schema and some do not.
+    return f"{_endpoint_cache_key(endpoint)}|{model}"
+
+
+def _schema_support_known_missing(endpoint: str | None, model: str) -> bool:
+    return _endpoint_schema_support.get(_schema_key(endpoint, model)) is False
+
+
+def _remember_schema_unsupported(endpoint: str | None, model: str, exc: Exception) -> None:
+    logger.warning(
+        "LLM %s at %s rejected a request with response_format and accepted it without; "
+        "continuing without a schema for this model: %s", model, endpoint, exc,
+    )
+    _endpoint_schema_support[_schema_key(endpoint, model)] = False
+
+
+# Reasoning effort: how long a thinking model may think before answering.
+# None leaves the model's default. Short structured calls (the inline
+# appraisal) ask for "low": a thinking model left at its default can spend
+# its whole output budget thinking and return nothing. OpenAI reasoning
+# models, vLLM and SGLang take the standard parameter; a model or server
+# that rejects it (non-reasoning OpenAI models) is remembered per endpoint
+# and model, and the call goes ahead without it.
+_reasoning_rejected: set[str] = set()
+
+
+def _reasoning_key(endpoint: str | None, model: str) -> str:
+    return f"{_endpoint_cache_key(endpoint)}|{model}"
+
+
+def _usable_reasoning_effort(endpoint: str | None, model: str, effort: str | None) -> str | None:
+    if not effort or _reasoning_key(endpoint, model) in _reasoning_rejected:
+        return None
+    return effort
+
+
+def _is_reasoning_unsupported_error(exc: Exception) -> bool:
+    """True when a server rejected the reasoning-effort parameter itself."""
+    if litellm is None or not isinstance(exc, (litellm.BadRequestError, litellm.UnprocessableEntityError)):
         return False
-    if isinstance(exc, openai.NotFoundError):
-        return True
-    if isinstance(exc, (openai.BadRequestError, openai.UnprocessableEntityError)):
-        msg = str(exc).lower()
-        if "not found" in msg or "unknown" in msg or "unsupported" in msg:
-            return True
-    if isinstance(exc, openai.APIStatusError) and getattr(exc, "status_code", 0) == 501:
-        return True
-    return False
+    return "reasoning" in str(exc).lower()
+
+
+def _finish_reason(value: Any) -> str:
+    """Collapse each provider's stop reason to: stop, length, tool_calls or other."""
+    text = str(getattr(value, "value", value) or "").lower()
+    if text in ("length", "max_tokens", "max_output_tokens") or "max_token" in text:
+        return "length"
+    if text in ("tool_calls", "tool_use", "function_call"):
+        return "tool_calls"
+    if text in ("stop", "end_turn", "stop_sequence", "completed", "finish_reason_stop"):
+        return "stop"
+    return text or "stop"
 
 
 # ---------------------------------------------------------------------------
-# Responses API format converters
+# Leaked reasoning
 # ---------------------------------------------------------------------------
-
-
-def _tools_to_responses(
-    tools: list[dict[str, Any]] | None,
-) -> list[dict[str, Any]]:
-    """Convert Chat Completions tools (nested function key) to Responses API flat format."""
-    if not tools:
-        return []
-    result: list[dict[str, Any]] = []
-    for tool in tools:
-        fn = tool.get("function", {})
-        result.append({
-            "type": "function",
-            "name": fn.get("name", ""),
-            "description": fn.get("description", ""),
-            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
-        })
-    return result
-
-
-def _messages_to_responses_input(
-    messages: list[dict[str, Any]],
-) -> tuple[str | None, list[dict[str, Any]]]:
-    """
-    Convert Chat Completions messages to Responses API (instructions, input_items).
-
-    System messages → instructions parameter.
-    Assistant tool_calls (nested OpenAI format) → function_call items.
-    Tool result messages → function_call_output items.
-    """
-    system_parts: list[str] = []
-    input_items: list[dict[str, Any]] = []
-
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "") or ""
-
-        if role == "system":
-            text = _content_text(content)
-            if text.strip():
-                system_parts.append(text)
-
-        elif role == "user":
-            input_items.append({"role": "user", "content": _content_to_responses(content)})
-
-        elif role == "assistant":
-            if content:
-                input_items.append({"role": "assistant", "content": _content_to_responses(content, assistant=True)})
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                args = fn.get("arguments", "{}")
-                if isinstance(args, dict):
-                    args = json.dumps(args)
-                input_items.append({
-                    "type": "function_call",
-                    "call_id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "arguments": args,
-                })
-
-        elif role == "tool":
-            input_items.append({
-                "type": "function_call_output",
-                "call_id": msg.get("tool_call_id", ""),
-                "output": content,
-            })
-
-    instructions = "\n\n".join(p for p in system_parts if p.strip()) or None
-    return instructions, input_items
-
-
-def _extract_responses_result(response: Any) -> dict[str, Any]:
-    """Extract {content, tool_calls, raw} from a Responses API response object."""
-    content = getattr(response, "output_text", "") or ""
-    tool_calls: list[dict[str, Any]] = []
-
-    for item in getattr(response, "output", None) or []:
-        if getattr(item, "type", None) == "function_call":
-            raw_args = getattr(item, "arguments", "{}")
-            try:
-                args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except Exception:
-                logger.debug("Failed to parse tool arguments: %r", str(raw_args)[:200])
-                args = {}
-            tool_calls.append({
-                "id": getattr(item, "call_id", None),
-                "name": getattr(item, "name", ""),
-                "arguments": args,
-            })
-
-    return {"content": content, "tool_calls": tool_calls, "raw": response}
-
 
 _REASONING_PATTERNS = [
     # DeepSeek/Qwen-style reasoning tags, if they surface inline in `content`.
@@ -652,6 +418,10 @@ def strip_reasoning(content: str) -> str:
     return cleaned
 
 
+# ---------------------------------------------------------------------------
+# Config normalisation
+# ---------------------------------------------------------------------------
+
 _PROVIDER_ALIASES: dict[str, str] = {
     "openai_chat_completions_endpoint": "openai-chat-completions-endpoint",
     "openai_codex": "openai-codex",
@@ -660,6 +430,7 @@ _PROVIDER_ALIASES: dict[str, str] = {
     "minimax_portal": "minimax-portal",
     "google_gemini_cli": "google-gemini-cli",
     "google_antigravity": "google-antigravity",
+    "xai_oauth": "xai-oauth",
 }
 
 
@@ -671,18 +442,33 @@ def normalize_provider(provider: str | None) -> str:
 
 
 def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:
-    # ChatGPT subscription OAuth has one registered backend. Never inherit a
-    # stale OpenAI API-key endpoint from a previous provider selection.
+    # Subscription tokens must never be sent to a custom/API-key endpoint.
     if provider == "openai-codex":
         return _CODEX_DEFAULT_BASE_URL
+    if provider == "xai-oauth":
+        return "https://api.x.ai/v1"
+    if provider == "azure_openai" and endpoint and endpoint.strip():
+        # The resource URL people copy from the Azure portal; the v1 API under it
+        # speaks the plain OpenAI protocol, with the deployment name as the model.
+        base = endpoint.strip().rstrip("/")
+        return base if "/openai/" in base + "/" else f"{base}/openai/v1"
     if endpoint:
         return endpoint.strip() or None
     _DEFAULTS: dict[str, str] = {
         "grok": "https://api.x.ai/v1",
         "chutes": "https://api.chutes.ai/v1",
         "qwen-portal": "https://portal.qwen.ai/v1",
+        "minimax-portal": _MINIMAX_DEFAULT_ENDPOINT,
         "google-gemini-cli": "https://cloudcode-pa.googleapis.com",
         "google-antigravity": "https://cloudcode-pa.googleapis.com",
+        "openrouter": "https://openrouter.ai/api/v1",
+        "bedrock": DEFAULT_BEDROCK_REGION,
+        "zai": "https://api.z.ai/api/paas/v4",
+        "deepseek": "https://api.deepseek.com",
+        "qwen": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "qwen_coding": "https://coding-intl.dashscope.aliyuncs.com/v1",
+        "meta": "https://api.meta.ai/v1",
+        "minimax": "https://api.minimax.io/v1",
     }
     return _DEFAULTS.get(provider)
 
@@ -693,9 +479,49 @@ def resolve_api_key(api_key_env: str | None) -> str | None:
     value = api_key_env.strip()
     if not value:
         return None
-    import os
-
     return os.getenv(value)
+
+
+def load_stored_api_key(ref: str | None) -> str | None:
+    """The API key saved under *ref* in the auth store, if any.
+
+    A key typed during setup lives in the auth store (``~/.hexis/auth``),
+    which every service mounts, so no file edit or restart is needed.
+    """
+    if not ref:
+        return None
+    try:
+        from core.auth.store import load_auth
+
+        stored = load_auth(ref)
+    except Exception:
+        return None
+    if isinstance(stored, dict):
+        value = stored.get("api_key")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+# Which environment variable each API-key provider reads when the config
+# names no key. Deliberately absent: openai_compatible — a local server must
+# never silently consume an ambient OPENAI_API_KEY (Bar #5).
+_PROVIDER_ENV_KEYS: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "grok": "XAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openai-chat-completions-endpoint": "OPENAI_API_KEY",
+    "azure_openai": "AZURE_OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "bedrock": "AWS_BEARER_TOKEN_BEDROCK",
+    "zai": "ZAI_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+    "qwen_coding": "QWEN_API_KEY",
+    "meta": "META_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+}
 
 
 def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = "gpt-4o") -> dict[str, Any]:
@@ -716,14 +542,9 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
     if not api_key:
         api_key = resolve_api_key(str(config.get("api_key_env") or "").strip() or None)
     if not api_key:
-        provider_env_map = {
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-            "grok": "XAI_API_KEY",
-            "gemini": "GEMINI_API_KEY",
-            "openai-chat-completions-endpoint": "OPENAI_API_KEY",
-        }
-        env_name = provider_env_map.get(provider)
+        api_key = load_stored_api_key(str(config.get("api_key_ref") or "").strip() or None)
+    if not api_key:
+        env_name = _PROVIDER_ENV_KEYS.get(provider)
         if env_name:
             api_key = os.getenv(env_name)
     result: dict[str, Any] = {
@@ -738,6 +559,10 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
         result["auth_mode"] = auth_mode
     return result
 
+
+# ---------------------------------------------------------------------------
+# Message shaping
+# ---------------------------------------------------------------------------
 
 def _extract_system_prompt(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     parts, rest = _extract_system_parts(messages)
@@ -858,114 +683,6 @@ def _content_to_openai_chat(content: Any) -> Any:
     return parts or _content_text(content)
 
 
-def _content_to_responses(content: Any, *, assistant: bool = False) -> Any:
-    if not isinstance(content, list):
-        return _content_text(content)
-    parts: list[dict[str, Any]] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
-        if ptype in {"text", "input_text", "output_text"}:
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                parts.append({"type": "output_text" if assistant else "input_text", "text": text})
-            continue
-        if not assistant and ptype in {"image_url", "input_image"}:
-            url = _image_url_from_part(part)
-            if url:
-                parts.append({
-                    "type": "input_image",
-                    "image_url": url,
-                    "detail": _image_detail_from_part(part),
-                })
-    return parts or _content_text(content)
-
-
-def _content_to_responses_parts(content: Any, *, assistant: bool = False) -> list[dict[str, Any]]:
-    converted = _content_to_responses(content, assistant=assistant)
-    if isinstance(converted, list):
-        return converted
-    text = _content_text(converted)
-    return [{"type": "output_text" if assistant else "input_text", "text": text}]
-
-
-def _content_to_anthropic(content: Any) -> Any:
-    if not isinstance(content, list):
-        return _content_text(content)
-    parts: list[dict[str, Any]] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
-        if ptype in {"text", "input_text", "output_text"}:
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                parts.append({"type": "text", "text": text})
-            continue
-        if ptype in {"image_url", "input_image"}:
-            url = _image_url_from_part(part)
-            if not url:
-                continue
-            media_type, data = _data_url_parts(url)
-            if media_type and data:
-                parts.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": data,
-                    },
-                })
-    return parts or _content_text(content)
-
-
-def _messages_to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    converted: list[dict[str, Any]] = []
-    for msg in messages:
-        role = msg.get("role")
-        if role not in {"user", "assistant", "tool"}:
-            continue
-        next_msg = dict(msg)
-        next_msg["content"] = _content_to_anthropic(next_msg.get("content"))
-        converted.append(next_msg)
-    return converted
-
-
-def _content_to_gemini_parts(content: Any) -> list[Any]:
-    if gemini_types is None:
-        return []
-    if not isinstance(content, list):
-        return [gemini_types.Part(text=_content_text(content))]
-
-    parts: list[Any] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
-        if ptype in {"text", "input_text", "output_text"}:
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                parts.append(gemini_types.Part(text=text))
-            continue
-        if ptype in {"image_url", "input_image"}:
-            url = _image_url_from_part(part)
-            if not url:
-                continue
-            media_type, data = _data_url_parts(url)
-            if not (media_type and data):
-                continue
-            raw = base64.b64decode(data)
-            from_bytes = getattr(gemini_types.Part, "from_bytes", None)
-            if callable(from_bytes):
-                parts.append(from_bytes(data=raw, mime_type=media_type))
-            else:
-                parts.append(gemini_types.Part(
-                    inline_data=gemini_types.Blob(mime_type=media_type, data=raw)
-                ))
-    return parts or [gemini_types.Part(text=_content_text(content))]
-
-
 def _openai_tool_calls(raw_calls: list[Any]) -> list[dict[str, Any]]:
     tool_calls: list[dict[str, Any]] = []
     for call in raw_calls or []:
@@ -981,292 +698,237 @@ def _openai_tool_calls(raw_calls: list[Any]) -> list[dict[str, Any]]:
     return tool_calls
 
 
-def _anthropic_tools(openai_tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    if not openai_tools:
-        return []
-    tools: list[dict[str, Any]] = []
-    for tool in openai_tools:
-        fn = tool.get("function", {})
-        tools.append(
-            {
-                "name": fn.get("name"),
-                "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
-            }
-        )
-    return tools
+# ---------------------------------------------------------------------------
+# Anthropic subscription (setup-token) specifics
+# ---------------------------------------------------------------------------
+
+# Must be verbatim: Anthropic's subscription (OAuth) endpoint validates the
+# Claude-Code identity preamble. hermes-agent and openclaw both send this exact
+# string; a different wording can 401.
+_CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+# LiteLLM recognises the sk-ant-oat token itself (Bearer auth plus the OAuth
+# beta); these are the remaining Claude Code request headers the
+# subscription endpoint expects.
+_CLAUDE_CODE_HEADERS = {
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+    "user-agent": "claude-cli/2.1.2 (external, cli)",
+    "x-app": "cli",
+}
 
 
-def _gemini_tools(openai_tools: list[dict[str, Any]] | None) -> list[Any]:
+def _oauth_tool_name(name: str) -> str:
+    """Normalize a tool name for the OAuth/subscription path.
+
+    Anthropic's subscription billing classifier flags single-underscore
+    ``mcp_`` tool names as third-party apps and 400s the request; Claude Code
+    uses a double underscore (``mcp__``). Hexis emits ``mcp_<server>_<tool>``
+    (see core/tools/mcp.py), so rewrite those. Matches hermes-agent.
     """
-    Convert OpenAI-style tools to google-genai tool declarations.
+    if name.startswith("mcp_") and not name.startswith("mcp__"):
+        return "mcp__" + name[len("mcp_"):]
+    return name
 
-    Returns a list of google.genai.types.Tool instances (typed as Any here to
-    avoid importing google-genai at type-check time).
+
+def _oauth_tools(tools: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]] | None, dict[str, str]]:
+    """Tools as sent on the subscription path, and wire name -> original name."""
+    if not tools:
+        return tools, {}
+    renamed: list[dict[str, Any]] = []
+    restore: dict[str, str] = {}
+    for tool in tools:
+        fn = tool.get("function") or {}
+        original = str(fn.get("name") or "")
+        wire = _oauth_tool_name(original)
+        if wire != original:
+            restore[wire] = original
+            tool = {**tool, "function": {**fn, "name": wire}}
+        renamed.append(tool)
+    return renamed, restore
+
+
+def _restore_tool_names(tool_calls: list[dict[str, Any]], restore: dict[str, str]) -> list[dict[str, Any]]:
+    if not restore:
+        return tool_calls
+    return [{**call, "name": restore.get(call.get("name") or "", call.get("name"))} for call in tool_calls]
+
+
+def _uses_anthropic_messages(provider: str, model: str) -> bool:
+    """True when LiteLLM will send this request as Anthropic Messages, where a
+    `cache_control` breakpoint on the system blocks is honoured."""
+    if provider in ANTHROPIC_COMPATIBLE:
+        return True
+    return provider in {"bedrock", "vertex"} and "claude" in model.lower()
+
+
+def _litellm_messages(
+    messages: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+    auth_mode: str | None,
+) -> list[dict[str, Any]]:
+    """Messages in LiteLLM's (OpenAI chat) shape.
+
+    For Anthropic-protocol targets the system parts become one system message
+    of content blocks with the cache breakpoint on the last stable block (see
+    _anthropic_system_blocks); every other provider receives the system
+    messages as they are — OpenAI and Gemini cache a stable prefix on their
+    own, and LiteLLM folds several system messages into the provider's single
+    instruction field, in order.
     """
-    if not openai_tools or gemini_types is None:
-        return []
-    decls: list[Any] = []
-    for tool in openai_tools:
-        fn = tool.get("function", {}) if isinstance(tool, dict) else {}
-        name = fn.get("name")
-        if not name:
-            continue
-        decls.append(
-            gemini_types.FunctionDeclaration(
-                name=name,
-                description=fn.get("description", ""),
-                parameters_json_schema=fn.get("parameters") or {"type": "object", "properties": {}},
-            )
-        )
-    if not decls:
-        return []
-    return [gemini_types.Tool(function_declarations=decls)]
-
-
-def _messages_to_gemini_contents(messages: list[dict[str, Any]]) -> list[Any]:
-    """
-    Convert OpenAI-style message list into google-genai `contents`.
-
-    Handles:
-    - user text messages
-    - assistant text messages
-    - assistant tool_calls (OpenAI format) -> functionCall parts
-    - tool result messages (role=tool) -> functionResponse parts
-    """
-    if gemini_types is None:
-        return []
-
-    # Map OpenAI tool call id -> function name so we can attach tool outputs.
-    call_id_to_name: dict[str, str] = {}
-    for msg in messages:
-        if msg.get("role") != "assistant":
-            continue
-        for tc in msg.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
-            call_id = str(tc.get("id") or "")
-            fn = tc.get("function") or {}
-            name = str((fn.get("name") if isinstance(fn, dict) else "") or "")
-            if call_id and name:
-                call_id_to_name[call_id] = name
-
-    contents: list[Any] = []
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content") or ""
-
-        if role == "user":
-            contents.append(
-                gemini_types.Content(
-                    role="user",
-                    parts=_content_to_gemini_parts(content),
-                )
-            )
-            continue
-
-        if role == "assistant":
-            parts: list[Any] = []
-            if content:
-                parts.append(gemini_types.Part(text=_content_text(content)))
-
-            for tc in msg.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                fn = tc.get("function") or {}
-                if not isinstance(fn, dict):
-                    continue
-                name = str(fn.get("name") or "")
-                if not name:
-                    continue
-                call_id = tc.get("id")
-                raw_args: Any = fn.get("arguments", "{}")
-                args: dict[str, Any] = {}
-                if isinstance(raw_args, str):
-                    try:
-                        args = json.loads(raw_args) if raw_args else {}
-                    except Exception:
-                        logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
-                        args = {}
-                elif isinstance(raw_args, dict):
-                    args = raw_args
-                parts.append(
-                    gemini_types.Part(
-                        function_call=gemini_types.FunctionCall(
-                            id=str(call_id) if call_id else None,
-                            name=name,
-                            args=args,
-                        )
-                    )
-                )
-
-            if parts:
-                contents.append(gemini_types.Content(role="model", parts=parts))
-            continue
-
-        if role == "tool":
-            call_id = str(msg.get("tool_call_id") or "")
-            fn_name = call_id_to_name.get(call_id) or ""
-            if fn_name:
-                contents.append(
-                    gemini_types.Content(
-                        role="user",
-                        parts=[
-                            gemini_types.Part(
-                                function_response=gemini_types.FunctionResponse(
-                                    id=call_id or None,
-                                    name=fn_name,
-                                    response={"content": str(content)},
-                                )
-                            )
-                        ],
-                    )
-                )
-            else:
-                # Fallback: if we can't find a matching function name, inject as user text.
-                contents.append(
-                    gemini_types.Content(
-                        role="user",
-                        parts=[gemini_types.Part(text=_content_text(content))],
-                    )
-                )
-            continue
-
-        # Ignore other roles (system is handled separately).
-
-    return contents
+    converted = [{**msg, "content": _content_to_openai_chat(msg.get("content"))} for msg in messages]
+    if not _uses_anthropic_messages(provider, model):
+        return converted
+    parts, rest = _extract_system_parts(converted)
+    # Only reshape the wire format when the caller actually split the prompt.
+    # A single system message has no cacheable boundary to exploit, and the
+    # subscription path is validated by Anthropic (it checks the identity
+    # preamble), so it keeps the exact shape it has always had.
+    split = len(parts) > 1
+    if provider == "anthropic" and auth_mode == "setup-token":
+        # The identity preamble is the most stable text there is; it leads.
+        parts = [_CLAUDE_CODE_IDENTITY, *parts]
+    if not parts:
+        return rest
+    content: Any = _anthropic_system_blocks(parts) if split else "\n\n".join(parts)
+    return [{"role": "system", "content": content}, *rest]
 
 
 # ---------------------------------------------------------------------------
-# Responses API implementation
+# LiteLLM routing
 # ---------------------------------------------------------------------------
 
+# LiteLLM's prefix for each provider that maps onto one directly.
+_LITELLM_PREFIX = {
+    "openai": "openai",
+    "openai_compatible": "openai",
+    "openai-chat-completions-endpoint": "openai",
+    # Subscription sign-ins that expose an OpenAI-compatible endpoint; the
+    # OAuth access token is the API key (core.llm_config injects a fresh one).
+    "chutes": "openai",
+    "qwen-portal": "openai",
+    "github-copilot": "openai",
+    "grok": "xai",
+    "openrouter": "openrouter",
+    "anthropic": "anthropic",
+    # MiniMax's Anthropic-compatible endpoint, with a MiniMax Portal sign-in.
+    "minimax-portal": "anthropic",
+    "gemini": "gemini",
+    "azure_openai": "azure",
+    "bedrock": "bedrock",
+    "vertex": "vertex_ai",
+    "zai": "zai",
+    "deepseek": "deepseek",
+    # Alibaba Model Studio (DashScope); the Coding Plan is the same protocol
+    # on its own subscription endpoint.
+    "qwen": "dashscope",
+    "qwen_coding": "dashscope",
+    # Meta's Muse models are served only through the Responses API.
+    "meta": "openai/responses",
+    # MiniMax's OpenAI-compatible API with an API key (the Portal sign-in
+    # above uses its Anthropic-compatible endpoint instead).
+    "minimax": "minimax",
+    # A SuperGrok / X sign-in: the OAuth access token is the API key.
+    "xai-oauth": "xai",
+    # A ChatGPT sign-in. The Codex backend speaks only the Responses API, and
+    # LiteLLM sends a model it does not list to Chat Completions unless told.
+    "openai-codex": "chatgpt/responses",
+}
 
-async def _responses_completion(
-    client: Any,
+
+def _litellm_target(
+    provider: str,
     model: str,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-    temperature: float,
-    max_tokens: int,
-    response_format: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Non-streaming completion via the Responses API."""
-    instructions, input_items = _messages_to_responses_input(messages)
-    responses_tools = _tools_to_responses(tools)
+    endpoint: str | None,
+    api_key: str | None,
+    *,
+    auth_mode: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """LiteLLM's model string and connection arguments for a configured provider."""
+    if litellm is None:
+        raise RuntimeError("The litellm package is required (pip install litellm).")
+    prefix = _LITELLM_PREFIX.get(provider)
+    if prefix is None:
+        raise _unsupported_provider(provider)
+    kwargs: dict[str, Any] = {}
+    if provider == "openai-codex":
+        # LiteLLM reads the token and account from its own file, which
+        # _subscription_key has just refreshed; nothing is passed here.
+        return f"{prefix}/{model}", {}
+    if provider == "bedrock":
+        # A Bedrock API key if given; otherwise the AWS credential chain
+        # (AWS_* environment variables, profile, or the instance role).
+        kwargs["aws_region_name"] = (endpoint or "").strip() or DEFAULT_BEDROCK_REGION
+        if api_key:
+            kwargs["api_key"] = api_key
+    elif provider == "vertex":
+        project, location = parse_vertex_endpoint(endpoint)
+        if not project:
+            raise RuntimeError("Vertex AI needs a Google Cloud project ID.")
+        kwargs["vertex_project"] = project
+        kwargs["vertex_location"] = location
+        if api_key:
+            # A pasted service-account key; without one, Application Default Credentials.
+            kwargs["vertex_credentials"] = api_key
+    elif provider == "azure_openai":
+        # Azure's v1 API under the resource URL, with the deployment as the model.
+        base = (endpoint or "").strip().rstrip("/")
+        if base.endswith("/openai/v1"):
+            base = base[: -len("/openai/v1")]
+        kwargs.update(api_base=base or None, api_version="v1", api_key=api_key)
+    elif provider == "github-copilot":
+        from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
 
-    payload: dict[str, Any] = {
-        "model": model,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-    }
-    if instructions:
-        payload["instructions"] = instructions
-    payload["input"] = input_items or ""
-    if responses_tools:
-        payload["tools"] = responses_tools
-        payload["tool_choice"] = "auto"
-    if response_format:
-        fmt_type = response_format.get("type", "text")
-        if fmt_type == "json_object":
-            payload["text"] = {"format": {"type": "json_object"}}
-        elif fmt_type == "json_schema":
-            payload["text"] = {"format": response_format}
-
-    response = await client.responses.create(**payload)
-    return _extract_responses_result(response)
-
-
-async def _responses_stream_completion(
-    client: Any,
-    model: str,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None,
-    temperature: float,
-    max_tokens: int,
-    on_text_delta: Any | None = None,
-    on_reasoning_delta: Any | None = None,
-) -> dict[str, Any]:
-    """Streaming completion via the Responses API."""
-    instructions, input_items = _messages_to_responses_input(messages)
-    responses_tools = _tools_to_responses(tools)
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "temperature": temperature,
-        "max_output_tokens": max_tokens,
-    }
-    if instructions:
-        payload["instructions"] = instructions
-    payload["input"] = input_items or ""
-    if responses_tools:
-        payload["tools"] = responses_tools
-        payload["tool_choice"] = "auto"
-
-    content_parts: list[str] = []
-    # Accumulate tool calls: item_id -> {call_id, name, arguments_parts}
-    tc_accum: dict[str, dict[str, Any]] = {}
-
-    async with client.responses.stream(**payload) as stream:
-        async for event in stream:
-            event_type = getattr(event, "type", "")
-
-            if event_type == "response.output_text.delta":
-                text = getattr(event, "delta", "")
-                content_parts.append(text)
-                if on_text_delta:
-                    import asyncio
-                    result = on_text_delta(text)
-                    if asyncio.iscoroutine(result):
-                        await result
-
-            elif event_type in {
-                "response.reasoning_summary_text.delta",
-                "response.reasoning_text.delta",
-            }:
-                text = getattr(event, "delta", "")
-                if text and on_reasoning_delta:
-                    import asyncio
-                    result = on_reasoning_delta(text)
-                    if asyncio.iscoroutine(result):
-                        await result
-
-            elif event_type == "response.output_item.done":
-                item = getattr(event, "item", None)
-                if item and getattr(item, "type", None) == "function_call":
-                    raw_args = getattr(item, "arguments", "{}")
-                    try:
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                    except Exception:
-                        logger.debug("Failed to parse tool arguments: %r", str(raw_args)[:200])
-                        args = {}
-                    tc_accum[getattr(item, "id", "")] = {
-                        "call_id": getattr(item, "call_id", None),
-                        "name": getattr(item, "name", ""),
-                        "arguments": args,
-                    }
-
-    tool_calls: list[dict[str, Any]] = []
-    for tc in tc_accum.values():
-        tool_calls.append({
-            "id": tc["call_id"],
-            "name": tc["name"],
-            "arguments": tc["arguments"],
-        })
-
-    return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+        kwargs.update(api_base=endpoint, api_key=api_key, extra_headers=dict(COPILOT_REQUEST_HEADERS))
+    elif provider == "anthropic" and auth_mode == "setup-token":
+        # A Claude Code setup token (sk-ant-oat…): LiteLLM sends it as Bearer
+        # auth with the OAuth beta; the rest of the Claude Code identity goes
+        # in these headers and the system preamble (_litellm_messages).
+        kwargs.update(api_base=endpoint, api_key=api_key, extra_headers=dict(_CLAUDE_CODE_HEADERS))
+    else:
+        if endpoint:
+            kwargs["api_base"] = endpoint
+        # Local OpenAI-compatible servers (vLLM, SGLang, llama.cpp) often need
+        # no key, but the client refuses to send a request without one.
+        kwargs["api_key"] = api_key or ("not-needed" if endpoint and prefix == "openai" else None)
+    return f"{prefix}/{model}", {k: v for k, v in kwargs.items() if v is not None}
 
 
-def _chat_completions_url(endpoint: str | None) -> str:
-    base = (endpoint or "").strip().rstrip("/")
-    if not base:
-        raise ValueError("An endpoint is required for an OpenAI-compatible provider.")
-    if base.endswith("/chat/completions"):
-        return base
-    return f"{base}/chat/completions"
+async def _subscription_key(provider: str, api_key: str | None) -> str | None:
+    """Refresh a subscription sign-in under its cross-process lock before a call."""
+    if provider == "openai-codex":
+        from core.auth.openai_codex import ensure_fresh_openai_codex_credentials
+        await ensure_fresh_openai_codex_credentials()
+        return None
+    if provider == "xai-oauth":
+        from core.auth.xai_oauth import ensure_fresh_xai_credentials
+        return (await ensure_fresh_xai_credentials()).access
+    return api_key
 
 
-async def _compatible_chat_stream_completion(
+async def _emit(callback: Any | None, text: str) -> None:
+    if callback and text:
+        import asyncio
+
+        result = callback(text)
+        if asyncio.iscoroutine(result):
+            await result
+
+
+def _code_assist_credentials(api_key: str | None) -> tuple[str, str]:
+    """(access token, project id) packed by core.llm_config for Code Assist."""
+    data: dict[str, Any] = {}
+    if api_key:
+        try:
+            parsed = json.loads(api_key)
+            if isinstance(parsed, dict):
+                data = parsed
+        except ValueError:
+            pass
+    return str(data.get("token") or api_key or ""), str(data.get("projectId") or "")
+
+
+def _build_request(
     *,
     provider: str,
     model: str,
@@ -1276,136 +938,27 @@ async def _compatible_chat_stream_completion(
     tools: list[dict[str, Any]] | None,
     temperature: float,
     max_tokens: int,
-    on_text_delta: Any | None,
-    on_reasoning_delta: Any | None,
-) -> dict[str, Any]:
-    """Stream the portable Chat Completions SSE contract without SDK parsing."""
-    import asyncio
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {**msg, "content": _content_to_openai_chat(msg.get("content"))}
-            for msg in messages
-        ],
+    auth_mode: str | None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """The litellm.acompletion keyword arguments, and the tool-name restore map."""
+    target, connection = _litellm_target(provider, model, endpoint, api_key, auth_mode=auth_mode)
+    restore: dict[str, str] = {}
+    if provider == "anthropic" and auth_mode == "setup-token":
+        tools, restore = _oauth_tools(tools)
+    request: dict[str, Any] = {
+        "model": target,
+        "messages": _litellm_messages(messages, provider=provider, model=model, auth_mode=auth_mode),
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stream": True,
+        # A parameter this model does not take (temperature on a reasoning
+        # model, say) is left out rather than failing the call.
+        "drop_params": True,
+        **connection,
     }
     if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-
-    headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    content_parts: list[str] = []
-    tool_parts: dict[int, dict[str, Any]] = {}
-    terminal = False
-    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-
-    async for event in iter_sse_json_events(
-        provider,
-        "POST",
-        _chat_completions_url(endpoint),
-        headers=headers,
-        json_body=payload,
-        timeout=timeout,
-        attempts=_LLM_MAX_RETRIES,
-        max_delay=_LLM_RETRY_MAX_WAIT,
-        retry_unsafe_methods=True,
-        strict_json=True,
-    ):
-        if isinstance(event.get("error"), dict):
-            error = event["error"]
-            detail = error.get("message") or error.get("type") or "Provider stream failed"
-            raise RuntimeError(str(detail))
-
-        choices = event.get("choices")
-        if not isinstance(choices, list) or not choices:
-            continue
-        choice = choices[0] if isinstance(choices[0], dict) else {}
-        if choice.get("finish_reason") is not None:
-            terminal = True
-        delta = choice.get("delta") if isinstance(choice, dict) else {}
-        if not isinstance(delta, dict):
-            continue
-
-        reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning and on_reasoning_delta:
-            result = on_reasoning_delta(reasoning)
-            if asyncio.iscoroutine(result):
-                await result
-
-        text = delta.get("content")
-        if isinstance(text, str) and text:
-            content_parts.append(text)
-            if on_text_delta:
-                result = on_text_delta(text)
-                if asyncio.iscoroutine(result):
-                    await result
-
-        tool_deltas = delta.get("tool_calls")
-        if not isinstance(tool_deltas, list):
-            continue
-        for tool_delta in tool_deltas:
-            if not isinstance(tool_delta, dict):
-                continue
-            raw_index = tool_delta.get("index")
-            if raw_index is None:
-                index = 0
-            elif isinstance(raw_index, bool):
-                raise RuntimeError("Streamed tool call has an invalid index.")
-            elif isinstance(raw_index, int) and raw_index >= 0:
-                index = raw_index
-            elif isinstance(raw_index, str):
-                index_text = raw_index.strip()
-                if not index_text.isascii() or not index_text.isdecimal():
-                    raise RuntimeError("Streamed tool call has an invalid index.")
-                try:
-                    index = int(index_text)
-                except (ValueError, OverflowError) as exc:
-                    raise RuntimeError(
-                        "Streamed tool call has an invalid index."
-                    ) from exc
-            else:
-                raise RuntimeError("Streamed tool call has an invalid index.")
-            current = tool_parts.setdefault(
-                index,
-                {"id": None, "name": None, "arguments_parts": []},
-            )
-            if tool_delta.get("id"):
-                current["id"] = tool_delta["id"]
-            function = tool_delta.get("function")
-            if isinstance(function, dict):
-                if function.get("name"):
-                    current["name"] = function["name"]
-                if function.get("arguments"):
-                    current["arguments_parts"].append(str(function["arguments"]))
-
-    if not terminal:
-        raise RuntimeError("OpenAI-compatible stream ended before a finish signal.")
-
-    tool_calls: list[dict[str, Any]] = []
-    for index in sorted(tool_parts):
-        item = tool_parts[index]
-        raw_arguments = "".join(item["arguments_parts"])
-        try:
-            arguments = json.loads(raw_arguments) if raw_arguments else {}
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"Malformed streamed arguments for tool {item['name'] or index}."
-            ) from exc
-        if not item["name"]:
-            raise RuntimeError(f"Streamed tool call {index} is missing a function name.")
-        tool_calls.append({
-            "id": item["id"],
-            "name": item["name"],
-            "arguments": arguments,
-        })
-
-    return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+        request["tools"] = tools
+        request["tool_choice"] = "auto"
+    return request, restore
 
 
 async def chat_completion(
@@ -1420,181 +973,17 @@ async def chat_completion(
     max_tokens: int = 1200,
     response_format: dict[str, Any] | None = None,
     auth_mode: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
+    """One model turn. Returns ``{content, tool_calls, raw, finish_reason}``."""
     provider = normalize_provider(provider)
     endpoint = normalize_endpoint(provider, endpoint)
 
-    if provider == "gemini":
-        if genai is None or gemini_types is None:
-            raise RuntimeError("google-genai package is required for Gemini provider (pip install google-genai).")
-        if not api_key:
-            raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
-
-        client = genai.Client(api_key=api_key)
-        # Gemini 2.5+ implicitly caches repeated prefixes. SystemPrompt emits
-        # the stable half first and the volatile half second; keep that order
-        # intact when flattening the API's single system instruction.
-        system_prompt, rest = _extract_system_prompt(messages)
-        contents = _messages_to_gemini_contents(rest)
-        gemini_tools = _gemini_tools(tools)
-
-        tool_config = None
-        if gemini_tools:
-            tool_config = gemini_types.ToolConfig(
-                function_calling_config=gemini_types.FunctionCallingConfig(
-                    mode=gemini_types.FunctionCallingConfigMode.AUTO,
-                )
-            )
-
-        config = gemini_types.GenerateContentConfig(
-            system_instruction=system_prompt or None,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            tools=gemini_tools or None,
-            tool_config=tool_config,
-        )
-
-        async def _do_gemini_completion():
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config,
-            )
-            content = getattr(response, "text", "") or ""
-            tool_calls: list[dict[str, Any]] = []
-            for call in getattr(response, "function_calls", None) or []:
-                tool_calls.append({
-                    "id": getattr(call, "id", None),
-                    "name": getattr(call, "name", "") or "",
-                    "arguments": getattr(call, "args", None) or {},
-                })
-            return {"content": content, "tool_calls": tool_calls, "raw": response}
-
-        return await _retry_on_transient(_do_gemini_completion)
-
-    if provider in OPENAI_COMPATIBLE:
-        default_headers = None
-        if provider == "github-copilot":
-            from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
-            default_headers = COPILOT_REQUEST_HEADERS
-        client = _get_openai_client(api_key, endpoint, provider, default_headers)
-
-        # Try Responses API first, fall back to Chat Completions
-        if _should_try_responses(endpoint, provider=provider):
-            try:
-                result = await _retry_on_transient(lambda: _responses_completion(
-                    client, model, messages, tools, temperature, max_tokens, response_format,
-                ))
-                _cache_responses_support(endpoint, True)
-                return result
-            except Exception as exc:
-                if _is_responses_unsupported_error(exc):
-                    _cache_responses_support(endpoint, False)
-                else:
-                    raise
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {**msg, "content": _content_to_openai_chat(msg.get("content"))}
-                for msg in messages
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-        if response_format:
-            payload["response_format"] = response_format
-
-        async def _do_chat_completion():
-            response = await client.chat.completions.create(**payload)
-            message = response.choices[0].message
-            content = strip_reasoning(message.content or "")
-            tool_calls = _openai_tool_calls(message.tool_calls or [])
-            return {"content": content, "tool_calls": tool_calls, "raw": response}
-
-        return await _retry_on_transient(_do_chat_completion)
-
-    if provider == "openai-codex":
-        # Wrapped like every other provider branch: a 429/5xx here was the
-        # one unretried path (it killed live turns during ingestion storms).
-        return await _retry_on_transient(lambda: _codex_responses_completion(
-            model=model,
-            endpoint=endpoint,
-            api_key=api_key,
-            messages=messages,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            on_text_delta=None,
-        ))
-
-    if provider == "anthropic":
-        if auth_mode == "setup-token":
-            from core.providers.anthropic_http import anthropic_http_completion
-            system_prompt, rest = _extract_system_prompt(messages)
-            rest = _messages_to_anthropic_messages(rest)
-            return await _retry_on_transient(lambda: anthropic_http_completion(
-                endpoint=endpoint or "https://api.anthropic.com",
-                api_key=api_key or "",
-                model=model,
-                messages=rest,
-                tools=tools,
-                auth_mode="setup-token",
-                max_tokens=max_tokens,
-                system_prompt=system_prompt or None,
-            ))
-        if anthropic is None:
-            raise RuntimeError("anthropic package is required for Anthropic provider.")
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        system_parts, rest = _extract_system_parts(messages)
-        system_blocks = _anthropic_system_blocks(system_parts)
-        rest = _messages_to_anthropic_messages(rest)
-        anthropic_tools = _anthropic_tools(tools)
-
-        async def _do_anthropic_completion():
-            response = await client.messages.create(
-                model=model,
-                system=system_blocks,
-                messages=rest,
-                tools=anthropic_tools or None,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            text_parts: list[str] = []
-            tool_calls: list[dict[str, Any]] = []
-            for block in response.content or []:
-                if block.type == "text":
-                    text_parts.append(block.text)
-                if block.type == "tool_use":
-                    tool_calls.append({"id": block.id, "name": block.name, "arguments": block.input})
-            return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": response}
-
-        return await _retry_on_transient(_do_anthropic_completion)
-
-    if provider == "minimax-portal":
-        from core.providers.anthropic_http import anthropic_http_completion
-        system_prompt, rest = _extract_system_prompt(messages)
-        rest = _messages_to_anthropic_messages(rest)
-        return await anthropic_http_completion(
-            endpoint=endpoint or "https://api.minimax.io/anthropic",
-            api_key=api_key or "",
-            model=model,
-            messages=rest,
-            tools=tools,
-            auth_mode="api-key",
-            max_tokens=max_tokens,
-            system_prompt=system_prompt or None,
-        )
-
-    if provider in {"google-gemini-cli", "google-antigravity"}:
+    if provider in CODE_ASSIST_PROVIDERS:
         from core.providers.google_code_assist import google_code_assist_completion
-        _api_key_data = json.loads(api_key) if api_key else {}
-        access_token = _api_key_data.get("token", api_key or "")
-        project_id = _api_key_data.get("projectId", "")
-        return await google_code_assist_completion(
+
+        access_token, project_id = _code_assist_credentials(api_key)
+        result = await _retry_on_transient(lambda: google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
             project_id=project_id,
@@ -1602,9 +991,54 @@ async def chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-        )
+        ))
+        result["content"] = strip_reasoning(result.get("content") or "")
+        result.setdefault("finish_reason", "tool_calls" if result.get("tool_calls") else "stop")
+        return result
 
-    raise ValueError(f"Unsupported provider: {provider}")
+    reasoning_effort = _usable_reasoning_effort(endpoint, model, reasoning_effort)
+    api_key = await _subscription_key(provider, api_key)
+    request, restore = _build_request(
+        provider=provider, model=model, endpoint=endpoint, api_key=api_key, messages=messages,
+        tools=tools, temperature=temperature, max_tokens=max_tokens, auth_mode=auth_mode,
+    )
+    if response_format and _schema_support_known_missing(endpoint, model):
+        response_format = None
+    if response_format:
+        request["response_format"] = response_format
+    if reasoning_effort:
+        request["reasoning_effort"] = reasoning_effort
+
+    async def _do_completion():
+        response = await litellm.acompletion(**request)
+        choice = response.choices[0]
+        message = choice.message
+        return {
+            "content": strip_reasoning(getattr(message, "content", None) or ""),
+            "tool_calls": _restore_tool_names(_openai_tool_calls(getattr(message, "tool_calls", None) or []), restore),
+            "raw": response,
+            "finish_reason": _finish_reason(getattr(choice, "finish_reason", None)),
+        }
+
+    schema_rejection: Exception | None = None
+    for _attempt in range(3):
+        try:
+            result = await _retry_on_transient(_do_completion)
+        except Exception as exc:
+            if request.get("reasoning_effort") and _is_reasoning_unsupported_error(exc):
+                logger.warning("LLM %s at %s rejected reasoning effort; continuing without it: %s", model, endpoint, exc)
+                _reasoning_rejected.add(_reasoning_key(endpoint, model))
+                request.pop("reasoning_effort", None)
+                continue
+            if request.get("response_format") and _is_request_rejected(exc):
+                schema_rejection = exc
+                request.pop("response_format", None)
+                continue
+            raise
+        if schema_rejection is not None:
+            _remember_schema_unsupported(endpoint, model, schema_rejection)
+        return result
+    raise RuntimeError(f"LLM endpoint {endpoint} rejected the request")
 
 
 async def stream_chat_completion(
@@ -1627,8 +1061,7 @@ async def stream_chat_completion(
     Accumulates the full response while optionally calling ``on_text_delta(text)``
     for each answer token and ``on_reasoning_delta(text)`` for provider-native
     reasoning. Reasoning never enters the returned content. Returns the same
-    shape as ``chat_completion()``:
-    ``{content, tool_calls, raw}``.
+    shape as ``chat_completion()``: ``{content, tool_calls, raw, finish_reason}``.
 
     ``on_text_delta`` can be a sync or async callable accepting a single str
     argument. It's called for each text token as it arrives.
@@ -1637,365 +1070,106 @@ async def stream_chat_completion(
     endpoint = normalize_endpoint(provider, endpoint)
     delivered = False
 
-    def _deliver_text(text: str) -> Any:
+    async def _deliver_text(text: str) -> None:
         nonlocal delivered
         if text:
             delivered = True
-        if on_text_delta is not None:
-            return on_text_delta(text)
-        return None
+        await _emit(on_text_delta, text)
 
-    def _deliver_reasoning(text: str) -> Any:
+    async def _deliver_reasoning(text: str) -> None:
         nonlocal delivered
         if text:
             delivered = True
-        if on_reasoning_delta is not None:
-            return on_reasoning_delta(text)
-        return None
+        await _emit(on_reasoning_delta, text)
 
-    text_delta_callback = _deliver_text if on_text_delta is not None else None
-    reasoning_delta_callback = (
-        _deliver_reasoning if on_reasoning_delta is not None else None
-    )
-
+    # Once text has reached the caller, a retry would repeat it.
     def _can_retry() -> bool:
         return not delivered
 
-    if provider == "gemini":
-        if genai is None or gemini_types is None:
-            raise RuntimeError("google-genai package is required for Gemini provider (pip install google-genai).")
-        if not api_key:
-            raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
+    if provider in CODE_ASSIST_PROVIDERS:
+        from core.providers.google_code_assist import stream_google_code_assist_completion
 
-        client = genai.Client(api_key=api_key)
-        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
-        # caching. The complete instruction still reaches the model.
-        system_prompt, rest = _extract_system_prompt(messages)
-        contents = _messages_to_gemini_contents(rest)
-        gemini_tools = _gemini_tools(tools)
-
-        tool_config = None
-        if gemini_tools:
-            tool_config = gemini_types.ToolConfig(
-                function_calling_config=gemini_types.FunctionCallingConfig(
-                    mode=gemini_types.FunctionCallingConfigMode.AUTO,
-                )
-            )
-
-        config = gemini_types.GenerateContentConfig(
-            system_instruction=system_prompt or None,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-            tools=gemini_tools or None,
-            tool_config=tool_config,
-        )
-
-        async def _do_gemini_stream():
-            # Track emitted text so we can compute deltas if the stream is cumulative.
-            emitted: str = ""
-            calls_by_id: dict[str, dict[str, Any]] = {}
-            last_chunk: Any | None = None
-
-            async for chunk in client.aio.models.generate_content_stream(
+        access_token, project_id = _code_assist_credentials(api_key)
+        result = await _retry_on_transient(
+            lambda: stream_google_code_assist_completion(
+                endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
+                access_token=access_token,
+                project_id=project_id,
                 model=model,
-                contents=contents,
-                config=config,
-            ):
-                last_chunk = chunk
-                text = getattr(chunk, "text", "") or ""
-                if text:
-                    if text.startswith(emitted):
-                        delta = text[len(emitted) :]
-                        emitted = text
-                    else:
-                        delta = text
-                        emitted += text
-                    if delta and text_delta_callback:
-                        import asyncio
-
-                        result = text_delta_callback(delta)
-                        if asyncio.iscoroutine(result):
-                            await result
-
-                for call in getattr(chunk, "function_calls", None) or []:
-                    call_id = getattr(call, "id", None) or ""
-                    calls_by_id[str(call_id)] = {
-                        "id": call_id or None,
-                        "name": getattr(call, "name", "") or "",
-                        "arguments": getattr(call, "args", None) or {},
-                    }
-
-            tool_calls = [v for k, v in calls_by_id.items() if k]
-            # Gemini reports cached_content_token_count on the final streamed
-            # chunk. Preserve it so record_llm_usage can prove cache hits.
-            return {"content": emitted, "tool_calls": tool_calls, "raw": last_chunk}
-
-        return await _retry_on_transient(
-            _do_gemini_stream,
-            should_retry=_can_retry,
-        )
-
-    if provider in OPENAI_COMPATIBLE:
-        if provider in {"openai_compatible", "openai-chat-completions-endpoint"}:
-            return await _compatible_chat_stream_completion(
-                provider=provider,
-                model=model,
-                endpoint=endpoint,
-                api_key=api_key,
                 messages=messages,
                 tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                on_text_delta=text_delta_callback,
-                on_reasoning_delta=reasoning_delta_callback,
-            )
-
-        default_headers = None
-        if provider == "github-copilot":
-            from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
-            default_headers = COPILOT_REQUEST_HEADERS
-        client = _get_openai_client(api_key, endpoint, provider, default_headers)
-
-        # Try Responses API first, fall back to Chat Completions
-        if _should_try_responses(endpoint, provider=provider):
-            try:
-                result = await _retry_on_transient(
-                    lambda: _responses_stream_completion(
-                        client,
-                        model,
-                        messages,
-                        tools,
-                        temperature,
-                        max_tokens,
-                        text_delta_callback,
-                        reasoning_delta_callback,
-                    ),
-                    should_retry=_can_retry,
-                )
-                _cache_responses_support(endpoint, True)
-                return result
-            except Exception as exc:
-                if _is_responses_unsupported_error(exc):
-                    _cache_responses_support(endpoint, False)
-                else:
-                    raise
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {**msg, "content": _content_to_openai_chat(msg.get("content"))}
-                for msg in messages
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
-
-        async def _do_stream_completion():
-            response = await client.chat.completions.create(**payload)
-
-            content_parts: list[str] = []
-            # Accumulate tool calls: index -> {id, name, arguments_parts}
-            tc_accum: dict[int, dict[str, Any]] = {}
-
-            try:
-                async for event in response:
-                    delta = event.choices[0].delta
-                    if delta and delta.content:
-                        content_parts.append(delta.content)
-                        if text_delta_callback:
-                            import asyncio
-                            result = text_delta_callback(delta.content)
-                            if asyncio.iscoroutine(result):
-                                await result
-                    if delta:
-                        reasoning = (
-                            getattr(delta, "reasoning", None)
-                            or getattr(delta, "reasoning_content", None)
-                        )
-                        if reasoning and reasoning_delta_callback:
-                            import asyncio
-                            result = reasoning_delta_callback(reasoning)
-                            if asyncio.iscoroutine(result):
-                                await result
-                    if delta and delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in tc_accum:
-                                tc_accum[idx] = {
-                                    "id": getattr(tc_delta, "id", None),
-                                    "name": None,
-                                    "arguments_parts": [],
-                                }
-                            if tc_delta.id:
-                                tc_accum[idx]["id"] = tc_delta.id
-                            fn = getattr(tc_delta, "function", None)
-                            if fn:
-                                if getattr(fn, "name", None):
-                                    tc_accum[idx]["name"] = fn.name
-                                if getattr(fn, "arguments", None):
-                                    tc_accum[idx]["arguments_parts"].append(fn.arguments)
-            finally:
-                await _close_async_stream(response)
-
-            # Build final tool calls
-            tool_calls: list[dict[str, Any]] = []
-            for idx in sorted(tc_accum.keys()):
-                tc = tc_accum[idx]
-                raw_args = "".join(tc["arguments_parts"])
-                try:
-                    args = json.loads(raw_args) if raw_args else {}
-                except Exception:
-                    logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
-                    args = {}
-                tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
-            return {
-                "content": strip_reasoning("".join(content_parts)),
-                "tool_calls": tool_calls,
-                "raw": None,
-            }
-
-        return await _retry_on_transient(
-            _do_stream_completion,
-            should_retry=_can_retry,
-        )
-
-    if provider == "openai-codex":
-        # A 429/5xx fails before any token reaches the caller and retries
-        # freely; once tokens have streamed, retry is refused so the consumer
-        # never sees the same text twice.
-        return await _retry_on_transient(
-            lambda: _codex_responses_completion(
-                model=model,
-                endpoint=endpoint,
-                api_key=api_key,
-                messages=messages,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                on_text_delta=text_delta_callback,
+                is_antigravity=(provider == "google-antigravity"),
+                on_text_delta=_deliver_text if on_text_delta is not None else None,
             ),
             should_retry=_can_retry,
         )
+        result["content"] = strip_reasoning(result.get("content") or "")
+        result.setdefault("finish_reason", "tool_calls" if result.get("tool_calls") else "stop")
+        return result
 
-    if provider == "anthropic":
-        if auth_mode == "setup-token":
-            from core.providers.anthropic_http import stream_anthropic_http_completion
-            system_prompt, rest = _extract_system_prompt(messages)
-            rest = _messages_to_anthropic_messages(rest)
-            return await _retry_on_transient(
-                lambda: stream_anthropic_http_completion(
-                    endpoint=endpoint or "https://api.anthropic.com",
-                    api_key=api_key or "",
-                    model=model,
-                    messages=rest,
-                    tools=tools,
-                    auth_mode="setup-token",
-                    max_tokens=max_tokens,
-                    system_prompt=system_prompt or None,
-                    on_text_delta=text_delta_callback,
-                ),
-                should_retry=_can_retry,
-            )
-        if anthropic is None:
-            raise RuntimeError("anthropic package is required for Anthropic provider.")
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        system_prompt, rest = _extract_system_prompt(messages)
-        rest = _messages_to_anthropic_messages(rest)
-        anthropic_tools = _anthropic_tools(tools)
-        sdk_kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": rest,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+    api_key = await _subscription_key(provider, api_key)
+    request, restore = _build_request(
+        provider=provider, model=model, endpoint=endpoint, api_key=api_key, messages=messages,
+        tools=tools, temperature=temperature, max_tokens=max_tokens, auth_mode=auth_mode,
+    )
+    request["stream"] = True
+    # Ask for the token counts on the final chunk, so a streamed turn is
+    # metered like a plain one. Dropped for providers that do not take it.
+    request["stream_options"] = {"include_usage": True}
+
+    async def _do_stream():
+        response = await litellm.acompletion(**request)
+        content_parts: list[str] = []
+        finish: Any = None
+        usage: Any = None
+        # Tool calls arrive in pieces: index -> {id, name, arguments_parts}
+        tc_accum: dict[int, dict[str, Any]] = {}
+        async for chunk in response:
+            usage = getattr(chunk, "usage", None) or usage
+            if not getattr(chunk, "choices", None):
+                continue
+            choice = chunk.choices[0]
+            finish = getattr(choice, "finish_reason", None) or finish
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+            if isinstance(reasoning, str) and reasoning:
+                await _deliver_reasoning(reasoning)
+            if getattr(delta, "content", None):
+                content_parts.append(delta.content)
+                await _deliver_text(delta.content)
+            for tc_delta in getattr(delta, "tool_calls", None) or []:
+                idx = getattr(tc_delta, "index", None) or 0
+                entry = tc_accum.setdefault(idx, {"id": None, "name": None, "arguments_parts": []})
+                if getattr(tc_delta, "id", None):
+                    entry["id"] = tc_delta.id
+                fn = getattr(tc_delta, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        entry["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        entry["arguments_parts"].append(fn.arguments)
+        tool_calls: list[dict[str, Any]] = []
+        for idx in sorted(tc_accum):
+            entry = tc_accum[idx]
+            raw_args = "".join(entry["arguments_parts"])
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except Exception:
+                logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
+                args = {}
+            tool_calls.append({"id": entry["id"], "name": entry["name"], "arguments": args})
+        return {
+            "content": strip_reasoning("".join(content_parts)),
+            "tool_calls": _restore_tool_names(tool_calls, restore),
+            # Token counts, when the provider reported them, in the shape
+            # core.usage.extract_usage reads.
+            "raw": SimpleNamespace(usage=usage) if usage is not None else None,
+            "finish_reason": _finish_reason(finish or ("tool_calls" if tool_calls else "stop")),
         }
-        if system_prompt:
-            sdk_kwargs["system"] = system_prompt
-        if anthropic_tools:
-            sdk_kwargs["tools"] = anthropic_tools
 
-        async def _do_anthropic_stream():
-            async with client.messages.stream(**sdk_kwargs) as stream:
-                text_parts: list[str] = []
-                tool_calls: list[dict[str, Any]] = []
-                current_tool: dict[str, Any] | None = None
-
-                async for event in stream:
-                    if hasattr(event, "type"):
-                        if event.type == "content_block_start":
-                            block = event.content_block
-                            if block.type == "tool_use":
-                                current_tool = {"id": block.id, "name": block.name, "arguments_json": ""}
-                        elif event.type == "content_block_delta":
-                            delta = event.delta
-                            if delta.type == "text_delta":
-                                text_parts.append(delta.text)
-                                if text_delta_callback:
-                                    import asyncio
-                                    result = text_delta_callback(delta.text)
-                                    if asyncio.iscoroutine(result):
-                                        await result
-                            elif delta.type == "input_json_delta" and current_tool is not None:
-                                current_tool["arguments_json"] += delta.partial_json
-                        elif event.type == "content_block_stop":
-                            if current_tool is not None:
-                                raw_args = current_tool["arguments_json"]
-                                try:
-                                    args = json.loads(raw_args) if raw_args else {}
-                                except Exception:
-                                    logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
-                                    args = {}
-                                tool_calls.append({
-                                    "id": current_tool["id"],
-                                    "name": current_tool["name"],
-                                    "arguments": args,
-                                })
-                                current_tool = None
-
-                return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}
-
-        return await _retry_on_transient(
-            _do_anthropic_stream,
-            should_retry=_can_retry,
-        )
-
-    if provider == "minimax-portal":
-        from core.providers.anthropic_http import stream_anthropic_http_completion
-        system_prompt, rest = _extract_system_prompt(messages)
-        rest = _messages_to_anthropic_messages(rest)
-        return await stream_anthropic_http_completion(
-            endpoint=endpoint or "https://api.minimax.io/anthropic",
-            api_key=api_key or "",
-            model=model,
-            messages=rest,
-            tools=tools,
-            auth_mode="api-key",
-            max_tokens=max_tokens,
-            system_prompt=system_prompt or None,
-            on_text_delta=text_delta_callback,
-        )
-
-    if provider in {"google-gemini-cli", "google-antigravity"}:
-        from core.providers.google_code_assist import stream_google_code_assist_completion
-        _api_key_data = json.loads(api_key) if api_key else {}
-        access_token = _api_key_data.get("token", api_key or "")
-        project_id = _api_key_data.get("projectId", "")
-        return await stream_google_code_assist_completion(
-            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
-            access_token=access_token,
-            project_id=project_id,
-            model=model,
-            messages=messages,
-            tools=tools,
-            is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
-            on_text_delta=text_delta_callback,
-        )
-
-    raise ValueError(f"Unsupported provider: {provider}")
+    return await _retry_on_transient(_do_stream, should_retry=_can_retry)
 
 
 async def stream_text_completion(
@@ -2007,180 +1181,30 @@ async def stream_text_completion(
     messages: list[dict[str, Any]],
     temperature: float = 0.7,
     max_tokens: int = 1400,
+    auth_mode: str | None = None,
 ) -> AsyncIterator[str]:
-    provider = normalize_provider(provider)
-    endpoint = normalize_endpoint(provider, endpoint)
+    import asyncio
 
-    if provider in OPENAI_COMPATIBLE:
-        client = _get_openai_client(api_key, endpoint, provider)
+    # One streaming path for every provider: stream_chat_completion feeds a
+    # queue, and this generator hands the text on as it arrives.
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-        async def _do_text_stream():
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            )
-            try:
-                async for event in response:
-                    delta = event.choices[0].delta
-                    if delta and delta.content:
-                        yield delta.content
-            finally:
-                await _close_async_stream(response)
-
-        # Note: We can't wrap a generator with retry logic the same way,
-        # but we retry the initial request
-        async def _start_stream():
-            return _do_text_stream()
-
-        stream = await _retry_on_transient(_start_stream)
-        async for chunk in stream:
-            yield chunk
-        return
-
-    if provider == "gemini":
-        if genai is None or gemini_types is None:
-            raise RuntimeError("google-genai package is required for Gemini provider (pip install google-genai).")
-        if not api_key:
-            raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
-
-        client = genai.Client(api_key=api_key)
-        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
-        # caching. The complete instruction still reaches the model.
-        system_prompt, rest = _extract_system_prompt(messages)
-        contents = _messages_to_gemini_contents(rest)
-        config = gemini_types.GenerateContentConfig(
-            system_instruction=system_prompt or None,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
-
-        emitted = ""
-        async for chunk in client.aio.models.generate_content_stream(
-            model=model,
-            contents=contents,
-            config=config,
-        ):
-            text = getattr(chunk, "text", "") or ""
-            if not text:
-                continue
-            if text.startswith(emitted):
-                delta = text[len(emitted) :]
-                emitted = text
-            else:
-                delta = text
-                emitted += text
-            if delta:
-                yield delta
-        return
-
-    if provider == "anthropic":
-        if anthropic is None:
-            raise RuntimeError("anthropic package is required for Anthropic provider.")
-        client = anthropic.AsyncAnthropic(api_key=api_key)
-        system_prompt, rest = _extract_system_prompt(messages)
-        rest = _messages_to_anthropic_messages(rest)
-        async with client.messages.stream(
-            model=model,
-            system=system_prompt or None,
-            messages=rest,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        ) as stream:
-            async for text in stream.text_stream:
-                yield text
-        return
-
-    if provider == "openai-codex":
-        if not api_key:
-            raise RuntimeError("Missing OpenAI Codex OAuth access token (api_key).")
-        account_id = _extract_codex_account_id(api_key)
-        url = _resolve_codex_url(endpoint)
-        instructions, input_items = _messages_to_codex_responses_input(messages)
-        payload: dict[str, Any] = {
-            "model": model,
-            "store": False,
-            "stream": True,
-            "input": input_items,
-            "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
-            "temperature": temperature,
-        }
-        if instructions:
-            payload["instructions"] = instructions
-        _ = max_tokens  # max token field support is inconsistent; omit unless proven.
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "chatgpt-account-id": account_id,
-            "OpenAI-Beta": "responses=experimental",
-            "originator": "pi",
-            "accept": "text/event-stream",
-            "content-type": "application/json",
-            "user-agent": f"hexis (python; {os.uname().sysname if hasattr(os, 'uname') else 'unknown'})",
-        }
-        timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+    async def produce():
         try:
-            async for event in iter_sse_json_events(
-                "openai-codex",
-                "POST",
-                url,
-                headers=headers,
-                json_body=payload,
-                timeout=timeout,
-                attempts=3,
-                max_delay=_LLM_RETRY_MAX_WAIT,
-                retry_unsafe_methods=True,
-            ):
-                event_type = event.get("type")
-                if event_type == "response.output_text.delta":
-                    delta = event.get("delta", "")
-                    if isinstance(delta, str) and delta:
-                        yield delta
-                elif event_type in {"response.done", "response.completed"}:
-                    return
-                elif event_type in {"error", "response.failed"}:
-                    message = event.get("message") or "Codex request failed"
-                    raise RuntimeError(str(message))
-        except IntegrationHttpError as exc:
-            raise RuntimeError(str(exc)) from exc
-        return
+            await stream_chat_completion(
+                provider=provider, model=model, endpoint=endpoint, api_key=api_key,
+                messages=messages, temperature=temperature, max_tokens=max_tokens,
+                on_text_delta=queue.put, auth_mode=auth_mode,
+            )
+        finally:
+            await queue.put(None)
 
-    if provider == "minimax-portal":
-        from core.providers.anthropic_http import stream_anthropic_http_completion
-        system_prompt, rest = _extract_system_prompt(messages)
-        rest = _messages_to_anthropic_messages(rest)
-        result = await stream_anthropic_http_completion(
-            endpoint=endpoint or "https://api.minimax.io/anthropic",
-            api_key=api_key or "",
-            model=model,
-            messages=rest,
-            tools=None,
-            auth_mode="api-key",
-            max_tokens=max_tokens,
-            system_prompt=system_prompt or None,
-        )
-        if result["content"]:
-            yield result["content"]
-        return
-
-    if provider in {"google-gemini-cli", "google-antigravity"}:
-        from core.providers.google_code_assist import stream_google_code_assist_completion
-        _api_key_data = json.loads(api_key) if api_key else {}
-        access_token = _api_key_data.get("token", api_key or "")
-        project_id = _api_key_data.get("projectId", "")
-        result = await stream_google_code_assist_completion(
-            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
-            access_token=access_token,
-            project_id=project_id,
-            model=model,
-            messages=messages,
-            tools=None,
-            is_antigravity=(provider == "google-antigravity"),
-        )
-        if result["content"]:
-            yield result["content"]
-        return
-
-    raise ValueError(f"Unsupported provider: {provider}")
+    task = asyncio.create_task(produce())
+    try:
+        while (chunk := await queue.get()) is not None:
+            yield chunk
+        await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

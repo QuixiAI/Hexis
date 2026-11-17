@@ -741,7 +741,7 @@ def build_parser() -> argparse.ArgumentParser:
         service_control.add_argument(
             "services",
             nargs="*",
-            choices=["heartbeat", "maintenance", "channels", "all"],
+            choices=["heartbeat", "maintenance", "ingest", "channels", "all"],
             help="Services to control (default: all installed)",
         )
         service_control.set_defaults(func=f"service_{action}")
@@ -754,7 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_logs.add_argument(
         "services",
         nargs="*",
-        choices=["heartbeat", "maintenance", "channels", "all"],
+        choices=["heartbeat", "maintenance", "ingest", "channels", "all"],
         help="Services to read (default: all installed)",
     )
     service_logs.add_argument("--follow", "-f", action="store_true", help="Follow logs")
@@ -770,7 +770,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_uninstall.add_argument(
         "services",
         nargs="*",
-        choices=["heartbeat", "maintenance", "channels", "all"],
+        choices=["heartbeat", "maintenance", "ingest", "channels", "all"],
         help="Services to remove (default: all installed)",
     )
     service_uninstall.add_argument(
@@ -1855,6 +1855,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--reason", default="Completed via CLI", help="Completion reason"
     )
     goals_complete.set_defaults(func="goals_complete")
+
+    goals_abandon = goals_sub.add_parser(
+        "abandon", parents=[_db], help="Abandon a goal (archived with its reason; not marked completed)"
+    )
+    goals_abandon.add_argument("goal_id", help="Goal UUID")
+    goals_abandon.add_argument("--reason", default="Abandoned via CLI", help="Why it was abandoned")
+    goals_abandon.set_defaults(func="goals_abandon")
 
     goals.set_defaults(func="goals")
 
@@ -3252,7 +3259,7 @@ def _running_container_workers(
     )
     if rc != 0:
         return None, compose_cmd
-    worker_names = {"heartbeat_worker", "maintenance_worker", "channel_worker"}
+    worker_names = {"heartbeat_worker", "maintenance_worker", "ingest_worker", "channel_worker"}
     running = sorted({part for part in out.split() if part in worker_names})
     return running, compose_cmd
 
@@ -3296,6 +3303,7 @@ def _host_managed_compose_workers() -> set[str]:
         mapping = {
             "heartbeat": "heartbeat_worker",
             "maintenance": "maintenance_worker",
+            "ingest": "ingest_worker",
             "channels": "channel_worker",
         }
         return {mapping[name] for name in installed_host_services() if name in mapping}
@@ -3421,7 +3429,7 @@ def _handle_host_service_command(
     func = str(getattr(args, "func", "service_status"))
     try:
         if func == "service_install":
-            requested = ["heartbeat", "maintenance"]
+            requested = ["heartbeat", "maintenance", "ingest"]
             if args.channels:
                 requested.append("channels")
             running_workers, compose_cmd = _running_container_workers(
@@ -4580,20 +4588,33 @@ def _format_transcript_event(event: dict[str, Any]) -> str | None:
     return None
 
 
+# Mirrors services/agent.py (compose_chat_turn); duplicated so the CLI does
+# not import the agent runtime just to render a transcript.
+_TRANSCRIPT_MARKER = "[USER MESSAGE]\n"
+_TRANSCRIPT_DIVIDER = (
+    "--- What you remember (context for this reply, not part of the message) ---"
+)
+
+
 def _split_transcript_user_message(raw: str | None) -> tuple[str, str | None]:
-    """Chat turns store the FULL assembled prompt as `user_message` --
-    subconscious signals, the continuity packet, identity/memory context,
-    then the literal text a human typed after a stable '[USER MESSAGE]'
-    marker (see services/agent.py's enriched_parts / services/chat.py). Pull
-    out just what was actually said, plus the '## Subconscious Signals'
-    block if present -- that block lives nowhere else, so this is the only
-    way a transcript can show it as the issue asks. Heartbeat turns carry no
-    marker and pass through unchanged."""
+    """Chat turns store the FULL assembled prompt as `user_message`: the
+    literal text a human typed after a stable '[USER MESSAGE]' marker, then a
+    divider and what the agent remembered (subconscious signals, the
+    continuity packet, memory context). Turns stored before the message came
+    first carry that context ahead of the marker instead. Pull out just what
+    was actually said, plus the '## Subconscious Signals' block if present --
+    that block lives nowhere else, so this is the only way a transcript can
+    show it as the issue asks. Heartbeat turns carry no marker and pass
+    through unchanged."""
     if not raw:
         return raw or "", None
-    marker = "[USER MESSAGE]\n"
+    marker = _TRANSCRIPT_MARKER
     idx = raw.rfind(marker)
     prefix, clean = (raw[:idx], raw[idx + len(marker):]) if idx != -1 else ("", raw)
+    div = clean.find(_TRANSCRIPT_DIVIDER)
+    if div != -1:
+        prefix = prefix + "\n" + clean[div + len(_TRANSCRIPT_DIVIDER):]
+        clean = clean[:div]
     signals = None
     sig_idx = prefix.find("## Subconscious Signals")
     if sig_idx != -1:
@@ -5747,7 +5768,8 @@ async def _goals_create(
     try:
         async with pool.acquire() as conn:
             goal_id = await conn.fetchval(
-                "SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority)",
+                # The person's own goal: worked on without spending energy.
+                "SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority, NULL, NULL, 'user_request'::goal_source)",
                 title,
                 description,
                 source,
@@ -6935,7 +6957,7 @@ def _handle_ui_container(
         host_workers_ok, _host_error = _ensure_installed_host_services_running()
     docker_worker_targets = [
         name
-        for name in ("heartbeat_worker", "maintenance_worker")
+        for name in ("heartbeat_worker", "maintenance_worker", "ingest_worker")
         if name not in host_managed_workers
     ]
     docker_workers_ok = True
@@ -7628,7 +7650,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         "reset",
         "upgrade",
     }
-    if {"heartbeat_worker", "maintenance_worker"} <= host_managed_workers:
+    if {"heartbeat_worker", "maintenance_worker", "ingest_worker"} <= host_managed_workers:
         docker_cmds -= {"start", "stop"}
     docker_bin: str | None = None
     compose_cmd: list[str] | None = None
@@ -8144,11 +8166,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return 1
         docker_targets = [
             name
-            for name in ("heartbeat_worker", "maintenance_worker")
+            for name in ("heartbeat_worker", "maintenance_worker", "ingest_worker")
             if name not in host_managed_workers
         ]
         if not docker_targets:
-            print("Started heartbeat and maintenance host services.")
+            print("Started heartbeat, maintenance and ingest host services.")
             return 0
         return run_compose(
             compose_cmd or [],
@@ -8165,11 +8187,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 return 1
         docker_targets = [
             name
-            for name in ("heartbeat_worker", "maintenance_worker")
+            for name in ("heartbeat_worker", "maintenance_worker", "ingest_worker")
             if name not in host_managed_workers
         ]
         if not docker_targets:
-            print("Stopped heartbeat and maintenance host services.")
+            print("Stopped heartbeat, maintenance and ingest host services.")
             return 0
         return run_compose(
             compose_cmd or [],
@@ -8495,6 +8517,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if func == "goals_complete":
         dsn = _get_dsn(args)
         return asyncio.run(_goals_update(dsn, args.goal_id, "completed", args.reason))
+    if func == "goals_abandon":
+        dsn = _get_dsn(args)
+        return asyncio.run(_goals_update(dsn, args.goal_id, "abandoned", args.reason))
 
     # Schedule commands
     if func == "schedule":

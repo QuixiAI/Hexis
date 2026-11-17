@@ -49,6 +49,13 @@ except ImportError:
     _HAS_EBOOKLIB = False
 
 
+_HAS_PPTX = True
+try:
+    import pptx  # noqa: F401
+except ImportError:
+    _HAS_PPTX = False
+
+
 def test_default_read_result_wraps_legacy_read(tmp_path):
     p = tmp_path / "note.txt"
     p.write_text("plain text content")
@@ -84,6 +91,38 @@ def test_epub_chapters_follow_the_spine_not_the_manifest(tmp_path):
 
     positions = [text.index(f"Chapter {name}") for name in ("one", "two", "three")]
     assert positions == sorted(positions), text
+
+
+@pytest.mark.skipif(not _HAS_PPTX, reason="python-pptx not installed")
+def test_pptx_reads_grouped_shapes_and_tables(tmp_path):
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    from services.ingest.readers import PptxReader
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(0.5), Inches(4), Inches(1))
+    box.text_frame.text = "Plain box"
+    group = slide.shapes.add_group_shape()
+    grouped = group.shapes.add_textbox(Inches(1), Inches(2), Inches(3), Inches(1))
+    grouped.text_frame.text = "Grouped box"
+    table = slide.shapes.add_table(
+        2, 2, Inches(1), Inches(4), Inches(4), Inches(1)
+    ).table
+    for (row, col), text in {
+        (0, 0): "Region",
+        (0, 1): "Sales",
+        (1, 0): "North",
+        (1, 1): "42",
+    }.items():
+        table.cell(row, col).text = text
+    path = tmp_path / "shapes.pptx"
+    prs.save(path)
+
+    text = PptxReader.read(path)
+
+    assert "[Slide 1]\nPlain box\nGrouped box\nRegion\tSales\nNorth\t42" in text, text
 
 
 def test_xls_fails_loud_with_conversion_hint(tmp_path):
@@ -181,7 +220,7 @@ class _StubLLM:
         self.marker = marker
         self.call_count = 0
 
-    async def complete_json(self, messages, temperature=0.2):
+    async def complete_json(self, messages, temperature=0.2, **kwargs):
         self.call_count += 1
         text = str(messages[-1].get("content", ""))
         if "key 'items'" in text:

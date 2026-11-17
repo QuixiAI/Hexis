@@ -1,5 +1,6 @@
 "use client";
 
+import { confirmAction } from "../../lib/confirm";
 import {
   Activity,
   BrainCircuit,
@@ -967,6 +968,29 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
   return messages;
 }
 
+/** Sends a failed question again. Its own component so the React compiler
+ * does not read the send handler as something that runs during render. */
+function RetryButton({
+  assistantId,
+  disabled,
+  onRetry,
+}: {
+  assistantId: string;
+  disabled: boolean;
+  onRetry: (assistantId: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onRetry(assistantId)}
+      disabled={disabled}
+      className="mt-2 rounded-md border border-red-200 bg-white px-2.5 py-1 text-xs font-medium text-red-700 hover:border-red-400 disabled:opacity-50"
+    >
+      Retry
+    </button>
+  );
+}
+
 export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [events, setEvents] = useState<LogEvent[]>(() => loadActivityEvents());
@@ -1709,8 +1733,9 @@ export default function ChatPage() {
     if (sending || sessionActionBusy) return;
     const currentSessionId = sessionId || loadSessionId();
     if (!currentSessionId && messages.length === 0) return;
-    const confirmed = window.confirm(
-      "Clear this conversation from active context? Long-term memories and source records are preserved."
+    const confirmed = await confirmAction(
+      "Clear this conversation from active context? Long-term memories and source records are preserved.",
+      { confirmLabel: "Clear", destructive: true }
     );
     if (!confirmed) return;
 
@@ -2365,6 +2390,16 @@ export default function ChatPage() {
     return finalAssistantText;
   };
 
+  // Sends the question again after a turn that produced no (or a partial)
+  // answer. The failed pair leaves the thread; the resend adds a fresh one.
+  const retryQuestion = (assistantId: string) => {
+    const index = messages.findIndex((msg) => msg.id === assistantId);
+    const question = index > 0 ? messages[index - 1] : null;
+    if (!question || question.role !== "user" || !question.content.trim()) return;
+    setMessages((prev) => prev.filter((msg) => msg.id !== assistantId && msg.id !== question.id));
+    void handleSend(question.content);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     const userHistory = messages
       .filter((msg) => msg.role === "user" && msg.content.trim())
@@ -2598,17 +2633,21 @@ export default function ChatPage() {
                           <MessagePresentationView presentation={message.presentation} />
                         ) : message.content ? (
                           <MessagePresentationView presentation={{ tone: "neutral", blocks: [{ type: "text", text: message.content }] }} />
-                        ) : message.incomplete ? (
-                          <p role="status" aria-live="polite" className="text-sm text-red-700">
-                            Response incomplete — {inlineErrorDetail(message.error)}. You can retry.
-                          </p>
-                        ) : message.ui?.length ? null : (
+                        ) : message.incomplete || message.ui?.length ? null : (
                           <Spinner label="Thinking..." />
                         )}
-                        {message.incomplete && message.content ? (
-                          <p role="status" aria-live="polite" className="text-xs text-red-700">
-                            Response incomplete{message.error ? `: ${inlineErrorDetail(message.error)}` : ""} — not added to conversation history. You can retry.
-                          </p>
+                        {message.incomplete ? (
+                          <div role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm">
+                            <p className="font-medium text-red-700">
+                              {message.content ? "The answer was cut off." : "No answer came back."}
+                            </p>
+                            <p role="status" aria-live="polite" className="mt-1 break-words text-xs text-red-700">
+                              {message.content
+                                ? `Response incomplete${message.error ? `: ${inlineErrorDetail(message.error)}` : ""} — not added to conversation history.`
+                                : `Response incomplete — ${inlineErrorDetail(message.error)}.`}
+                            </p>
+                            <RetryButton assistantId={message.id} disabled={sending} onRetry={retryQuestion} />
+                          </div>
                         ) : null}
                         {message.ui?.map((ui) => (
                           ui.kind === "connector_setup" ? (
@@ -4568,23 +4607,26 @@ function emotionSnapshotFromEvent(event: LogEvent): EmotionSnapshot | null {
   const raw = asRecord(event.raw);
   const signals = asRecord(raw.signals);
   const emotion = asRecord(signals.emotional_state);
+  // An appraisal that failed or reported no emotional state is not a mood:
+  // the tile keeps the last real appraisal (or neutral) rather than reading
+  // the event's summary line, which then names the model.
   const label =
     asString(emotion.primary_emotion) ||
     asString(emotion.mood) ||
-    asString(emotion.state) ||
-    firstDetailPart(event.detail) ||
-    "neutral";
+    asString(emotion.state);
   const valence = asNumber(emotion.valence);
+  if (!label && valence === null) return null;
   const detail =
     asString(emotion.summary) ||
     asString(emotion.reason) ||
     asString(signals.subconscious_response) ||
     event.detail ||
-    label;
+    label ||
+    "neutral";
   return {
     id: event.id,
     ts: event.ts,
-    label,
+    label: label || "neutral",
     valence,
     detail,
   };
@@ -4660,10 +4702,6 @@ function memoryCountFromEvent(event: LogEvent | null): number {
   if (count !== null) return Math.round(count);
   const match = event.detail.match(/Retrieved\s+(\d+)/i);
   return match ? Number(match[1]) : memoryPreviewsFromEvent(event).length;
-}
-
-function firstDetailPart(value: string): string {
-  return value.split(" · ")[0]?.trim() || "";
 }
 
 function afterFirstDetailPart(value: string): string {

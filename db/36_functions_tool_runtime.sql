@@ -372,7 +372,19 @@ DECLARE
     run_at TIMESTAMPTZ;
 BEGIN
     IF schedule_str IS NOT NULL THEN
-        IF db_brain_is_cron_expression(schedule_str) THEN
+        -- An absolute date-time, the most natural way to say "on November 10
+        -- at 9am": ISO 8601 with or without an offset (or after "once:").
+        -- Without an offset it is read in the schedule's timezone.
+        IF regexp_replace(schedule_str, '^once:', '', 'i') ~ '^\d{4}-\d{2}-\d{2}([T ]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}(:?\d{2})?)?$' THEN
+            schedule_str := regexp_replace(schedule_str, '^once:', '', 'i');
+            IF schedule_str ~ '(Z|[+-]\d{2}(:?\d{2})?)$' THEN
+                run_at := schedule_str::timestamptz;
+            ELSE
+                run_at := (schedule_str::timestamp) AT TIME ZONE timezone_value;
+            END IF;
+            schedule_kind := 'once';
+            schedule := jsonb_build_object('run_at', run_at);
+        ELSIF db_brain_is_cron_expression(schedule_str) THEN
             schedule_kind := 'cron';
             schedule := jsonb_build_object('cron', schedule_str);
         ELSIF schedule_str LIKE '{%' THEN

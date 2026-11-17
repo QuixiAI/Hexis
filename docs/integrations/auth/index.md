@@ -23,10 +23,36 @@ Hexis supports multiple LLM providers via OAuth, device-code, or token-based aut
 | `minimax-portal` | User code + PKCE | `oauth.minimax_portal` | Free tier available |
 | `google-gemini-cli` | OAuth PKCE | `oauth.google_gemini_cli` | Free tier available |
 | `google-antigravity` | OAuth PKCE | `oauth.google_antigravity` | Free tier available |
+| `xai-oauth` | Device code | `oauth.xai` | SuperGrok / X Premium subscription |
 
 All providers can be used for any LLM slot (`llm.chat`, `llm.heartbeat`, `llm.subconscious`).
 
-API-key providers (`openai`, `anthropic`, `grok`, `gemini`) can also use traditional environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) instead of OAuth.
+Every sign-in is also available from the dashboard's Models step. The step
+lists one entry per vendor; a vendor's form takes an API key and, where the
+vendor has one, offers its subscription login instead: ChatGPT under OpenAI,
+SuperGrok / X under Grok, Google under Gemini, Qwen Portal under Alibaba
+Qwen, MiniMax Portal under MiniMax, and a Claude Code setup token under
+Anthropic. Chutes and GitHub Copilot are login-only entries.
+
+Every provider is called through one library, [LiteLLM](https://docs.litellm.ai/);
+the sign-ins above stay owned by Hexis and only hand LiteLLM a fresh token.
+
+API-key providers can also use traditional environment variables instead of OAuth:
+
+| Provider | Environment variable |
+|----------|----------------------|
+| `openai`, `openai-chat-completions-endpoint` | `OPENAI_API_KEY` |
+| `anthropic` | `ANTHROPIC_API_KEY` |
+| `grok` | `XAI_API_KEY` |
+| `gemini` | `GEMINI_API_KEY` |
+| `openrouter` | `OPENROUTER_API_KEY` |
+| `azure_openai` | `AZURE_OPENAI_API_KEY` (endpoint: the Azure resource URL; model: the deployment name) |
+| `bedrock` | `AWS_BEARER_TOKEN_BEDROCK`, or the AWS credential chain (endpoint: the region) |
+| `vertex` | a pasted service-account key, or Application Default Credentials (endpoint: `projects/<id>/locations/<region>`) |
+| `deepseek` | `DEEPSEEK_API_KEY` |
+| `zai` | `ZAI_API_KEY` |
+| `qwen`, `qwen_coding` | `DASHSCOPE_API_KEY`, `QWEN_API_KEY` |
+| `meta` | `META_API_KEY` |
 
 For a custom OpenAI-compatible endpoint, put the endpoint and key in the
 project's ignored `.env` file:
@@ -44,8 +70,9 @@ hexis init --provider openai_compatible --model your-model-id --character hexis 
 ```
 
 The endpoint and environment variable name are stored in the brain; the key
-itself remains in `.env`. Use `OPENAI_API_KEY=not-needed` for an unauthenticated
-server because the OpenAI client still requires a value.
+itself remains in `.env`. An unauthenticated server needs no key at all: leave
+`--api-key-env` off and a placeholder is sent. An `openai_compatible` endpoint
+never picks up an ambient `OPENAI_API_KEY` on its own.
 
 ---
 
@@ -186,6 +213,23 @@ hexis auth google-antigravity logout [--yes]
 Options: `--no-open`, `--timeout-seconds N` (default: 120), `--manual`
 
 Configure: `llm.chat.provider = "google-antigravity"`, `llm.chat.model = "gemini-2.5-flash"`
+
+---
+
+## xAI (SuperGrok / X account)
+
+Device-code sign-in with a SuperGrok or X Premium account; the access token
+is used against `https://api.x.ai/v1` and refreshed automatically.
+
+```bash
+hexis auth xai-oauth login              # prints a code, opens the xAI device page
+hexis auth xai-oauth status [--json]
+hexis auth xai-oauth logout [--yes]
+```
+
+Options: `--timeout-seconds N` (default: 300)
+
+Configure: `llm.chat.provider = "xai-oauth"`, `llm.chat.model = "grok-4"`
 
 ---
 

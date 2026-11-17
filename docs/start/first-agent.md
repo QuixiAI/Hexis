@@ -33,8 +33,13 @@ hexis init
 
 Configure the LLM provider and model for the conscious layer (main conversations and heartbeat decisions). Options:
 
-- **OAuth providers** (no API key): OpenAI Codex, GitHub Copilot, Chutes, Gemini, Qwen, MiniMax
-- **API-key providers**: OpenAI, Anthropic, Grok, Gemini, or any OpenAI-compatible endpoint
+- **One entry per vendor.** A vendor's form takes an API key and, where the
+  vendor has one, offers its subscription login instead: ChatGPT under OpenAI,
+  SuperGrok / X under Grok, Google under Gemini, Qwen Portal under Alibaba Qwen,
+  MiniMax Portal under MiniMax, a Claude Code setup token under Anthropic.
+- **Login-only**: Chutes and GitHub Copilot.
+- **API key only**: OpenRouter, DeepSeek, Z.ai, Meta, Azure OpenAI, Amazon Bedrock,
+  Google Vertex AI, or any OpenAI-compatible endpoint (vLLM, llama.cpp, LM Studio, Ollama).
 
 If using OAuth, `hexis init` triggers the login flow automatically.
 

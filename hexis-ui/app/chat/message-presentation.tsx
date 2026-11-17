@@ -8,6 +8,20 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function formatInline(line: string): string {
+  return escapeHtml(line)
+    .replace(
+      /`([^`]+)`/g,
+      '<code class="rounded bg-[var(--surface-strong)] px-1.5 py-0.5 text-xs">$1</code>'
+    )
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(
+      /\[\^([A-Za-z0-9:_-]+)\]/g,
+      '<sup><a class="font-mono text-[10px] text-[var(--teal)] underline" href="#citation-$1">[$1]</a></sup>'
+    );
+}
+
 function renderMarkdown(text: string) {
   if (!text) return null;
 
@@ -38,21 +52,43 @@ function renderMarkdown(text: string) {
       continue;
     }
 
-    const formatted = escapeHtml(line)
-      .replace(
-        /`([^`]+)`/g,
-        '<code class="rounded bg-[var(--surface-strong)] px-1.5 py-0.5 text-xs">$1</code>'
-      )
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-      .replace(
-        /\[\^([A-Za-z0-9:_-]+)\]/g,
-        '<sup><a class="font-mono text-[10px] text-[var(--teal)] underline" href="#citation-$1">[$1]</a></sup>'
+    // Models answer in Markdown: headings, rules and bullets are block
+    // elements; anything else is a line of inline-formatted text.
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      parts.push(<hr key={`hr-${index}`} className="my-3 border-[var(--outline)]" />);
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      parts.push(
+        <div
+          key={`h-${index}`}
+          role="heading"
+          aria-level={heading[1].length}
+          className={`mb-1 mt-3 font-semibold first:mt-0 ${heading[1].length <= 2 ? "text-base" : ""}`}
+          dangerouslySetInnerHTML={{ __html: formatInline(heading[2]) }}
+        />
       );
+      continue;
+    }
+    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    if (bullet) {
+      parts.push(
+        <div
+          key={`li-${index}`}
+          className="flex gap-2"
+          style={{ paddingLeft: `${Math.min(bullet[1].length, 8) * 0.5}rem` }}
+        >
+          <span aria-hidden className="select-none">•</span>
+          <span dangerouslySetInnerHTML={{ __html: formatInline(bullet[2]) }} />
+        </div>
+      );
+      continue;
+    }
 
     parts.push(
       <span key={`line-${index}`}>
-        <span dangerouslySetInnerHTML={{ __html: formatted }} />
+        <span dangerouslySetInnerHTML={{ __html: formatInline(line) }} />
         {index < lines.length - 1 && <br />}
       </span>
     );

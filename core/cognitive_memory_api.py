@@ -1655,6 +1655,11 @@ class CognitiveMemory:
                 )
             )
 
+        # recmem_recall_context returns rows grouped by tier name (episodic,
+        # knowledge, semantic, subconscious). Callers keep the first N, so
+        # without ranking the episodic tier filled every slot and ingested
+        # facts (semantic) never reached the chat context.
+        memories.sort(key=lambda m: m.similarity if m.similarity is not None else float("-inf"), reverse=True)
         memories = _deduplicate_memories(memories)
 
         # Reinforce-on-recall: recalling a memory strengthens it (resets its decay

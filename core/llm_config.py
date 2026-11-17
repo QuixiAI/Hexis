@@ -152,17 +152,33 @@ async def load_llm_config(
         default_provider=default_provider,
         default_model=default_model,
     )
-    provider = identity["provider"]
     cfg.update(identity)
+    await apply_provider_credentials(cfg)
+    return normalize_llm_config(cfg, default_model=default_model)
 
-    # Run the provider-specific config loader (inject api_key, endpoint, auth_mode).
+
+async def apply_provider_credentials(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Inject the credential a provider's sign-in holds (api_key, endpoint, auth_mode).
+
+    OAuth providers always take their current token. Anthropic takes a stored
+    setup token only when no API key is configured: a key typed during setup
+    (``api_key_ref``), named by ``api_key_env``, or set in the environment wins.
+    """
+    from core.llm import load_stored_api_key, resolve_api_key
+
+    provider = normalize_provider(str(cfg.get("provider") or ""))
     loader = _PROVIDER_CONFIG_LOADERS.get(provider)
     if loader:
-        await loader(conn, cfg)
+        await loader(None, cfg)
     elif provider == "anthropic" and not cfg.get("api_key"):
-        await _load_anthropic_credentials(conn, cfg)
-
-    return normalize_llm_config(cfg, default_model=default_model)
+        configured_key = (
+            resolve_api_key(str(cfg.get("api_key_env") or "").strip() or None)
+            or load_stored_api_key(str(cfg.get("api_key_ref") or "").strip() or None)
+            or os.getenv("ANTHROPIC_API_KEY")
+        )
+        if not configured_key:
+            await _load_anthropic_credentials(None, cfg)
+    return cfg
 
 
 async def resolve_llm_config(
