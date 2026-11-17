@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 import { POST } from "./route";
 import { prisma } from "@/lib/prisma";
@@ -21,7 +22,7 @@ describe("/api/contradictions/decide", () => {
       ]);
 
       const response = await POST(
-        new Request("http://localhost/api/contradictions/decide", {
+        new NextRequest("http://localhost/api/contradictions/decide", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id: ID, outcome, note: "Operator decision" }),
@@ -41,14 +42,14 @@ describe("/api/contradictions/decide", () => {
 
   it("rejects malformed ids and outcomes before querying", async () => {
     const malformed = await POST(
-      new Request("http://localhost/api/contradictions/decide", {
+      new NextRequest("http://localhost/api/contradictions/decide", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: "not-a-uuid", outcome: "new_right" }),
       })
     );
     const unknownOutcome = await POST(
-      new Request("http://localhost/api/contradictions/decide", {
+      new NextRequest("http://localhost/api/contradictions/decide", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID, outcome: "delete_old" }),
@@ -66,7 +67,7 @@ describe("/api/contradictions/decide", () => {
       { result: { ok: false, error: "case_not_found" } },
     ]);
     const response = await POST(
-      new Request("http://localhost/api/contradictions/decide", {
+      new NextRequest("http://localhost/api/contradictions/decide", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID, outcome: "tension" }),

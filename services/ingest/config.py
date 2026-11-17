@@ -117,6 +117,13 @@ class Config:
     # HTTP/network retry lives at the provider layer (core/llm.py).
     llm_json_retries: int = 1
 
+    # Output budget per LLM call. Reasoning models spend part of it thinking,
+    # so a small budget truncates the JSON and silently yields nothing.
+    llm_max_tokens: int = 8000
+    # Reasoning effort for reading calls ("none", "low", ...); None leaves the
+    # model's default. A server that rejects it is asked without it (core.llm).
+    llm_reasoning_effort: str | None = None
+
     # Processing
     verbose: bool = True
     log: Optional[Callable[[str], None]] = None
@@ -320,6 +327,15 @@ def _infer_source_type(file_path: Path) -> str:
 
 
 def _extract_title(content: str, file_path: Path) -> str:
+    # Email (EmailReader): the first subject, not "[Email]" or "--- Message 1 ---".
+    stripped = content.lstrip()
+    if stripped.startswith(("[Email]", "--- Message ")):
+        subject = re.search(r"^\[Subject: (.*)\]$", content, re.MULTILINE)
+        if subject and subject.group(1).strip():
+            title = "Email: " + " ".join(subject.group(1).split())
+            more = len(re.findall(r"^--- Message \d+ ---$", content, re.MULTILINE)) - 1
+            return (title[:110] + (f" and {more} more" if more > 0 else ""))
+        return file_path.name
     # Try markdown header
     header_match = re.search(r"^#\s+(.+)$", content, re.MULTILINE)
     if header_match:
@@ -342,6 +358,8 @@ INGEST_CONFIG_KEYS = {
     "max_parallel_llm": "ingest.max_parallel_llm",
     "max_parallel_files": "ingest.max_parallel_files",
     "llm_json_retries": "ingest.llm_json_retries",
+    "llm_max_tokens": "ingest.llm_max_tokens",
+    "llm_reasoning_effort": "ingest.llm_reasoning_effort",
     "artifact_max_db_bytes": "ingest.artifact_max_db_bytes",
     "upload_max_bytes": "ingest.upload_max_bytes",
     "xlsx_max_rows_per_sheet": "ingest.xlsx_max_rows_per_sheet",

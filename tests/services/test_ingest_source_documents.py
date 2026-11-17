@@ -16,7 +16,7 @@ class _StubLLM:
         self.marker = marker
         self.call_count = 0
 
-    async def complete_json(self, messages, temperature=0.2):
+    async def complete_json(self, messages, temperature=0.2, **kwargs):
         self.call_count += 1
         text = str(messages[-1].get("content", ""))
         if "key 'items'" in text:
@@ -334,7 +334,7 @@ class _AppraisalStubLLM(_StubLLM):
         super().__init__(marker)
         self.valence = valence
 
-    async def complete_json(self, messages, temperature=0.2):
+    async def complete_json(self, messages, temperature=0.2, **kwargs):
         text = str(messages[-1].get("content", ""))
         if "key 'items'" in text:
             return await super().complete_json(messages, temperature)
@@ -491,5 +491,113 @@ async def test_rlm_ingest_modes_receive_source_document_handle(db_pool, monkeypa
                 "DELETE FROM subconscious_units WHERE source_attribution->>'content_hash' = $1",
                 content_hash,
             )
+            await conn.execute("DELETE FROM source_documents WHERE content_hash = $1", content_hash)
+            await conn.execute("DELETE FROM ingestion_receipts WHERE doc_ref = $1", content_hash)
+
+
+async def test_text_job_reads_into_the_document_its_connector_stored(db_pool, monkeypatch):
+    """A connector stores its item as a document and queues reading with that
+    document's id; reading must land on that row, not store a second copy."""
+    marker = get_test_identifier("connectordoc")
+    content = f"# Slack day {marker}\n\nThe team agreed to ship the reading view."
+    stored_hash = f"connector:test:{marker}"
+    fact = f"The source-document handle survived for {marker}."
+
+    async with db_pool.acquire() as conn:
+        await _stub_get_embedding(conn)
+        stored = json.loads(await conn.fetchval(
+            "SELECT upsert_source_document($1, 'connector_conversation_day', $2, $3, '.txt', $4, 10,"
+            " '{\"kind\": \"connector_item\"}'::jsonb, '{}'::jsonb)::text",
+            f"Slack day {marker}", stored_hash, f"slack://test/{marker}", content,
+        ))
+        job_id = await conn.fetchval(
+            "SELECT enqueue_ingestion_job('text', $1::jsonb, $2, $3)",
+            json.dumps({
+                "title": f"Slack day {marker}",
+                "mode": "fast",
+                "source_type": "connector_conversation_day",
+                "connector_id": "slack",
+                "source_document_id": stored["document_id"],
+            }),
+            content,
+            stored_hash,
+        )
+
+    from services.ingest import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "IngestLLM", lambda config: _StubLLM(marker))
+    config = Config(
+        dsn=_db_dsn(os.environ.get("POSTGRES_DB")),
+        llm_config={"provider": "openai", "model": "stub", "api_key": "stub"},
+        verbose=False,
+    )
+    from services.ingest.jobs import run_ingestion_jobs_step
+
+    try:
+        assert await run_ingestion_jobs_step(db_pool, config_override=config) >= 1
+        async with db_pool.acquire() as conn:
+            status = await conn.fetchval("SELECT status FROM ingestion_jobs WHERE id = $1::uuid", job_id)
+            copies = await conn.fetchval(
+                "SELECT count(*) FROM source_documents WHERE content = $1", content,
+            )
+            memory_doc = await conn.fetchval(
+                "SELECT source_attribution->>'source_document_id' FROM memories WHERE content = $1", fact,
+            )
+            chunks = await conn.fetchval(
+                "SELECT count(*) FROM source_document_chunks WHERE source_document_id = $1::uuid",
+                stored["document_id"],
+            )
+        assert status == "completed"
+        assert copies == 1
+        assert memory_doc == stored["document_id"]
+        assert chunks >= 1
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM ingestion_jobs WHERE id = $1::uuid", job_id)
+            await conn.execute(
+                "DELETE FROM subconscious_units WHERE source_attribution->>'content_hash' = $1", stored_hash,
+            )
+            await conn.execute("DELETE FROM memories WHERE content = $1", fact)
+            await conn.execute("DELETE FROM source_documents WHERE content = $1", content)
+            await conn.execute("DELETE FROM ingestion_receipts WHERE doc_ref = $1", stored_hash)
+
+
+async def test_ingestion_reports_each_unit_of_work(db_pool):
+    marker = get_test_identifier("progress")
+    content = f"# Progress {marker}\n\nOne section that yields one fact."
+    content_hash = _hash_text(content)
+    fact = f"The source-document handle survived for {marker}."
+    async with db_pool.acquire() as conn:
+        await _stub_get_embedding(conn)
+    config = Config(
+        dsn=_db_dsn(os.environ.get("POSTGRES_DB")),
+        llm_config={"provider": "openai", "model": "stub", "api_key": "stub"},
+        mode=IngestionMode.FAST,
+        verbose=False,
+    )
+    pipeline = IngestionPipeline(config)
+    pipeline.llm = _StubLLM(marker)
+    pipeline.appraiser.llm = pipeline.llm
+    pipeline.extractor.llm = pipeline.llm
+    reports: list[dict[str, int]] = []
+
+    async def record(progress):
+        reports.append(progress)
+
+    pipeline.on_progress = record
+    try:
+        assert await pipeline.ingest_text(content, title=f"Progress {marker}") == 1
+    finally:
+        await pipeline.close()
+    try:
+        assert reports[0] == {"sections": 1, "appraised": 0, "extracted": 0, "facts": 0, "saved": 0, "merged": 0}
+        assert reports[-1] == {"sections": 1, "appraised": 1, "extracted": 1, "facts": 1, "saved": 1, "merged": 0}
+        assert len(reports) == 4  # start, appraised, extracted, saved
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM subconscious_units WHERE source_attribution->>'content_hash' = $1", content_hash,
+            )
+            await conn.execute("DELETE FROM memories WHERE content = $1", fact)
             await conn.execute("DELETE FROM source_documents WHERE content_hash = $1", content_hash)
             await conn.execute("DELETE FROM ingestion_receipts WHERE doc_ref = $1", content_hash)

@@ -116,6 +116,17 @@ def _integration_tool_error_type(exc: IntegrationHttpError) -> ToolErrorType:
     return ToolErrorType.HTTP_ERROR
 
 
+class _GmailCredentials:
+    """Readiness shared by the Gmail reading tools: they need a connected account."""
+
+    _credentials_resolver: Callable[[], dict[str, Any] | None] | None
+
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        if self._credentials_resolver and self._credentials_resolver():
+            return None
+        return "Gmail is not connected. Connect it on the Connections page."
+
+
 class EmailSendHandler(ToolHandler):
     """Send email via SMTP."""
 
@@ -136,6 +147,11 @@ class EmailSendHandler(ToolHandler):
                 - from_name: Default sender name (optional)
         """
         self._config_resolver = config_resolver
+
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        if self._config_resolver and self._config_resolver():
+            return None
+        return "Email sending is not configured. Set EMAIL_CONFIG (SMTP settings) in the service environment."
 
     @property
     def spec(self) -> ToolSpec:
@@ -304,6 +320,11 @@ class SendGridEmailHandler(ToolHandler):
         self._api_key_resolver = api_key_resolver
         self._from_email = from_email
 
+    async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
+        if self._api_key_resolver and self._api_key_resolver():
+            return None
+        return "SendGrid is not configured. Set SENDGRID_API_KEY in the service environment."
+
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
@@ -434,7 +455,7 @@ class SendGridEmailHandler(ToolHandler):
             )
 
 
-class EmailListHandler(ToolHandler):
+class EmailListHandler(_GmailCredentials, ToolHandler):
     """List recent emails from a mailbox via Gmail API."""
 
     def __init__(
@@ -588,7 +609,7 @@ class EmailListHandler(ToolHandler):
             )
 
 
-class EmailReadHandler(ToolHandler):
+class EmailReadHandler(_GmailCredentials, ToolHandler):
     """Read a specific email by ID via Gmail API."""
 
     def __init__(
@@ -715,7 +736,7 @@ class EmailReadHandler(ToolHandler):
             )
 
 
-class EmailSearchHandler(ToolHandler):
+class EmailSearchHandler(_GmailCredentials, ToolHandler):
     """Search emails using Gmail's search syntax."""
 
     def __init__(
@@ -926,7 +947,7 @@ def _extract_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return attachments
 
 
-class IngestEmailsHandler(ToolHandler):
+class IngestEmailsHandler(_GmailCredentials, ToolHandler):
     """B.2: Fetch recent emails, store as episodic memories, and extract contacts.
 
     Composite tool that orchestrates:

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Check, MessageSquarePlus, Plus, X } from "lucide-react";
+import { Ban, Check, MessageSquarePlus, Plus, X } from "lucide-react";
 import { Card } from "../components/ui/card";
 import { Badge, GoalPriorityBadge } from "../components/ui/badge";
 import { PageHeader } from "../components/ui/page-header";
@@ -78,25 +78,36 @@ export default function GoalsPage() {
     }
   };
 
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const patchGoal = async (id: string, body: Record<string, unknown>): Promise<boolean> => {
+    setUpdateError(null);
+    try {
+      const res = await fetch(`/api/goals/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`The goal could not be updated (HTTP ${res.status}).`);
+      return true;
+    } catch (err: unknown) {
+      setUpdateError(err instanceof Error ? err.message : "The goal could not be updated.");
+      return false;
+    } finally {
+      fetchGoals();
+    }
+  };
+
   const changePriority = async (id: string, priority: string, reason?: string) => {
-    await fetch(`/api/goals/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ priority, reason }),
-    });
-    fetchGoals();
+    await patchGoal(id, { priority, reason });
   };
 
   const addProgress = async (id: string) => {
     if (!progressNote.trim()) return;
-    await fetch(`/api/goals/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ progress_note: progressNote.trim() }),
-    });
-    setProgressGoalId(null);
-    setProgressNote("");
-    fetchGoals();
+    if (await patchGoal(id, { progress_note: progressNote.trim() })) {
+      setProgressGoalId(null);
+      setProgressNote("");
+    }
   };
 
   const grouped = {
@@ -184,6 +195,12 @@ export default function GoalsPage() {
           </Card>
         )}
 
+        {updateError && (
+          <p role="alert" className="mt-6 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {updateError}
+          </p>
+        )}
+
         {/* Backend outage banner (distinct from "no goals") */}
         {error && (
           <Card className="mt-6 border-red-200 bg-red-50 fade-up">
@@ -248,6 +265,21 @@ export default function GoalsPage() {
                           className="flex h-8 w-8 items-center justify-center rounded-md border border-emerald-200 text-emerald-700 hover:bg-emerald-50"
                         >
                           <Check size={15} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            // Abandoned is not completed: the goal is archived with
+                            // its reason, kept in history, and no longer pursued.
+                            const reason = window.prompt(`Why abandon "${g.title}"? (optional)`);
+                            if (reason === null) return;
+                            void changePriority(g.id, "abandoned", reason.trim() || "Abandoned via UI");
+                          }}
+                          title="Abandon goal"
+                          aria-label={`Abandon ${g.title}`}
+                          className="flex h-8 w-8 items-center justify-center rounded-md border border-[var(--outline)] text-[var(--ink-soft)] hover:bg-[var(--surface-strong)]"
+                        >
+                          <Ban size={15} />
                         </button>
                         <button
                           type="button"

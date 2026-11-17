@@ -50,6 +50,11 @@ async def test_portable_brain_core_paths_are_sql_only(db_pool):
         await tr.start()
         try:
             await _stub_get_embedding(conn)
+            # Channel turns queue a reading job only when this is on (off by
+            # default: live turns are remembered once, by the encoder).
+            await conn.execute(
+                "SELECT set_config('channel.source_artifacts_enqueue_inbound', 'true'::jsonb)"
+            )
 
             await conn.execute(
                 "SELECT set_config($1, $2::jsonb)",

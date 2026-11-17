@@ -93,6 +93,7 @@ async def run_subconscious_decider(conn) -> dict[str, Any]:
             max_tokens=1800,
             response_format={"type": "json_object"},
             fallback={},
+            usage_source="subconscious",
         )
     except Exception as exc:
         return {"skipped": True, "reason": str(exc)}

@@ -7,6 +7,8 @@ import { Badge } from "../components/ui/badge";
 import { PageHeader } from "../components/ui/page-header";
 import { Spinner } from "../components/ui/spinner";
 import { PwaSettings } from "../components/pwa/pwa-settings";
+import { OutreachSettings } from "./outreach-settings";
+import { RetentionSettings } from "./retention-settings";
 
 type SettingsData = {
   groups: Record<string, Record<string, unknown>>;
@@ -16,7 +18,7 @@ type SettingsData = {
   tools: Record<string, unknown>;
 };
 
-const TABS = ["models", "autonomy", "tools", "voice", "app", "advanced"] as const;
+const TABS = ["models", "messages", "autonomy", "tools", "voice", "retention", "app", "advanced"] as const;
 type Tab = (typeof TABS)[number];
 
 const MODEL_ROLES = [
@@ -142,7 +144,11 @@ export default function SettingsPage() {
             </section>
           ) : null}
 
+          {tab === "messages" ? <OutreachSettings /> : null}
+
           {tab === "voice" ? <VoicePanel /> : null}
+
+          {tab === "retention" ? <RetentionSettings /> : null}
 
           {tab === "app" ? <PwaSettings /> : null}
 

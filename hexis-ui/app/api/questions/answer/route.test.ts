@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NextRequest } from "next/server";
 
 import { POST } from "./route";
 import { prisma } from "@/lib/prisma";
@@ -18,7 +19,7 @@ describe("/api/questions/answer", () => {
       { result: { ok: true, id: ID, status: "answered", answer: "Hartford" } },
     ]);
     const response = await POST(
-      new Request("http://localhost/api/questions/answer", {
+      new NextRequest("http://localhost/api/questions/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID, choice_index: 2 }),
@@ -36,7 +37,7 @@ describe("/api/questions/answer", () => {
 
   it("requires either a choice or free text", async () => {
     const response = await POST(
-      new Request("http://localhost/api/questions/answer", {
+      new NextRequest("http://localhost/api/questions/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID }),
@@ -48,7 +49,7 @@ describe("/api/questions/answer", () => {
 
   it("rejects a malformed question id before querying", async () => {
     const response = await POST(
-      new Request("http://localhost/api/questions/answer", {
+      new NextRequest("http://localhost/api/questions/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: "not-a-question", choice_index: 1 }),
@@ -71,7 +72,7 @@ describe("/api/questions/answer", () => {
       },
     ]);
     const response = await POST(
-      new Request("http://localhost/api/questions/answer", {
+      new NextRequest("http://localhost/api/questions/answer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: ID, answer: "The Hartford one" }),

@@ -538,7 +538,7 @@ CREATE TABLE embedding_cache (
 
 CREATE TABLE IF NOT EXISTS worker_instances (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    mode TEXT NOT NULL CHECK (mode IN ('heartbeat', 'maintenance', 'both', 'channel', 'unknown')),
+    mode TEXT NOT NULL CHECK (mode IN ('heartbeat', 'maintenance', 'both', 'channel', 'ingest', 'unknown')),
     instance_name TEXT,
     process_id INT,
     host_name TEXT,
@@ -977,9 +977,17 @@ INSERT INTO config_defaults (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
     ('heartbeat.use_rlm', 'true'::jsonb, 'Enable RLM loop for heartbeat decisions'),
-    ('chat.use_rlm', 'true'::jsonb, 'Enable RLM loop for chat'),
+    ('chat.turn_timeout_s', '360'::jsonb, 'Outer time limit for one chat turn, in seconds; 0 disables'),
+    ('chat.priority_max_wait_s', '180'::jsonb, 'Longest a background model call waits for chat to finish before going ahead'),
+    ('chat.max_tool_rounds', '5'::jsonb, 'Rounds of tool calls in one chat turn before the agent must answer'),
+    ('chat.answer_reserve_s', '30'::jsonb, 'Seconds of the chat loop time limit kept for writing the answer'),
+    ('heartbeat.claim_timeout_s', '1800'::jsonb, 'Seconds after a heartbeat starts before its claim stops blocking new heartbeats'),
+    ('chat.use_rlm', 'false'::jsonb, 'Route chat turns through the RLM REPL loop instead of the agent loop (the REPL prompt carries no persona or memory context)'),
     ('rlm.chat.streaming_enabled', 'false'::jsonb, 'Use native RLM chat path for streaming transports; false keeps UI/CLI token streaming through AgentLoop until RLM supports incremental final output'),
     ('rlm.heartbeat.max_iterations', '10'::jsonb, 'Max RLM iterations for heartbeat'),
+    ('rlm.heartbeat.user_goal_max_iterations', '40'::jsonb, 'Reasoning steps per heartbeat while a goal the user set is active'),
+    ('rlm.heartbeat.user_goal_timeout_seconds', '1800'::jsonb, 'Seconds per heartbeat while a goal the user set is active'),
+    ('heartbeat.free_work_daily_token_cap', '5000000'::jsonb, 'Heartbeat model tokens per day after which work on the user''s goals spends energy again (0 = no cap)'),
     ('rlm.chat.max_iterations', '15'::jsonb, 'Max RLM iterations for chat'),
     ('rlm.max_depth', '1'::jsonb, 'Max recursion depth for sub-calls'),
     ('rlm.sub_model', 'null'::jsonb, 'Model for sub-calls (null = same as root)'),

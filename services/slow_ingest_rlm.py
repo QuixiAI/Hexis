@@ -9,11 +9,12 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from core.cognitive_memory_api import RelationshipType
 from core.memory_repo import MemoryRepo
@@ -34,6 +35,7 @@ from services.ingest import (
     IngestionPipeline,
     Section,
     _hash_text,
+    _should_cancel,
     _word_count,
 )
 from services.prompt_resources import compose_compact_personhood_prompt, load_rlm_slow_ingest_prompt
@@ -59,6 +61,45 @@ _DEFAULT_ASSESSMENT: dict[str, Any] = {
 }
 
 _ASSESSMENT_KEYS = set(_DEFAULT_ASSESSMENT.keys())
+
+
+class SlowReadFailed(RuntimeError):
+    """A chunk's slow read produced no assessment (timeout or a model
+    failure). Raised, never replaced by an empty assessment: an empty one
+    would be persisted and receipted as if the chunk had nothing to say,
+    and the job would complete with no memories and never be read again."""
+
+
+class SlowAnswerUnusable(SlowReadFailed):
+    """The model answered, but not with an assessment object."""
+
+
+def _raise_if_cancelled(pipeline: IngestionPipeline) -> None:
+    # Same signal and message as the fast path; fail_ingestion_job turns a
+    # failure on a cancel-requested job into 'cancelled'.
+    if _should_cancel(pipeline.config):
+        raise RuntimeError("Ingestion cancelled")
+
+
+def _counted_call_hook(pipeline: IngestionPipeline) -> Callable[[], Awaitable[None]]:
+    """Run before every slow-read model call: the pipeline's own hook (the
+    job runner sets it to wait for a live chat turn), then count the call
+    with the pipeline's other calls so the job's metrics include it."""
+    llm = pipeline.llm
+
+    async def _before_call() -> None:
+        if llm.before_call is not None:
+            await llm.before_call()
+        llm.call_count += 1
+
+    return _before_call
+
+
+def _valid_facts(assessment: dict[str, Any]) -> list[str]:
+    return [
+        fact for fact in assessment.get("extracted_facts", [])
+        if fact and isinstance(fact, str) and len(fact.strip()) >= 10
+    ]
 
 
 def _require_source_document(doc: DocumentInfo) -> None:
@@ -105,12 +146,16 @@ async def run_slow_ingest_chunk(
     max_iterations: int = 6,
     timeout_seconds: int = 120,
     workspace_budgets: WorkspaceBudgets | None = None,
+    before_call: Callable[[], Awaitable[Any]] | None = None,
 ) -> dict[str, Any]:
     """Run a mini-RLM loop to consciously read and assess one chunk.
 
     Returns an assessment dict with keys: acceptance, analysis,
     emotional_reaction, worldview_impact, importance, trust_assessment,
     extracted_facts, connections, rejection_reasons.
+
+    Raises SlowReadFailed (timeout, no answer), SlowAnswerUnusable (an
+    answer that is not an assessment) or RLMCallError (model call failed).
     """
     time_start = time.perf_counter()
     llm_cfg = normalize_llm_config(llm_config)
@@ -138,7 +183,7 @@ async def run_slow_ingest_chunk(
     )
 
     loop = asyncio.get_running_loop()
-    llm_query_fn = _make_sync_llm_query(llm_cfg, loop)
+    llm_query_fn = _make_sync_llm_query(llm_cfg, loop, before_call=before_call)
     memory_env = RLMMemoryEnv(repo, workspace, llm_query_fn=llm_query_fn)
 
     repl = HexisLocalREPL()
@@ -157,53 +202,34 @@ async def run_slow_ingest_chunk(
         result = await asyncio.wait_for(
             loop.run_in_executor(
                 None,
-                _run_loop,
-                repl,
-                llm_cfg,
-                loop,
-                system_prompt,
-                max_iterations,
+                functools.partial(
+                    _run_loop,
+                    repl,
+                    llm_cfg,
+                    loop,
+                    system_prompt,
+                    max_iterations,
+                    strict=True,
+                    before_call=before_call,
+                ),
             ),
             timeout=timeout_seconds,
         )
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
         logger.warning(
             "slow_ingest_chunk timed out chunk=%d/%d after %ds",
             chunk_index + 1,
             total_chunks,
             timeout_seconds,
         )
-        duration = time.perf_counter() - time_start
-        return {
-            "assessment": dict(_DEFAULT_ASSESSMENT),
-            "metrics": {
-                "iterations": 0,
-                "message_count": 0,
-                "timed_out": True,
-                "duration_seconds": round(duration, 2),
-            },
-        }
+        raise SlowReadFailed(
+            f"slow read of chunk {chunk_index + 1}/{total_chunks} timed out after {timeout_seconds}s"
+        ) from exc
     except RlmLoopFailure as exc:
-        # #111: a total LLM failure -- same honest degrade as the timeout
-        # branch above (a default, conservative assessment) rather than
-        # letting a fabricated decision or an unhandled crash reach the
-        # ingestion pipeline.
-        logger.error(
-            "slow_ingest_chunk got no usable LLM response chunk=%d/%d: %s",
-            chunk_index + 1,
-            total_chunks,
-            exc,
-        )
-        duration = time.perf_counter() - time_start
-        return {
-            "assessment": dict(_DEFAULT_ASSESSMENT),
-            "metrics": {
-                "iterations": 0,
-                "message_count": 0,
-                "llm_error": str(exc),
-                "duration_seconds": round(duration, 2),
-            },
-        }
+        # A total model failure (#111) is a failed read, not an empty one.
+        raise SlowReadFailed(
+            f"slow read of chunk {chunk_index + 1}/{total_chunks} got no usable model response: {exc}"
+        ) from exc
     finally:
         repl.cleanup()
         repo.close()
@@ -212,9 +238,14 @@ async def run_slow_ingest_chunk(
 
     # Parse JSON assessment from FINAL answer
     try:
-        parsed = json.loads(raw_answer) if raw_answer else {}
+        parsed = json.loads(raw_answer) if raw_answer else None
     except (json.JSONDecodeError, TypeError):
-        parsed = {}
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise SlowAnswerUnusable(
+            f"slow read of chunk {chunk_index + 1}/{total_chunks} gave no assessment: "
+            f"{str(raw_answer)[:200]!r}"
+        )
 
     assessment = _safe_assessment(parsed)
     duration = time.perf_counter() - time_start
@@ -305,12 +336,14 @@ async def run_slow_ingest(
     assessments: list[dict[str, Any]] = []
     chunks_processed = 0
     total_chunks = len(sections)
+    before_call = _counted_call_hook(pipeline)
 
     for section in sections:
         if pipeline._skip_section(section.title):
             continue
         if chunk_hashes[section.index] in receipts:
             continue  # resumed: this chunk already persisted
+        _raise_if_cancelled(pipeline)
 
         chunk_result = await run_slow_ingest_chunk(
             chunk_text=section.extraction_view(),
@@ -323,6 +356,7 @@ async def run_slow_ingest(
             llm_config=llm_config,
             dsn=dsn,
             workspace_budgets=workspace_budgets,
+            before_call=before_call,
         )
 
         assessment = chunk_result["assessment"]
@@ -351,19 +385,16 @@ async def run_slow_ingest(
         elif acceptance == "question":
             chunk_source["questioned"] = True
 
-        facts = assessment.get("extracted_facts", [])
         connection_ids = assessment.get("connections", [])
         rejection_reason_ids = assessment.get("rejection_reasons", [])
 
-        valid_facts = [
-            fact for fact in facts
-            if fact and isinstance(fact, str) and len(fact.strip()) >= 10
-        ]
+        valid_facts = _valid_facts(assessment)
         # The whole fact-persistence pass is atomic in the DB (db/66
         # slow_ingest_persist_facts): routing, corroboration via the audited
         # belief-revision policy, creation, and every edge kind. Trust
         # derives from source attributions (#83); the acceptance stance is
-        # recorded as edges and metadata.
+        # recorded as edges and metadata. It records the chunk's receipt
+        # even when there are no facts, so a retry skips the chunk.
         worldview_edge_ids = [
             wv.get("memory_id") or wv.get("id") for wv in worldview_stubs[:3]
         ]
@@ -464,38 +495,38 @@ async def run_hybrid_ingest(
             doc_ref, f"enc:{doc_ref}", memory_id=encounter_id, source_path=doc.path
         )
 
-    # Phase 1: Fast pass -- use the pipeline's KnowledgeExtractor to score all chunks
+    # Chunks receipted by an earlier attempt are already persisted; neither
+    # pass reads them again.
+    pending = [
+        section for section in sections
+        if not pipeline._skip_section(section.title)
+        and chunk_hashes[section.index] not in receipts
+    ]
+
+    # Phase 1: Fast pass -- use the pipeline's KnowledgeExtractor to score
+    # every pending chunk. A failed extraction fails the document, and the
+    # job retries it; a chunk is never kept as if it had nothing to say.
     fast_extractions: dict[int, list[Extraction]] = {}
     chunk_importance: dict[int, float] = {}
 
     appraisal = Appraisal(primary_emotion="neutral", intensity=0.2)
 
-    for section in sections:
-        if pipeline._skip_section(section.title):
-            continue
-
-        try:
-            extractions = await pipeline.extractor.extract(
-                section=section,
-                doc=doc,
-                appraisal=appraisal,
-                mode=IngestionMode.FAST,
-                max_items=pipeline.config.max_facts_per_section,
-            )
-            fast_extractions[section.index] = extractions
-            max_imp = max((e.importance for e in extractions), default=0.0)
-            chunk_importance[section.index] = max_imp
-        except Exception as e:
-            logger.warning("Fast extraction failed for section %d: %s", section.index, e)
-            fast_extractions[section.index] = []
-            chunk_importance[section.index] = 0.0
+    for section in pending:
+        _raise_if_cancelled(pipeline)
+        extractions = await pipeline.extractor.extract(
+            section=section,
+            doc=doc,
+            appraisal=appraisal,
+            mode=IngestionMode.FAST,
+            max_items=pipeline.config.max_facts_per_section,
+        )
+        fast_extractions[section.index] = extractions
+        chunk_importance[section.index] = max((e.importance for e in extractions), default=0.0)
 
     # Phase 2: Identify high-signal chunks
     high_signal_indices: set[int] = set()
 
-    for section in sections:
-        if section.index not in chunk_importance:
-            continue
+    for section in pending:
         # Criterion 1: High importance from extraction
         if chunk_importance[section.index] > 0.7:
             high_signal_indices.add(section.index)
@@ -518,7 +549,7 @@ async def run_hybrid_ingest(
     logger.info(
         "hybrid_ingest triage: %d/%d chunks flagged as high-signal",
         len(high_signal_indices),
-        len(sections),
+        len(pending),
     )
 
     # Phase 3: Process chunks
@@ -527,77 +558,89 @@ async def run_hybrid_ingest(
     fast_chunk_count = 0
     assessments: list[dict[str, Any]] = []
     total_chunks = len(sections)
+    before_call = _counted_call_hook(pipeline)
 
-    for section in sections:
-        if pipeline._skip_section(section.title):
-            continue
+    for section in pending:
+        _raise_if_cancelled(pipeline)
+        section_hash = chunk_hashes[section.index]
+        extractions = fast_extractions[section.index]
 
         if section.index in high_signal_indices:
             # Slow path: RLM loop
-            chunk_result = await run_slow_ingest_chunk(
-                chunk_text=section.extraction_view(),
-                chunk_index=section.index,
-                total_chunks=total_chunks,
-                source_info=source_info,
-                worldview_stubs=worldview_stubs,
-                emotional_state=emotional_state,
-                goal_stubs=goal_stubs,
-                llm_config=llm_config,
-                dsn=dsn,
-                workspace_budgets=workspace_budgets,
+            assessment: dict[str, Any] | None = None
+            try:
+                chunk_result = await run_slow_ingest_chunk(
+                    chunk_text=section.extraction_view(),
+                    chunk_index=section.index,
+                    total_chunks=total_chunks,
+                    source_info=source_info,
+                    worldview_stubs=worldview_stubs,
+                    emotional_state=emotional_state,
+                    goal_stubs=goal_stubs,
+                    llm_config=llm_config,
+                    dsn=dsn,
+                    workspace_budgets=workspace_budgets,
+                    before_call=before_call,
+                )
+            except SlowAnswerUnusable as exc:
+                logger.warning("hybrid_ingest: %s; keeping the fast pass's facts", exc)
+            else:
+                assessment = chunk_result["assessment"]
+                assessments.append(assessment)
+                # Update emotional state
+                emo = assessment.get("emotional_reaction", {})
+                if isinstance(emo, dict) and "valence" in emo:
+                    emotional_state = emo
+
+            hybrid_facts = _valid_facts(assessment) if assessment is not None else []
+            if assessment is not None and (hybrid_facts or not extractions):
+                slow_chunk_count += 1
+                # Create memories from slow assessment (same logic as run_slow_ingest)
+                acceptance = assessment["acceptance"]
+
+                chunk_source = dict(source_info)
+                chunk_source["section_hash"] = section_hash
+                chunk_id = doc.chunk_ids.get(section.index)
+                if chunk_id:
+                    chunk_source["chunk_id"] = chunk_id
+                    chunk_source["chunk_index"] = section.index
+                chunk_source["conscious_analysis"] = assessment.get("analysis", "")
+                chunk_source["acceptance"] = acceptance
+                if acceptance == "contest":
+                    chunk_source["contested"] = True
+                elif acceptance == "question":
+                    chunk_source["questioned"] = True
+
+                hybrid_result = await pipeline.store.persist_slow_facts(
+                    hybrid_facts,
+                    assessment,
+                    chunk_source,
+                    encounter_id=encounter_id,
+                    connection_ids=None,
+                    worldview_ids=None,
+                    rejection_reason_ids=assessment.get("rejection_reasons", []),
+                    context="hybrid_ingest",
+                )
+                memories_created.extend(str(m) for m in (hybrid_result.get("created") or []))
+                continue
+            # The slow read yielded nothing, but the fast pass found facts:
+            # keep those rather than dropping the chunk.
+            logger.info(
+                "hybrid_ingest: slow read of chunk %d yielded no facts; keeping %d fast facts",
+                section.index, len(extractions),
             )
 
-            assessment = chunk_result["assessment"]
-            assessments.append(assessment)
-            slow_chunk_count += 1
-
-            # Update emotional state
-            emo = assessment.get("emotional_reaction", {})
-            if isinstance(emo, dict) and "valence" in emo:
-                emotional_state = emo
-
-            # Create memories from slow assessment (same logic as run_slow_ingest)
-            acceptance = assessment["acceptance"]
-
-            chunk_source = dict(source_info)
-            chunk_source["section_hash"] = chunk_hashes[section.index]
-            chunk_id = doc.chunk_ids.get(section.index)
-            if chunk_id:
-                chunk_source["chunk_id"] = chunk_id
-                chunk_source["chunk_index"] = section.index
-            chunk_source["conscious_analysis"] = assessment.get("analysis", "")
-            chunk_source["acceptance"] = acceptance
-            if acceptance == "contest":
-                chunk_source["contested"] = True
-            elif acceptance == "question":
-                chunk_source["questioned"] = True
-
-            hybrid_facts = [
-                fact for fact in assessment.get("extracted_facts", [])
-                if fact and isinstance(fact, str) and len(fact.strip()) >= 10
-            ]
-            hybrid_result = await pipeline.store.persist_slow_facts(
-                hybrid_facts,
-                assessment,
-                chunk_source,
-                encounter_id=encounter_id,
-                connection_ids=None,
-                worldview_ids=None,
-                rejection_reason_ids=assessment.get("rejection_reasons", []),
-                context="hybrid_ingest",
-            )
-            memories_created.extend(str(m) for m in (hybrid_result.get("created") or []))
-
-        else:
-            # Fast path: use pre-extracted facts from Phase 1
-            fast_chunk_count += 1
-            extractions = fast_extractions.get(section.index, [])
-            created = await pipeline._create_semantic_memories(
-                doc, encounter_id, appraisal, extractions,
-                section_hash=chunk_hashes[section.index],
-                chunk_index=section.index,
-            )
-            memories_created.extend(created)
+        # Fast path: use pre-extracted facts from Phase 1
+        fast_chunk_count += 1
+        if not extractions:
+            await pipeline.store.record_receipt(doc_ref, section_hash, source_path=doc.path)
+            continue
+        created = await pipeline._create_semantic_memories(
+            doc, encounter_id, appraisal, extractions,
+            section_hash=section_hash,
+            chunk_index=section.index,
+        )
+        memories_created.extend(created)
 
     await pipeline.store.record_receipt(
         doc_ref, doc_ref, memories_created=len(memories_created), source_path=doc.path
