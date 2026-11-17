@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -306,11 +307,12 @@ def provision(config: dict, progress=print) -> dict:
     )
 
 
-def request_json(url: str, body=None, timeout=5):
+def request_json(url: str, body=None, timeout=5, *, api_key=None):
     data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
@@ -433,6 +435,10 @@ class Runtime:
         self.root = instance_root(self.instance)
         self.config_path = self.root / "config.json"
         self.state_path = self.root / "state.json"
+        self.gateway_credentials_path = self.root / "gateway-credentials.json"
+
+    def gateway_api_key(self) -> str | None:
+        return read_json(self.gateway_credentials_path).get("api_key")
 
     def config(self):
         return {
@@ -615,6 +621,18 @@ class Runtime:
                 terminate(state["gateway"])
                 state.pop("gateway", None)
             assets = assets or state.get("assets")
+            gateway_api_key = None
+            if not gateway_external:
+                gateway_api_key = self.gateway_api_key()
+                if not gateway_api_key:
+                    gateway_api_key = secrets.token_urlsafe(32)
+                    write_json(
+                        self.gateway_credentials_path, {"api_key": gateway_api_key}
+                    )
+                    state.pop("gateway_authenticated", None)
+                if not state.get("gateway_authenticated"):
+                    terminate(state.get("gateway"))
+                    state.pop("gateway", None)
             if not gateway_external and not owned(state.get("gateway")):
                 if not assets:
                     # External local server, managed gateway: only install the
@@ -644,9 +662,12 @@ class Runtime:
                         "--llamacpp-url",
                         state["local_url"],
                         "--no-ui",
+                        "--require-auth",
                     ],
                     state,
+                    env={**os.environ, "QUIXIGATE_MASTER_KEY": gateway_api_key},
                 )
+                state["gateway_authenticated"] = True
                 self._wait(
                     state["gateway_url"].removesuffix("/v1") + "/health/liveness",
                     record,
@@ -696,12 +717,17 @@ class Runtime:
                         "pool_strategy": "fill_first",
                         "allow_paid_overflow": False,
                     },
+                    api_key=gateway_api_key,
                 )
             # An HTTP listener is not proof that inference works.
             self.probe(state["local_url"], state["model_id"])
             for attempt in range(3):
                 try:
-                    self.probe(state["gateway_url"], state["gateway_model"])
+                    self.probe(
+                        state["gateway_url"],
+                        state["gateway_model"],
+                        api_key=gateway_api_key,
+                    )
                     break
                 except (OSError, ValueError, InferenceRuntimeError):
                     if attempt == 2:
@@ -743,7 +769,7 @@ class Runtime:
         return self.status()
 
     @staticmethod
-    def probe(url: str, model: str):
+    def probe(url: str, model: str, *, api_key=None):
         result = request_json(
             url + "/chat/completions",
             {
@@ -758,6 +784,7 @@ class Runtime:
                 "temperature": 0,
             },
             timeout=60,
+            api_key=api_key,
         )
         if (
             not result.get("choices", [{}])[0]
@@ -784,7 +811,13 @@ class Runtime:
         for name in ("local", "gateway"):
             url = state.get(name + "_url") or config.get(name + "_url")
             try:
-                request_json(url + "/models", timeout=2) if url else None
+                if url:
+                    api_key = (
+                        self.gateway_api_key()
+                        if name == "gateway" and not config.get("gateway_url")
+                        else None
+                    )
+                    request_json(url + "/models", timeout=2, api_key=api_key)
                 ready = bool(url)
             except (OSError, ValueError):
                 ready = False
@@ -839,7 +872,8 @@ def resolved_routes(
     instance: str | None = None, *, container: bool | None = None
 ) -> list[dict]:
     runtime = Runtime(instance)
-    if not runtime.config()["enabled"]:
+    config = runtime.config()
+    if not config["enabled"]:
         return []
     state = read_json(runtime.state_path)
     if not state.get("enabled"):
@@ -860,9 +894,18 @@ def resolved_routes(
                 url = urllib.parse.urlunsplit(
                     parsed._replace(netloc=f"host.docker.internal:{parsed.port}")
                 )
-        routes.append(
-            {"provider": "openai_compatible", "model": model, "endpoint": url}
-        )
+        route = {"provider": "openai_compatible", "model": model, "endpoint": url}
+        if (
+            name == "gateway"
+            and state.get("gateway_authenticated")
+            and not config.get("gateway_url")
+        ):
+            api_key = runtime.gateway_api_key()
+            if not api_key:
+                # The direct local model can still serve requests during repair.
+                continue
+            route["api_key"] = api_key
+        routes.append(route)
     return routes
 
 
