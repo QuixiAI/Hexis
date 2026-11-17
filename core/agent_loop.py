@@ -659,6 +659,13 @@ class AgentLoop:
                 **event,
             })
 
+        # Direct model calls have no enclosing turn deadline. Give them the
+        # configured budget and reserve finalization time only inside a turn.
+        inference_timeout = cfg.timeout_seconds
+        if self._started_at is not None:
+            elapsed = time.monotonic() - self._started_at
+            inference_timeout = max(0.1, inference_timeout - elapsed - 1.0)
+
         if self._streaming:
             first_token = True
             received_text = False
@@ -695,7 +702,7 @@ class AgentLoop:
                 endpoint=llm.get("endpoint"),
                 api_key=llm.get("api_key"),
                 fallbacks=llm.get("fallbacks"),
-                inference_timeout=max(0.1, cfg.timeout_seconds - (time.monotonic() - self._started_at) - 1.0),
+                inference_timeout=inference_timeout,
                 messages=model_messages,
                 tools=tools if tools else None,
                 temperature=cfg.temperature,
@@ -720,7 +727,7 @@ class AgentLoop:
                 endpoint=llm.get("endpoint"),
                 api_key=llm.get("api_key"),
                 fallbacks=llm.get("fallbacks"),
-                inference_timeout=max(0.1, cfg.timeout_seconds - (time.monotonic() - self._started_at) - 1.0),
+                inference_timeout=inference_timeout,
                 messages=model_messages,
                 tools=tools if tools else None,
                 temperature=cfg.temperature,
