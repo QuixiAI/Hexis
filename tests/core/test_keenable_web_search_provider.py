@@ -85,3 +85,23 @@ async def test_registry_cache_separates_keyless_and_keyed(monkeypatch):
         config=ToolsConfig(web_search={"provider": "keenable"}, api_keys={"keenable": "kn"}),
     )
     assert urls == ["https://api.keenable.ai/v1/search/public", "https://api.keenable.ai/v1/search"]
+
+
+async def test_registry_cache_keeps_variant_when_key_added_mid_request(monkeypatch):
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    urls: list[str] = []
+    config = ToolsConfig(web_search={"provider": "keenable"})
+
+    async def _request_json(provider, method, url, **kwargs):
+        urls.append(url)
+        if len(urls) == 1:
+            # A key shows up while the keyless request is still in flight.
+            config.api_keys["keenable"] = "kn"
+        return {"results": [{"title": "A", "url": "https://a.example/x", "snippet": "s"}]}
+
+    monkeypatch.setattr(wsp, "request_json", _request_json)
+    registry = wsp.create_default_web_search_registry()
+    await registry.search(query="q", max_results=3, config=config)
+    response, _ = await registry.search(query="q", max_results=3, config=config)
+    assert urls == ["https://api.keenable.ai/v1/search/public", "https://api.keenable.ai/v1/search"]
+    assert response.cached is False

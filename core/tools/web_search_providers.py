@@ -742,8 +742,11 @@ class WebSearchProviderRegistry:
         max_results: int,
         response: WebSearchResponse,
         config: ToolsConfig | None = None,
+        key: str | None = None,
     ) -> None:
-        self._cache[self._cache_key(provider, query, max_results, config)] = (
+        if key is None:
+            key = self._cache_key(provider, query, max_results, config)
+        self._cache[key] = (
             time.monotonic() + _CACHE_TTL_SECONDS,
             response,
         )
@@ -773,13 +776,17 @@ class WebSearchProviderRegistry:
             cached = self._cached(provider, query, max_results, config)
             if cached:
                 return cached, errors
+            # Capture the cache identity before awaiting: the config (e.g. an
+            # API key) can change while the request is in flight, and the
+            # response must be stored under the variant it was fetched with.
+            cache_key = self._cache_key(provider, query, max_results, config)
             try:
                 response = await provider.search(
                     query=query,
                     max_results=max_results,
                     config=config,
                 )
-                self._store_cache(provider, query, max_results, response, config)
+                self._store_cache(provider, query, max_results, response, config, key=cache_key)
                 return response, errors
             except WebSearchProviderError as exc:
                 errors.append(f"{provider.label}: {exc}")
