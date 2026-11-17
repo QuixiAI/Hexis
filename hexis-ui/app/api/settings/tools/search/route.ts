@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { SEARCH_PROVIDERS, searchProvider } from "@/lib/search-providers";
 import { prisma } from "@/lib/prisma";
 import { normalizeJsonValue } from "@/lib/db";
 
@@ -9,53 +10,6 @@ type ToolsConfigDoc = {
   web_search?: Record<string, unknown>;
   [key: string]: unknown;
 };
-
-const PROVIDERS = [
-  {
-    id: "auto",
-    label: "Automatic",
-    requires_credential: false,
-    hint: "Use the best available configured provider, then keyless fallbacks.",
-  },
-  {
-    id: "tavily",
-    label: "Tavily",
-    requires_credential: true,
-    hint: "High-quality search API. Provide a key or env reference.",
-  },
-  {
-    id: "brave",
-    label: "Brave Search",
-    requires_credential: true,
-    hint: "Brave Search API. Provide BRAVE_SEARCH_API_KEY or a direct key.",
-  },
-  {
-    id: "keenable",
-    label: "Keenable",
-    requires_credential: false,
-    hint: "Web search with no key required. Optionally provide KEENABLE_API_KEY for higher limits.",
-  },
-  {
-    id: "searxng",
-    label: "SearXNG",
-    requires_credential: false,
-    hint: "Self-hosted no-key metasearch. Provide a SearXNG base URL.",
-  },
-  {
-    id: "duckduckgo_lite",
-    label: "DuckDuckGo Lite",
-    requires_credential: false,
-    hint: "Keyless fallback provider.",
-  },
-  {
-    id: "bing_rss",
-    label: "Bing RSS",
-    requires_credential: false,
-    hint: "Keyless secondary fallback provider.",
-  },
-] as const;
-
-const PROVIDER_IDS = new Set(PROVIDERS.map((provider) => provider.id));
 
 function toStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -102,7 +56,7 @@ export async function GET() {
           : "auto",
       searxng_url:
         typeof webSearch.searxng_url === "string" ? webSearch.searxng_url : "",
-      providers: PROVIDERS,
+      providers: SEARCH_PROVIDERS,
     });
   } catch (error: unknown) {
     console.error("Search tool config read failed:", error);
@@ -134,15 +88,16 @@ export async function POST(req: NextRequest) {
     typeof payload.searxng_url === "string" ? payload.searxng_url.trim().replace(/\/+$/, "") : "";
   const requestedEnable = payload.enable !== false;
 
-  if (!PROVIDER_IDS.has(provider as (typeof PROVIDERS)[number]["id"])) {
+  const definition = searchProvider(provider);
+  if (!definition) {
     return NextResponse.json(
       { error: `Unknown web search provider: ${provider}` },
       { status: 400 }
     );
   }
 
-  if ((provider === "tavily" || provider === "brave") && !apiKey && !keyRef) {
-    const envName = provider === "tavily" ? "TAVILY_API_KEY" : "BRAVE_SEARCH_API_KEY";
+  if (definition.requires_credential && !apiKey && !keyRef) {
+    const envName = definition.credential_env;
     return NextResponse.json(
       { error: `Provide api_key or key_ref (for example: env:${envName}).` },
       { status: 400 }
@@ -186,14 +141,8 @@ export async function POST(req: NextRequest) {
     if (provider === "searxng") {
       nextConfig.web_search.searxng_url = searxngUrl;
     }
-    if (resolver) {
-      if (provider === "brave") {
-        nextConfig.api_keys.brave_search = resolver;
-      } else if (provider === "keenable") {
-        nextConfig.api_keys.keenable = resolver;
-      } else {
-        nextConfig.api_keys.tavily = resolver;
-      }
+    if (resolver && definition.credential_key) {
+      nextConfig.api_keys[definition.credential_key] = resolver;
     }
 
     if (requestedEnable) {
@@ -223,7 +172,7 @@ export async function POST(req: NextRequest) {
       tool: "web_search",
       enabled: true,
       provider,
-      key_source: keyRef ? "reference" : "direct",
+      key_source: keyRef ? "reference" : apiKey ? "direct" : "none",
     });
   } catch (error: unknown) {
     console.error("Search tool config update failed:", error);

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from core.llm import chat_completion, normalize_llm_config
+from core.response_cleanup import divider_cleanup_enabled, strip_leading_divider
 from core.memory_repo import MemoryRepo
 from core.tools.repl_bridge import ReplToolBridge, call_records_to_actions_taken
 from services.prompt_resources import (
@@ -905,8 +906,20 @@ async def run_chat_turn(
         duration,
     )
 
+    answer = result["final_answer"]
+    if divider_cleanup_enabled(llm_cfg):
+        answer = strip_leading_divider(answer)
+        if not answer.strip() and result["final_answer"].strip():
+            # The REPL may already have acted. Do not replay it to repair a
+            # cosmetic-only final answer; the chat surface keeps it unanswered.
+            raise RuntimeError(
+                "The model returned only dividers and produced no answer. "
+                "Try again or select another model. For literal divider output, "
+                "disable strip_leading_divider_models in the chat model configuration."
+            )
+
     return {
-        "response": result["final_answer"],
+        "response": answer,
         "metrics": {
             "iterations": result["iterations"],
             "message_count": result["message_count"],

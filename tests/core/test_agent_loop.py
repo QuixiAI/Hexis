@@ -2388,3 +2388,65 @@ class TestHeartbeatYieldsToChat:
         mock_llm.return_value = _text_response("hi")
         await AgentLoop(_make_config()).run("Hello")
         assert calls == []
+
+
+class TestDividerCompatibility:
+    @pytest.mark.parametrize("streaming", [False, True])
+    @pytest.mark.parametrize("reply", ["---\nReply.", "---"])
+    async def test_opt_in_cleanup_and_recovery_persist_only_the_answer(
+        self, monkeypatch, streaming, reply
+    ):
+        calls = []
+
+        async def completion(**kwargs):
+            calls.append(kwargs)
+            text = reply if len(calls) == 1 else "Recovered."
+            if streaming:
+                for token in text:
+                    await kwargs["on_text_delta"](token)
+            return _text_response(text)
+
+        monkeypatch.setattr(
+            "core.agent_loop.stream_chat_completion" if streaming
+            else "core.agent_loop.chat_completion",
+            completion,
+        )
+        llm_config = _make_llm_config()
+        llm_config["strip_leading_divider_models"] = [llm_config["model"]]
+        agent = AgentLoop(_make_config(llm_config=llm_config))
+        expected = "Reply." if reply.endswith("Reply.") else "Recovered."
+        if streaming:
+            events = [event async for event in agent.stream("Hi")]
+            visible = "".join(
+                event.data["text"] for event in events
+                if event.event == AgentEvent.TEXT_DELTA
+            )
+            assert visible == expected
+            assert not any(event.event == AgentEvent.ERROR for event in events)
+        else:
+            result = await agent.run("Hi")
+            assert result.text == expected
+            assert result.stopped_reason == "completed"
+        async with _DB_POOL.acquire() as conn:
+            messages = await conn.fetchval(
+                "SELECT messages FROM agent_turns WHERE id = $1::uuid", agent._turn_id
+            )
+        if isinstance(messages, str):
+            messages = json.loads(messages)
+        assistant_messages = [m["content"] for m in messages if m["role"] == "assistant"]
+        assert assistant_messages == [expected]
+        assert len(calls) == (1 if reply.endswith("Reply.") else 2)
+
+    async def test_divider_only_recovery_marks_turn_failed(self, monkeypatch):
+        monkeypatch.setattr(
+            "core.agent_loop.chat_completion", AsyncMock(return_value=_text_response("---"))
+        )
+        llm_config = _make_llm_config()
+        llm_config["strip_leading_divider_models"] = [llm_config["model"]]
+        agent = AgentLoop(_make_config(llm_config=llm_config))
+        result = await agent.run("Hi")
+        assert result.stopped_reason == "error"
+        async with _DB_POOL.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT status FROM agent_turns WHERE id = $1::uuid", agent._turn_id
+            ) == "failed"

@@ -424,8 +424,11 @@ class KeenableSearchProvider(WebSearchProvider):
             )
         except IntegrationHttpError as exc:
             _raise_web_search_error("Keenable", exc)
-        if not isinstance(data, dict):
-            raise WebSearchProviderError("Keenable returned an invalid payload.", ToolErrorType.HTTP_ERROR)
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            raise WebSearchProviderError(
+                "Keenable returned an invalid search response. Try again or choose another web search provider.",
+                ToolErrorType.HTTP_ERROR,
+            )
         results = [
             WebSearchResult(
                 title=str(item.get("title") or ""),
@@ -433,7 +436,7 @@ class KeenableSearchProvider(WebSearchProvider):
                 snippet=str(item.get("description") or item.get("snippet") or "")[:500],
                 site_name=_site_name(str(item["url"])),
             )
-            for item in data.get("results", [])
+            for item in data["results"]
             if isinstance(item, dict) and item.get("url")
         ]
         return WebSearchResponse(

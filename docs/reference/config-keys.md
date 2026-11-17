@@ -44,6 +44,7 @@ SELECT set_config('agent.name', '"MyAgent"'::jsonb);
 | `llm.chat.provider` | text | Conscious LLM provider |
 | `llm.chat.model` | text | Conscious LLM model |
 | `llm.chat.endpoint` | text | API endpoint URL |
+| `llm.chat.strip_leading_divider_models` | string[] | Optional exact model IDs needing opening-divider cleanup in chat; default `[]` (off) |
 | `llm.heartbeat.provider` | text | Heartbeat LLM provider (falls back to chat) |
 | `llm.heartbeat.model` | text | Heartbeat model |
 | `llm.subconscious.provider` | text | Subconscious LLM provider |
@@ -51,6 +52,50 @@ SELECT set_config('agent.name', '"MyAgent"'::jsonb);
 | `llm.guardrails.*` | text | Action-claim verifier LLM (falls back to subconscious) |
 | `llm.extraction.*` | text | Conscious-extraction LLM (falls back to subconscious) |
 | `llm.inbound_disposition` | object/null | Optional ambiguity-classifier override (falls back to `llm.subconscious`) |
+
+### Community-model opening dividers
+
+Some community models emit an unwanted `---`, `***`, or `___` before their
+answer, or return only a divider. If your chat model has this behavior, opt
+that exact model into cleanup. The setting lives inside the `llm.chat` JSON
+object; it is not a separate config row. To enable it for the currently
+configured chat model without replacing any other settings:
+
+```sql
+SELECT set_config(
+    'llm.chat',
+    jsonb_set(value, '{strip_leading_divider_models}',
+              jsonb_build_array(value->>'model'))
+)
+FROM config
+WHERE key = 'llm.chat' AND COALESCE(value->>'model', '') <> '';
+```
+
+No model is opted in automatically. Changing to an unlisted model disables
+cleanup. It applies only to chat replies, across providers, including streaming;
+heartbeat, ingestion, consent, and other structured model calls are unaffected.
+The stream holds the opening prefix until the first body line completes, then
+streams normally. Prefixes over 4096 characters are passed through unchanged.
+Internal dividers, code indentation, mixed punctuation, and recognizable YAML
+headers are preserved. The original provider response remains available to
+the caller for usage accounting.
+
+A literal opening horizontal rule is still ambiguous: leave cleanup off when
+you need verbatim Markdown or document output. To disable it again:
+
+```sql
+SELECT set_config(
+    'llm.chat', jsonb_set(value, '{strip_leading_divider_models}', '[]'::jsonb)
+)
+FROM config WHERE key = 'llm.chat';
+```
+
+If cleanup leaves neither answer text nor tool calls, the agent loop asks once
+for a substantive answer. If that also produces no answer or tools, the normal
+chat error flow explains how to recover rather than recording a blank success.
+Tool-only turns proceed normally, and both model calls are metered. The optional
+RLM chat runtime cleans only its final answer and surfaces a divider-only answer
+as an error; it never replays the REPL's actions to repair formatting.
 
 ## Heartbeat Configuration
 
