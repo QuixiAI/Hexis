@@ -158,7 +158,9 @@ def _resolve_noninteractive_endpoint(
     endpoint = (args.endpoint or "").strip()
     source = "--endpoint" if endpoint else ""
     if not endpoint and provider == "atlascloud":
-        endpoint = "https://api.atlascloud.ai/v1"
+        from core.llm import normalize_endpoint
+
+        endpoint = normalize_endpoint(provider, None) or ""
         source = "provider default"
     if not endpoint and provider == "openai_compatible":
         endpoint = os.getenv("OPENAI_BASE_URL", "").strip()
@@ -906,6 +908,16 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
                 else ""
             ),
         )
+    elif provider == "atlascloud":
+        from core.llm import normalize_endpoint
+
+        endpoint = _prompt(
+            "Atlas Cloud endpoint (blank for provider default)",
+            default=normalize_endpoint(provider, None) or "",
+        )
+        api_key_env = _prompt(
+            "API key env var name", default=_PROVIDER_ENV_VARS[provider], required=True
+        )
     elif provider == "azure_openai":
         endpoint = _prompt(
             "Azure OpenAI resource URL (https://<resource>.openai.azure.com)",
@@ -935,7 +947,7 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     except Exception as exc:
         catalog_error = str(exc)[:200]
         catalog = []
-    if provider == "openai_compatible" and not catalog:
+    if provider in {"openai_compatible", "atlascloud"} and not catalog:
         if catalog_error:
             err_console.print(f"[warn]Could not fetch endpoint models: {catalog_error}[/warn]")
         console.print("[muted]Enter the endpoint's exact model id to continue.[/muted]")
@@ -965,18 +977,12 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         api_key_env = _prompt(hint, default=_PROVIDER_ENV_VARS.get(provider, ""),
                               required=(provider == "azure_openai"))
         use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
-    elif provider != "openai_compatible":
+    elif provider not in {"openai_compatible", "atlascloud"}:
         endpoint = _prompt(
             "Endpoint (blank for provider default)",
             # Only OpenAI-shaped providers should inherit OPENAI_BASE_URL — don't
             # bleed it into Grok/Gemini/Anthropic (Bar #5).
-            default=(
-                "https://api.atlascloud.ai/v1"
-                if provider == "atlascloud"
-                else os.getenv("OPENAI_BASE_URL", "")
-                if provider in {"openai", "openai_compatible"}
-                else ""
-            ),
+            default=os.getenv("OPENAI_BASE_URL", "") if provider == "openai" else "",
         )
         api_key_env = _prompt(
             "API key env var name (e.g. OPENAI_API_KEY)",

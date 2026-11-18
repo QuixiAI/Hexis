@@ -5,7 +5,7 @@ auto-updating source over a hand-maintained list, treat it as advisory, and
 always allow a free-typed id.
 
   * most cloud providers → the models.dev catalog, cached on disk ~24h
-  * Atlas Cloud → its public model catalog, filtered to visible LLMs
+  * Atlas Cloud → the configured inference endpoint, filtered to text-generating models
   * on any failure → a short curated fallback; the model field stays free-text
 """
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pathlib import Path
 from core.integration_reliability import request_json
 
 MODELS_DEV_URL = "https://models.dev/api.json"
-ATLAS_MODELS_URL = "https://api.atlascloud.ai/api/v1/models"
 _CACHE = Path.home() / ".cache" / "hexis" / "models_dev.json"
 _CACHE_TTL = 24 * 3600
 _TIMEOUT = 12.0
@@ -206,28 +205,19 @@ async def fetch_models(
 ) -> list[str]:
     """Best-effort current chat model ids for *provider* (newest first)."""
     if provider == "atlascloud":
+        from core.init_api import list_endpoint_models
+        from core.llm import normalize_endpoint
+
+        default_endpoint = normalize_endpoint(provider, None) or ""
+        selected_endpoint = endpoint or default_endpoint
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         try:
-            data = await request_json(
-                "atlascloud_models",
-                "GET",
-                ATLAS_MODELS_URL,
-                timeout=_TIMEOUT,
-                attempts=2,
-                max_delay=2.0,
-            )
-            rows = data.get("data", []) if isinstance(data, dict) else []
-            models = [
-                str(row["model"])
-                for row in rows
-                if isinstance(row, dict)
-                and row.get("display_console") is True
-                and row.get("type") == "Text"
-                and "LLM" in (row.get("categories") or [])
-                and row.get("model")
-            ]
-            return models or _FALLBACK[provider]
+            models = await list_endpoint_models(provider, selected_endpoint, headers)
         except Exception:
+            if selected_endpoint.rstrip("/") != default_endpoint:
+                raise
             return _FALLBACK[provider]
+        return models
     if provider == "openai_compatible":
         if not endpoint:
             return []

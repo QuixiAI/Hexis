@@ -654,14 +654,37 @@ def describe_exception(exc: BaseException) -> str:
     return f"{name}: {text}" if text else name
 
 
+async def list_endpoint_models(
+    provider: str, endpoint: str, headers: dict[str, str]
+) -> list[str]:
+    """Read model IDs from an OpenAI-compatible inference endpoint."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(f"{endpoint.rstrip('/')}/models", headers=headers)
+    response.raise_for_status()
+    data = response.json()
+    rows = data.get("data") if isinstance(data, dict) else data
+    models: dict[str, None] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        model_id = _clean(row.get("id"))
+        output = row.get("output_modalities")
+        if provider == "atlascloud" and isinstance(output, list) and output and "text" not in output:
+            continue
+        if model_id:
+            models[model_id] = None
+
+    return list(models) if provider == "atlascloud" else sorted(models)
+
+
 async def list_models(role: str, raw: dict[str, Any]) -> dict[str, Any]:
     """Model ids the endpoint advertises, for the providers that have a list.
 
     Hosted providers without a public listing return an empty list; the
     wizard then falls back to its catalog or asks for a model id. Never raises.
     """
-    import httpx
-
     config = resolve_setup_config(role, raw)
     provider = config["provider"]
     result: dict[str, Any] = {"models": [], "key_source": config.get("key_source")}
@@ -695,15 +718,7 @@ async def list_models(role: str, raw: dict[str, Any]) -> dict[str, Any]:
     if config.get("api_key"):
         headers["Authorization"] = f"Bearer {config['api_key']}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{endpoint}/models", headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        rows = data.get("data") if isinstance(data, dict) else data
-        models = sorted(
-            {str(row.get("id")) for row in (rows or []) if isinstance(row, dict) and row.get("id")}
-        )
-        result["models"] = models
+        result["models"] = await list_endpoint_models(provider, endpoint, headers)
     except Exception as exc:  # noqa: BLE001 — advisory
         detail = describe_exception(exc)
         status, human = classify_llm_error(detail)

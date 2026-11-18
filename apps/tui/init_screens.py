@@ -49,7 +49,6 @@ def _plain(text: str, token: str = "text") -> Text:
 
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
-    "atlascloud": "deepseek-ai/deepseek-v4-pro",
     "openai": "gpt-4o",
     "openai-codex": "gpt-5.2",
     "grok": "grok-3",
@@ -213,7 +212,9 @@ class LLMConfigScreen(Screen):
     @staticmethod
     def _default_endpoint(provider: str) -> str:
         if provider == "atlascloud":
-            return "https://api.atlascloud.ai/v1"
+            from core.llm import normalize_endpoint
+
+            return normalize_endpoint(provider, None) or ""
         if provider == "openai":
             return os.getenv("OPENAI_BASE_URL", "")
         return ""
@@ -222,7 +223,8 @@ class LLMConfigScreen(Screen):
         provider_default = _normalize_provider(os.getenv("LLM_PROVIDER", "openai"))
         if provider_default not in _PROVIDER_ENV_VARS and provider_default not in _OAUTH_PROVIDERS:
             provider_default = "openai"
-        model_default = os.getenv("LLM_MODEL", _DEFAULT_MODELS.get(provider_default, "gpt-4o"))
+        fallback_model = "" if provider_default == "atlascloud" else "gpt-4o"
+        model_default = os.getenv("LLM_MODEL", _DEFAULT_MODELS.get(provider_default, fallback_model))
         endpoint_default = self._default_endpoint(provider_default)
         key_default = _PROVIDER_ENV_VARS.get(provider_default, "OPENAI_API_KEY")
 
@@ -290,7 +292,8 @@ class LLMConfigScreen(Screen):
     ) -> None:
         model_input = self.query_one("#model", Input)
         if not preserve_model or not model_input.value:
-            model_input.value = _DEFAULT_MODELS.get(provider, model_input.value or "gpt-4o")
+            fallback_model = "" if provider == "atlascloud" else model_input.value or "gpt-4o"
+            model_input.value = _DEFAULT_MODELS.get(provider, fallback_model)
 
         endpoint_input = self.query_one("#endpoint", Input)
         key_input = self.query_one("#api-key-env", Input)

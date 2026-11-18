@@ -78,34 +78,29 @@ def test_model_catalog_provider_mapping():
 
 
 @pytest.mark.asyncio
-async def test_atlascloud_catalog_filters_visible_llms(monkeypatch):
-    async def fake_request_json(*_args, **_kwargs):
-        return {
-            "data": [
-                {
-                    "model": "chat/model",
-                    "type": "Text",
-                    "categories": ["LLM"],
-                    "display_console": True,
-                },
-                {
-                    "model": "hidden/model",
-                    "type": "Text",
-                    "categories": ["LLM"],
-                    "display_console": False,
-                },
-                {
-                    "model": "image/model",
-                    "type": "Image",
-                    "categories": ["TEXT-TO-IMAGE"],
-                    "display_console": True,
-                },
-            ]
-        }
+async def test_atlascloud_catalog_uses_the_selected_inference_endpoint(monkeypatch):
+    import httpx
 
-    monkeypatch.setattr(model_catalog, "request_json", fake_request_json)
+    seen = []
 
-    assert await model_catalog.fetch_models("atlascloud") == ["chat/model"]
+    def send(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"data": [
+            {"id": "chat/model", "output_modalities": ["text"]},
+            {"id": "chat/model"},
+            {"id": "image/model", "output_modalities": ["image"]},
+            {"id": "custom/model"},
+        ]})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(send))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kw: client)
+
+    models = await model_catalog.fetch_models(
+        "atlascloud", endpoint="https://atlas-test.invalid/v1/", api_key="test-key"
+    )
+    assert models == ["chat/model", "custom/model"]
+    assert str(seen[0].url) == "https://atlas-test.invalid/v1/models"
+    assert seen[0].headers["Authorization"] == "Bearer test-key"
 
 
 def test_model_menu_filter_and_suppress():
