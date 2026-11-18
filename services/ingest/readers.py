@@ -845,8 +845,19 @@ class EpubReader(DocumentReader):
         author = book.get_metadata("DC", "creator")
         author_str = author[0][0] if author else "Unknown"
 
+        # The spine is the reading order; the manifest lists files in any order.
+        # Documents the spine does not name keep their manifest order after it.
+        documents = {
+            item.get_id(): item
+            for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)
+        }
+        ordered = [
+            documents.pop(idref) for idref, *_ in book.spine if idref in documents
+        ]
+        ordered.extend(documents.values())
+
         parts: list[str] = []
-        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        for item in ordered:
             soup = BeautifulSoup(item.get_body_content(), "html.parser")
             text = soup.get_text(separator="\n", strip=True)
             if text.strip():
@@ -874,17 +885,32 @@ class PptxReader(DocumentReader):
         parts: list[str] = []
         for i, slide in enumerate(prs.slides):
             slide_texts: list[str] = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for para in shape.text_frame.paragraphs:
-                        text = para.text.strip()
-                        if text:
-                            slide_texts.append(text)
+            cls._collect_shape_texts(slide.shapes, slide_texts)
             if slide_texts:
                 parts.append(f"[Slide {i + 1}]\n" + "\n".join(slide_texts))
 
         header = f"[Format: PPTX]\n[File: {file_path.name}]\n[Slides: {len(prs.slides)}]"
         return f"{header}\n\n" + "\n\n".join(parts)
+
+    @classmethod
+    def _collect_shape_texts(cls, shapes, texts: list[str]) -> None:
+        """Append the text of ``shapes`` in order, including grouped shapes and
+        tables; table rows are tab-separated, as in ``DocxReader``."""
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        for shape in shapes:
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                cls._collect_shape_texts(shape.shapes, texts)
+            elif shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    text = para.text.strip()
+                    if text:
+                        texts.append(text)
+            elif getattr(shape, "has_table", False):
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        texts.append("\t".join(cells))
 
 
 class XlsxReader(DocumentReader):

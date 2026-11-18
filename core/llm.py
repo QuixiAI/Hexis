@@ -560,6 +560,13 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
     auth_mode = config.get("auth_mode")
     if auth_mode:
         result["auth_mode"] = auth_mode
+    # Exact model IDs only. Merely selecting a provider or changing models
+    # must not enable a workaround intended for a particular community merge.
+    cleanup_models = config.get("strip_leading_divider_models")
+    if isinstance(cleanup_models, list):
+        result["strip_leading_divider_models"] = [
+            name for name in cleanup_models if isinstance(name, str) and name
+        ]
     return result
 
 

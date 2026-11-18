@@ -1389,9 +1389,14 @@ def build_parser() -> argparse.ArgumentParser:
     tools_web_provider = tools_web_sub.add_parser(
         "set-provider", help="Choose the web_search provider"
     )
+    from core.tools.web_search_providers import create_default_web_search_registry
+
     tools_web_provider.add_argument(
         "provider",
-        choices=["auto", "tavily", "brave", "searxng", "duckduckgo_lite", "bing_rss"],
+        choices=[
+            "auto",
+            *(provider.id for provider in create_default_web_search_registry().providers),
+        ],
         help="Provider id. Use auto to pick the best available provider.",
     )
     tools_web_provider.set_defaults(func="tools_web_search_set_provider")

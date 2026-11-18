@@ -1,5 +1,11 @@
 "use client";
 
+import {
+  SEARCH_PROVIDERS,
+  searchProvider,
+  searchConfigPlaceholder,
+  type SearchConfigProvider,
+} from "../../lib/search-providers";
 import { confirmAction } from "../../lib/confirm";
 import {
   Activity,
@@ -222,22 +228,6 @@ type FileAttachment = {
   unreadReason: string | null;
   error: string | null;
 };
-
-type SearchConfigProvider = "tavily" | "brave" | "searxng" | "auto";
-
-const SEARCH_CONFIG_PROVIDERS: { id: SearchConfigProvider; label: string }[] = [
-  { id: "tavily", label: "Tavily" },
-  { id: "brave", label: "Brave" },
-  { id: "searxng", label: "SearXNG" },
-  { id: "auto", label: "Auto" },
-];
-
-function searchConfigPlaceholder(provider: SearchConfigProvider): string {
-  if (provider === "brave") return "brave-... or env:BRAVE_SEARCH_API_KEY";
-  if (provider === "searxng") return "https://searxng.example";
-  if (provider === "auto") return "uses keyless fallback";
-  return "tvly-... or env:TAVILY_API_KEY";
-}
 
 const GMAIL_SETUP_STEPS = [
   "Open the Google setup page.",
@@ -1636,11 +1626,12 @@ export default function ChatPage() {
 
   const handleConfigureSearchTool = async () => {
     const value = searchConfigValue.trim();
-    if (searchConfigProvider !== "auto" && !value) {
+    const definition = searchProvider(searchConfigProvider);
+    if ((definition?.requires_credential || searchConfigProvider === "searxng") && !value) {
       setSearchConfigError(
         searchConfigProvider === "searxng"
           ? "Enter a SearXNG URL."
-          : `Enter a ${searchConfigProvider === "brave" ? "Brave" : "Tavily"} key or env reference.`
+          : `Enter a ${definition?.label} key or env reference.`
       );
       return;
     }
@@ -2590,7 +2581,7 @@ export default function ChatPage() {
                   }}
                   className="rounded-md border border-amber-200 bg-white px-3 py-2 text-sm"
                 >
-                  {SEARCH_CONFIG_PROVIDERS.map((provider) => (
+                  {SEARCH_PROVIDERS.map((provider) => (
                     <option key={provider.id} value={provider.id}>
                       {provider.label}
                     </option>
@@ -2600,7 +2591,7 @@ export default function ChatPage() {
                   value={searchConfigValue}
                   onChange={(event) => setSearchConfigValue(event.target.value)}
                   placeholder={searchConfigPlaceholder(searchConfigProvider)}
-                  disabled={searchConfigProvider === "auto"}
+                  disabled={!searchProvider(searchConfigProvider)?.credential_key && searchConfigProvider !== "searxng"}
                   className="min-w-0 flex-1 rounded-md border border-amber-200 bg-white px-3 py-2 text-sm disabled:bg-amber-100 disabled:text-amber-800"
                 />
                 <button onClick={handleConfigureSearchTool} disabled={searchConfigSaving} className="rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">{searchConfigSaving ? "Saving" : "Enable"}</button>
