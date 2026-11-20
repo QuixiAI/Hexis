@@ -1,4 +1,4 @@
-"""Hexis plugin: X/Twitter search via xAI live search (#99 extraction from core)."""
+"""Hexis plugin: X/Twitter research with search-provider fallback."""
 
 from __future__ import annotations
 
