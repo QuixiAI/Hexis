@@ -54,6 +54,7 @@ async def chat_json(
     fallback: dict[str, Any] | None = None,
     reasoning_effort: str | None = None,
     usage_source: str = "background",
+    on_recovery: Any | None = None,
 ) -> tuple[dict[str, Any], str]:
     fallback = fallback or {}
     response = await chat_completion(
@@ -61,20 +62,22 @@ async def chat_json(
         model=llm_config["model"],
         endpoint=llm_config.get("endpoint"),
         api_key=llm_config.get("api_key"),
+        fallbacks=llm_config.get("fallbacks"),
         auth_mode=llm_config.get("auth_mode"),
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
         response_format=response_format,
         reasoning_effort=reasoning_effort,
+        on_recovery=on_recovery,
     )
     # Every JSON call (subconscious appraisal, memory encoding, RecMem, …)
     # counts in Usage like the conversation does; it used to go unrecorded.
     from core.usage import record_llm_usage
 
     asyncio.ensure_future(record_llm_usage(
-        provider=llm_config["provider"],
-        model=llm_config["model"],
+        provider=response.get("provider", llm_config["provider"]),
+        model=response.get("model", llm_config["model"]),
         raw_response=response.get("raw"),
         operation="json",
         source=usage_source,

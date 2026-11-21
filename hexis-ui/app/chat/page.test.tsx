@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { isImageAttachmentFile, uploadFileName } from "./attachment-helpers";
@@ -93,6 +93,7 @@ describe("ChatPage attachments", () => {
   });
 
   afterEach(() => {
+    cleanup();
     vi.unstubAllGlobals();
     sessionStorage.clear();
   });
@@ -325,6 +326,12 @@ describe("ChatPage attachments", () => {
     });
     const addenda = (chatBodies[0].prompt_addenda as string[]).join("\n");
     expect(addenda).toContain("You have not read it");
+    // Wait until the streamed session is saved before clearing browser state.
+    await waitFor(() => {
+      expect(sessionStorage.getItem("hexis-chat-session-id")).toBe(
+        "00000000-0000-4000-8000-000000000001"
+      );
+    });
   });
 
   it("does not show a network error after the chat stream already completed", async () => {

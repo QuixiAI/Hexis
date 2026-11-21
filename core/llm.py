@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+from functools import wraps
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
@@ -221,14 +222,18 @@ def is_transient_error(exc: BaseException) -> bool:
     """True for failures that go away on their own: rate limits, server
     errors, timeouts, dropped connections. Same rule for every provider."""
     exc_str = str(exc).lower()
-    status = getattr(exc, 'status_code', None) or getattr(exc, 'status', None)
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    # Explicit client errors must not become transient because their body
+    # happens to contain words such as 'rate' or 'connection'.
+    if isinstance(status, int) and 400 <= status < 500 and status not in (408, 429):
+        return False
     return (
-        status in (429, 500, 502, 503, 504, 529)
-        or 'rate' in exc_str
-        or 'overloaded' in exc_str
-        or 'timeout' in exc_str
-        or 'timed out' in exc_str
-        or 'connection' in exc_str
+        status in (408, 429, 500, 502, 503, 504, 529)
+        or "rate" in exc_str
+        or "overloaded" in exc_str
+        or "timeout" in exc_str
+        or "timed out" in exc_str
+        or "connection" in exc_str
         or isinstance(exc, (ConnectionError, TimeoutError, OSError))
     )
 
@@ -238,6 +243,7 @@ async def _retry_on_transient(
     *,
     max_retries: int = _LLM_MAX_RETRIES,
     should_retry: Any | None = None,
+    on_recovery: Any | None = None,
 ) -> Any:
     """Retry an LLM call on transient errors (rate limits, server errors, network).
 
@@ -258,14 +264,26 @@ async def _retry_on_transient(
             if should_retry is not None and not should_retry():
                 is_transient = False
             if is_transient and attempt < max_retries - 1:
-                wait = _LLM_RETRY_BACKOFF_BASE ** attempt + _random.uniform(0.0, 1.0)
-                retry_after = getattr(exc, 'retry_after', None)
+                wait = _LLM_RETRY_BACKOFF_BASE**attempt + _random.uniform(0.0, 1.0)
+                retry_after = getattr(exc, "retry_after", None)
                 if retry_after:
                     wait = max(wait, float(retry_after))
                 wait = min(wait, _LLM_RETRY_MAX_WAIT)
                 logger.warning(
                     "LLM call failed (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt + 1, max_retries, wait, exc,
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    exc,
+                )
+                await _emit(
+                    on_recovery,
+                    {
+                        "kind": "transient_retry",
+                        "attempt": attempt + 1,
+                        "status_code": getattr(exc, "status_code", None),
+                        "wait_seconds": wait,
+                    },
                 )
                 await _asyncio.sleep(wait)
                 continue
@@ -564,6 +582,9 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
         result["strip_leading_divider_models"] = [
             name for name in cleanup_models if isinstance(name, str) and name
         ]
+    if isinstance(config.get("fallbacks"), list):
+        result["fallbacks"] = [dict(route) for route in config["fallbacks"]
+                               if isinstance(route, dict) and route.get("provider") and route.get("model")]
     return result
 
 
@@ -777,13 +798,46 @@ def _litellm_messages(
     """Messages in LiteLLM's (OpenAI chat) shape.
 
     For Anthropic-protocol targets the system parts become one system message
-    of content blocks with the cache breakpoint on the last stable block (see
-    _anthropic_system_blocks); every other provider receives the system
-    messages as they are — OpenAI and Gemini cache a stable prefix on their
-    own, and LiteLLM folds several system messages into the provider's single
-    instruction field, in order.
+    of content blocks with the cache breakpoint on the last stable block.
+    Codex lifts all instruction messages into a leading preamble, because its
+    backend rejects system-role input items. Other providers retain their
+    original message order and native prefix caching.
     """
-    converted = [{**msg, "content": _content_to_openai_chat(msg.get("content"))} for msg in messages]
+    converted = [
+        {**msg, "content": _content_to_openai_chat(msg.get("content"))}
+        for msg in messages
+    ]
+    if provider == "openai-codex":
+        # LiteLLM extracts only a leading run of string system messages into
+        # Responses.instructions. Later system messages (e.g. action receipts)
+        # otherwise leak into input, which ChatGPT rejects. Developer roles are
+        # also rewritten to system by LiteLLM. Lift all privileged instructions
+        # into the preamble, preserving their order and the full tool history.
+        instructions = []
+        rest = []
+        for msg in converted:
+            if msg.get("role") in {"system", "developer"}:
+                content = msg.get("content")
+                if isinstance(content, str):
+                    instructions.append({**msg, "role": "system"})
+                elif isinstance(content, list) and all(
+                    isinstance(part, dict) and part.get("type") == "text"
+                    for part in content
+                ):
+                    instructions.append(
+                        {
+                            **msg,
+                            "role": "system",
+                            "content": "\n".join(
+                                part.get("text", "") for part in content
+                            ),
+                        }
+                    )
+                else:
+                    raise ValueError("Codex instructions must contain text")
+            else:
+                rest.append(msg)
+        return [*instructions, *rest]
     if not _uses_anthropic_messages(provider, model):
         return converted
     parts, rest = _extract_system_parts(converted)
@@ -960,6 +1014,8 @@ def _build_request(
         # A parameter this model does not take (temperature on a reasoning
         # model, say) is left out rather than failing the call.
         "drop_params": True,
+        "timeout": 60.0,
+        "num_retries": 0,
         **connection,
     }
     if tools:
@@ -968,6 +1024,246 @@ def _build_request(
     return request, restore
 
 
+def _request_recovery(request, provider, callback):
+    """Expose safe recovery facts to both the caller and the next model attempt.
+
+    Never put provider error bodies in prompts: they can echo tokens or contain
+    untrusted text. This receipt describes infrastructure, not user behavior.
+    """
+    receipts = []
+    note = {"role": "system", "content": ""}
+
+    async def record(event):
+        receipts.append(event["kind"])
+        note["content"] = (
+            "[Runtime recovery notice — infrastructure event, not a user message] "
+            "This response encountered these recoverable failures: "
+            + ", ".join(receipts)
+            + ". "
+            "A retry or compatible request format is being used. Briefly acknowledge "
+            "the interruption when producing a conversational reply, then continue their request. "
+            "For structured output, preserve the required schema and format. "
+            "Do not claim tools or actions succeeded unless their results confirm it. "
+            "Infrastructure failures are not evidence that the user ignored or rejected you."
+        )
+        if not any(msg is note for msg in request["messages"]):
+            preamble_end = next(
+                (
+                    i
+                    for i, msg in enumerate(request["messages"])
+                    if msg.get("role") not in {"system", "developer"}
+                ),
+                len(request["messages"]),
+            )
+            request["messages"].insert(preamble_end, note)
+        await _emit(callback, event)
+
+    return record
+
+
+async def _compatible_completion(
+    factory, request, *, provider, on_recovery, should_retry=None
+):
+    """Bounded request adaptations, shared by buffered and streaming calls.
+
+    Only adapt explicit capability rejections. Never drop tools, instructions,
+    credentials, or change providers. Never replay a partially delivered stream.
+    """
+    adaptations = set()
+    while True:
+        try:
+            return await _retry_on_transient(
+                factory,
+                should_retry=should_retry,
+                on_recovery=on_recovery,
+            )
+        except Exception as exc:
+            if should_retry is not None and not should_retry():
+                raise
+            if not _is_request_rejected(exc):
+                raise
+            detail = str(exc).lower()
+            kind = None
+            if (
+                "system messages are not allowed" in detail
+                and "instruction_preamble_fallback" not in adaptations
+            ):
+                reshaped = _litellm_messages(
+                    request["messages"],
+                    provider="openai-codex",
+                    model="",
+                    auth_mode=None,
+                )
+                if reshaped != request["messages"]:
+                    request["messages"] = reshaped
+                    kind = "instruction_preamble_fallback"
+            elif "stream_options" in detail and "stream_options" in request:
+                request.pop("stream_options")
+                kind = "stream_options_fallback"
+            elif (
+                request.get("stream")
+                and (
+                    any(
+                        phrase in detail
+                        for phrase in (
+                            "streaming is not supported",
+                            "streaming not supported",
+                            "streaming is not allowed",
+                            "stream is not supported",
+                            "stream not supported",
+                            "stream is not allowed",
+                            "unsupported parameter: stream",
+                            "unsupported parameter: 'stream'",
+                            'unsupported parameter: "stream"',
+                            "unsupported value: 'stream'",
+                            'unsupported value: "stream"',
+                        )
+                    )
+                    or (
+                        "stream" in detail
+                        and "parameter" in detail
+                        and any(
+                            word in detail
+                            for word in ("unsupported", "not supported", "not allowed")
+                        )
+                    )
+                )
+            ):
+                request.pop("stream", None)
+                request.pop("stream_options", None)
+                kind = "buffered_response_fallback"
+            if kind is None:
+                raise
+            adaptations.add(kind)
+            await on_recovery({"kind": kind})
+
+
+def _with_fallbacks(call):
+    """Try only explicitly configured routes; never replay visible output.
+
+    A gateway route may itself implement free-cloud -> local failover. The
+    original messages and tools stay intact across each attempt.
+    """
+
+    @wraps(call)
+    async def run(
+        *, fallbacks=None, on_recovery=None, inference_timeout=120.0, **kwargs
+    ):
+        delivered = False
+        options = dict(kwargs)
+        for key in ("on_text_delta", "on_reasoning_delta"):
+            callback = options.get(key)
+            if callback is not None:
+
+                async def deliver(text, callback=callback):
+                    nonlocal delivered
+                    delivered = delivered or bool(text)
+                    await _emit(callback, text)
+
+                options[key] = deliver
+        import asyncio
+        import time
+
+        deadline = time.monotonic() + max(0.1, inference_timeout)
+        routes = [None, *(fallbacks or [])]
+        notices = []
+        last_error = None
+        for index, route in enumerate(routes):
+            attempt = dict(options)
+            try:
+                if route is not None:
+                    if fallbacks and deadline - time.monotonic() <= 0:
+                        raise last_error or TimeoutError(
+                            "Inference timeout budget exhausted"
+                        )
+                    from core.llm_config import apply_provider_credentials
+
+                    route_cfg = dict(route)
+                    await apply_provider_credentials(route_cfg)
+                    cfg = normalize_llm_config(route_cfg)
+                    attempt.update(
+                        {
+                            key: cfg.get(key)
+                            for key in (
+                                "provider",
+                                "model",
+                                "endpoint",
+                                "api_key",
+                                "auth_mode",
+                            )
+                        }
+                    )
+                    notice = {
+                        "kind": "model_fallback",
+                        "attempt": index,
+                        "provider": cfg["provider"],
+                        "model": cfg["model"],
+                        "previous_error_type": type(last_error).__name__,
+                    }
+                    notices.append(notice)
+                    await _emit(on_recovery, notice)
+                    runtime_notice = {
+                        "role": "system",
+                        "content": (
+                            "[Current response: verified runtime recovery facts] An inference request failed "
+                            f"({type(last_error).__name__}). This same agent's turn is continuing on a fallback inference route. "
+                            "When producing a conversational reply, briefly acknowledge the inference interruption "
+                            "and fallback, then continue the user's request. For structured output, preserve its schema. "
+                            "The underlying root cause is unconfirmed. Do not claim a dependency failed, a code fix "
+                            "was performed, or an old defect recurred unless independently verified. Do not claim "
+                            "unconfirmed tools or actions succeeded. This notice concerns the current response, "
+                            "not any remembered past incident. Preserve identity and boundaries."
+                        ),
+                    }
+                    preamble_end = next(
+                        (
+                            i
+                            for i, msg in enumerate(options["messages"])
+                            if msg.get("role") not in {"system", "developer"}
+                        ),
+                        len(options["messages"]),
+                    )
+                    attempt["messages"] = [
+                        *options["messages"][:preamble_end],
+                        runtime_notice,
+                        *options["messages"][preamble_end:],
+                    ]
+                if fallbacks:
+                    # Reserve time for every remaining route rather than let
+                    # primary retries consume the whole turn deadline.
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise last_error or TimeoutError(
+                            "Inference timeout budget exhausted"
+                        )
+                    attempt_budget = remaining / (len(routes) - index)
+                    result = await asyncio.wait_for(
+                        call(**attempt, on_recovery=on_recovery),
+                        timeout=attempt_budget,
+                    )
+                else:
+                    result = await call(**attempt, on_recovery=on_recovery)
+                if (
+                    index < len(routes) - 1
+                    and not (result.get("content") or "").strip()
+                    and not result.get("tool_calls")
+                ):
+                    raise RuntimeError("Inference returned no answer or tool calls")
+                if notices:
+                    result["provider"] = normalize_provider(attempt["provider"])
+                    result["model"] = attempt["model"]
+                    result["recoveries"] = notices
+                return result
+            except Exception as exc:
+                last_error = exc
+                if delivered or index == len(routes) - 1:
+                    raise
+        raise last_error
+
+    return run
+
+
+@_with_fallbacks
 async def chat_completion(
     *,
     provider: str,
@@ -981,6 +1277,7 @@ async def chat_completion(
     response_format: dict[str, Any] | None = None,
     auth_mode: str | None = None,
     reasoning_effort: str | None = None,
+    on_recovery: Any | None = None,
 ) -> dict[str, Any]:
     """One model turn. Returns ``{content, tool_calls, raw, finish_reason}``."""
     provider = normalize_provider(provider)
@@ -990,15 +1287,17 @@ async def chat_completion(
         from core.providers.google_code_assist import google_code_assist_completion
 
         access_token, project_id = _code_assist_credentials(api_key)
+        code_request = {"messages": [dict(message) for message in messages]}
+        recovery = _request_recovery(code_request, provider, on_recovery)
         result = await _retry_on_transient(lambda: google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
             project_id=project_id,
             model=model,
-            messages=messages,
+            messages=code_request["messages"],
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-        ))
+        ), on_recovery=recovery)
         result["content"] = strip_reasoning(result.get("content") or "")
         result.setdefault("finish_reason", "tool_calls" if result.get("tool_calls") else "stop")
         return result
@@ -1027,19 +1326,22 @@ async def chat_completion(
             "finish_reason": _finish_reason(getattr(choice, "finish_reason", None)),
         }
 
+    recovery = _request_recovery(request, provider, on_recovery)
     schema_rejection: Exception | None = None
     for _attempt in range(3):
         try:
-            result = await _retry_on_transient(_do_completion)
+            result = await _compatible_completion(_do_completion, request, provider=provider, on_recovery=recovery)
         except Exception as exc:
             if request.get("reasoning_effort") and _is_reasoning_unsupported_error(exc):
                 logger.warning("LLM %s at %s rejected reasoning effort; continuing without it: %s", model, endpoint, exc)
                 _reasoning_rejected.add(_reasoning_key(endpoint, model))
                 request.pop("reasoning_effort", None)
+                await recovery({"kind": "reasoning_parameter_fallback"})
                 continue
             if request.get("response_format") and _is_request_rejected(exc):
                 schema_rejection = exc
                 request.pop("response_format", None)
+                await recovery({"kind": "structured_output_fallback"})
                 continue
             raise
         if schema_rejection is not None:
@@ -1048,6 +1350,7 @@ async def chat_completion(
     raise RuntimeError(f"LLM endpoint {endpoint} rejected the request")
 
 
+@_with_fallbacks
 async def stream_chat_completion(
     *,
     provider: str,
@@ -1060,6 +1363,7 @@ async def stream_chat_completion(
     max_tokens: int = 1200,
     on_text_delta: Any | None = None,
     on_reasoning_delta: Any | None = None,
+    on_recovery: Any | None = None,
     auth_mode: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -1097,18 +1401,21 @@ async def stream_chat_completion(
         from core.providers.google_code_assist import stream_google_code_assist_completion
 
         access_token, project_id = _code_assist_credentials(api_key)
+        code_request = {"messages": [dict(message) for message in messages]}
+        recovery = _request_recovery(code_request, provider, on_recovery)
         result = await _retry_on_transient(
             lambda: stream_google_code_assist_completion(
                 endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
                 access_token=access_token,
                 project_id=project_id,
                 model=model,
-                messages=messages,
+                messages=code_request["messages"],
                 tools=tools,
                 is_antigravity=(provider == "google-antigravity"),
                 on_text_delta=_deliver_text if on_text_delta is not None else None,
             ),
             should_retry=_can_retry,
+            on_recovery=recovery,
         )
         result["content"] = strip_reasoning(result.get("content") or "")
         result.setdefault("finish_reason", "tool_calls" if result.get("tool_calls") else "stop")
@@ -1124,8 +1431,20 @@ async def stream_chat_completion(
     # metered like a plain one. Dropped for providers that do not take it.
     request["stream_options"] = {"include_usage": True}
 
+    recovery = _request_recovery(request, provider, on_recovery)
+
     async def _do_stream():
         response = await litellm.acompletion(**request)
+        if not request.get("stream"):
+            choice = response.choices[0]
+            content = strip_reasoning(getattr(choice.message, "content", None) or "")
+            await _deliver_text(content)
+            return {
+                "content": content,
+                "tool_calls": _restore_tool_names(_openai_tool_calls(getattr(choice.message, "tool_calls", None) or []), restore),
+                "raw": response,
+                "finish_reason": _finish_reason(getattr(choice, "finish_reason", None)),
+            }
         content_parts: list[str] = []
         finish: Any = None
         usage: Any = None
@@ -1176,7 +1495,8 @@ async def stream_chat_completion(
             "finish_reason": _finish_reason(finish or ("tool_calls" if tool_calls else "stop")),
         }
 
-    return await _retry_on_transient(_do_stream, should_retry=_can_retry)
+    return await _compatible_completion(_do_stream, request, provider=provider,
+                                        on_recovery=recovery, should_retry=_can_retry)
 
 
 async def stream_text_completion(
