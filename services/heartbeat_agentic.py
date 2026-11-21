@@ -14,7 +14,10 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from core.tools.config import ContextOverrides
 from services.agent import run_agent
-from services.heartbeat_prompt import render_heartbeat_decision_prompt_db
+from services.heartbeat_prompt import (
+    render_heartbeat_decision_prompt_db,
+    with_live_heartbeat_tools,
+)
 
 if TYPE_CHECKING:
     import asyncpg
@@ -97,6 +100,7 @@ async def run_agentic_heartbeat(
         else (bounded_plan_raw or plan)
     )
     context = plan.get("context") or context
+    context = await with_live_heartbeat_tools(context, registry)
     has_tasks = bool(plan.get("has_backlog_tasks"))
     if has_tasks:
         logger.info(

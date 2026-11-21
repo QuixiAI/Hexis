@@ -1105,7 +1105,7 @@ async def run_agent(
                     )
 
                     sub_memory_ctx = await render_heartbeat_decision_prompt_db(
-                        conn, heartbeat_context
+                        conn, heartbeat_context, tool_registry=registry
                     )
 
                 subconscious_output = await run_subconscious_appraisal(

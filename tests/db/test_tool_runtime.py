@@ -230,3 +230,100 @@ async def test_schedule_accepts_a_date_and_time(db_pool):
     assert with_offset["schedule"]["run_at"].startswith("2026-11-10T00:00:00")
     assert in_timezone["schedule_kind"] == "once"
     assert in_timezone["schedule"]["run_at"].startswith("2026-11-10T00:00:00")
+
+
+async def test_migration_0264_cleans_stale_agent_tools_config_rows(db_pool):
+    """#108: migration 0245 updated config_defaults.agent.tools, but existing
+    config rows shadowed it with 9 unregistered tool names. Migration 0264
+    cleans both string-array and object-array config rows non-destructively."""
+    from pathlib import Path
+    from core.tools.registry import create_default_registry
+
+    migration_sql = (
+        Path(__file__).resolve().parents[2]
+        / "db"
+        / "migrations"
+        / "0264_clean_stale_agent_tools_config.sql"
+    ).read_text(encoding="utf-8")
+    registered = set(create_default_registry(pool=None).list_names())
+
+    stale_strings = [
+        "recall",
+        "sense_memory_availability",
+        "request_background_search",
+        "recall_recent",
+        "recall_episode",
+        "explore_concept",
+        "explore_cluster",
+        "get_procedures",
+        "get_strategies",
+        "list_recent_episodes",
+        "create_goal",
+        "schedule_task",
+        "list_scheduled_tasks",
+        "update_scheduled_task",
+        "delete_scheduled_task",
+        "queue_user_message",
+        "self_repair",
+        "my_custom_tool",
+    ]
+    stale_objects = [
+        {"name": "recall", "enabled": True},
+        {"name": "recall_recent", "enabled": True},
+        {"name": "create_goal", "enabled": True},
+        {"name": "schedule_task", "enabled": True},
+        {"name": "delete_scheduled_task", "enabled": True},
+        {"name": "custom_tool", "enabled": True},
+    ]
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # 1. String-array shape (init_heartbeat_config / config_defaults)
+            await conn.execute(
+                "SELECT set_config('agent.tools', $1::jsonb)",
+                json.dumps(stale_strings),
+            )
+            await conn.execute(migration_sql)
+            cleaned = _coerce_json(
+                await conn.fetchval("SELECT get_config('agent.tools')")
+            )
+            assert cleaned == [
+                "recall",
+                "sense_memory_availability",
+                "request_background_search",
+                "explore_concept",
+                "get_procedures",
+                "get_strategies",
+                "manage_goals",
+                "manage_schedule",
+                "queue_user_message",
+                "self_repair",
+                "my_custom_tool",
+            ]
+            assert all(n in registered for n in cleaned if n != "my_custom_tool")
+
+            # Re-running is idempotent
+            await conn.execute(migration_sql)
+            assert _coerce_json(
+                await conn.fetchval("SELECT get_config('agent.tools')")
+            ) == cleaned
+
+            # 2. Object-array shape (apply_agent_config)
+            await conn.execute(
+                "SELECT set_config('agent.tools', $1::jsonb)",
+                json.dumps(stale_objects),
+            )
+            await conn.execute(migration_sql)
+            cleaned_objs = _coerce_json(
+                await conn.fetchval("SELECT get_config('agent.tools')")
+            )
+            assert cleaned_objs == [
+                {"name": "recall", "enabled": True},
+                {"name": "manage_goals", "enabled": True},
+                {"name": "manage_schedule", "enabled": True},
+                {"name": "custom_tool", "enabled": True},
+            ]
+        finally:
+            await tr.rollback()

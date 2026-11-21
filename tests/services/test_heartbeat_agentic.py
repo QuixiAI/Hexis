@@ -648,3 +648,57 @@ class TestAgenticFlag:
                 await conn.execute(
                     "DELETE FROM config WHERE key = 'heartbeat.use_agentic_loop'"
                 )
+
+
+async def test_run_agentic_heartbeat_derives_tools_from_registry(db_pool):
+    """#108: run_agentic_heartbeat replaces stale agent.tools with live enabled
+    ToolContext.HEARTBEAT handlers before rendering the prompt and calling run_agent."""
+    from types import SimpleNamespace
+    from core.tools.base import ToolContext
+
+    registry = _mock_registry(["recall", "manage_goals", "plugin_tool"])
+    registry.get_enabled_tools = AsyncMock(
+        return_value=[
+            SimpleNamespace(spec=SimpleNamespace(name="recall", allowed_contexts={ToolContext.HEARTBEAT})),
+            SimpleNamespace(spec=SimpleNamespace(name="manage_goals", allowed_contexts={ToolContext.HEARTBEAT})),
+            SimpleNamespace(spec=SimpleNamespace(name="plugin_tool", allowed_contexts={ToolContext.HEARTBEAT})),
+        ]
+    )
+
+    context = _mock_context()
+    context["agent"]["tools"] = ["recall_recent", "recall", "disabled_tool"]
+
+    captured: dict[str, Any] = {}
+
+    async def fake_run_agent(pool, reg, **kwargs):
+        captured["user_message"] = kwargs["user_message"]
+        captured["heartbeat_context"] = kwargs["heartbeat_context"]
+        return SimpleNamespace(
+            stopped_reason="completed",
+            text="done",
+            tool_calls_made=[],
+            energy_spent=0,
+            iterations=1,
+            timed_out=False,
+        )
+
+    async with db_pool.acquire() as conn:
+        with patch("services.heartbeat_agentic.run_agent", side_effect=fake_run_agent):
+            await run_agentic_heartbeat(
+                conn,
+                pool=db_pool,
+                registry=registry,
+                heartbeat_id=str(uuid.uuid4()),
+                context=context,
+            )
+
+    assert captured["heartbeat_context"]["agent"]["tools"] == [
+        "recall",
+        "manage_goals",
+        "plugin_tool",
+    ]
+    assert "recall_recent" not in captured["user_message"]
+    assert "disabled_tool" not in captured["user_message"]
+    assert "- recall" in captured["user_message"]
+    assert "- manage_goals" in captured["user_message"]
+    assert "- plugin_tool" in captured["user_message"]

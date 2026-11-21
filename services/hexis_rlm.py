@@ -644,6 +644,12 @@ async def run_heartbeat_decision(
     # Normalize LLM config
     llm_cfg = normalize_llm_config(llm_config)
 
+    # Derive advertised agent.tools from the live enabled heartbeat registry
+    # rather than relying on the static config copy.
+    from services.heartbeat_prompt import with_live_heartbeat_tools
+
+    turn_snapshot = await with_live_heartbeat_tools(turn_snapshot, tool_registry)
+
     # Create memory repo (psycopg2 sync)
     repo = MemoryRepo(dsn)
 

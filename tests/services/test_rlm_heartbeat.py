@@ -578,3 +578,187 @@ async def test_scheduled_heartbeats_get_the_persons_shell_permission(monkeypatch
             max_iterations=1, timeout_seconds=10,
         )
     assert seen["allow_shell"] is True and seen["allow_file_write"] is False
+
+
+class TestHeartbeatToolTruth:
+    """#108: Heartbeat advertised agent.tools must derive from the live
+    ToolRegistry (ToolContext.HEARTBEAT) rather than a stale static config list."""
+
+    @staticmethod
+    def _fake_handler(name: str, contexts: set | None = None):
+        from types import SimpleNamespace
+        from core.tools.base import ToolContext
+
+        allowed = contexts if contexts is not None else {ToolContext.HEARTBEAT}
+        return SimpleNamespace(spec=SimpleNamespace(name=name, allowed_contexts=allowed))
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_with_live_heartbeat_tools_derives_from_registry(self):
+        from core.tools.base import ToolContext
+        from services.heartbeat_prompt import with_live_heartbeat_tools
+
+        seen_contexts = []
+
+        class StubRegistry:
+            async def get_enabled_tools(self, context):
+                seen_contexts.append(context)
+                return [
+                    TestHeartbeatToolTruth._fake_handler("manage_goals"),
+                    TestHeartbeatToolTruth._fake_handler("recall"),
+                    TestHeartbeatToolTruth._fake_handler("custom_plugin_tool"),
+                ]
+
+        original = {
+            "energy": {"current": 10},
+            "agent": {
+                "objectives": ["Stay curious"],
+                "tools": [
+                    "recall_recent",
+                    "recall",
+                    "disabled_tool",
+                    {"name": "create_goal", "enabled": True},
+                ],
+            },
+        }
+        updated = await with_live_heartbeat_tools(original, StubRegistry())
+
+        assert seen_contexts == [ToolContext.HEARTBEAT]
+        # Preserves preferred ordering for enabled tools, drops dead/disabled,
+        # and appends newly enabled/plugin tools in sorted order.
+        assert updated["agent"]["tools"] == [
+            "recall",
+            "custom_plugin_tool",
+            "manage_goals",
+        ]
+        # Does not mutate caller's dict.
+        assert original["agent"]["tools"][0] == "recall_recent"
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_with_live_heartbeat_tools_respects_empty_enabled_list(self):
+        from services.heartbeat_prompt import with_live_heartbeat_tools
+
+        class AllDisabledRegistry:
+            async def get_enabled_tools(self, context):
+                return []
+
+        ctx = {"agent": {"tools": ["recall", "manage_goals"]}}
+        updated = await with_live_heartbeat_tools(ctx, AllDisabledRegistry())
+        assert updated["agent"]["tools"] == []
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_with_live_heartbeat_tools_falls_back_to_list_all_with_warning(self, caplog):
+        import logging
+        from core.tools.base import ToolContext
+        from services.heartbeat_prompt import with_live_heartbeat_tools
+
+        class FailingEnabledRegistry:
+            async def get_enabled_tools(self, context):
+                raise RuntimeError("db temporarily unavailable")
+
+            def list_all(self):
+                return [
+                    TestHeartbeatToolTruth._fake_handler("chat_only", {ToolContext.CHAT}),
+                    TestHeartbeatToolTruth._fake_handler("recall", {ToolContext.HEARTBEAT}),
+                ]
+
+        with caplog.at_level(logging.WARNING, logger="services.heartbeat_prompt"):
+            updated = await with_live_heartbeat_tools(
+                {"agent": {"tools": ["recall_recent"]}},
+                FailingEnabledRegistry(),
+            )
+
+        assert updated["agent"]["tools"] == ["recall"]
+        assert "falling back to registered tools" in caplog.text
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_run_heartbeat_decision_injects_live_registry_tools_into_repl(self, monkeypatch):
+        import services.hexis_rlm as hexis_rlm
+
+        captured = {}
+
+        class Stop(Exception):
+            pass
+
+        class StubREPL:
+            def setup(self, *, context_payload, **kwargs):
+                captured["repl_context"] = context_payload
+                raise Stop
+
+            def cleanup(self):
+                pass
+
+        class StubRegistry:
+            async def get_enabled_tools(self, context):
+                return [
+                    TestHeartbeatToolTruth._fake_handler("recall"),
+                    TestHeartbeatToolTruth._fake_handler("manage_goals"),
+                    TestHeartbeatToolTruth._fake_handler("plugin_tool"),
+                ]
+
+        monkeypatch.setattr(hexis_rlm, "MemoryRepo", lambda dsn: object())
+        monkeypatch.setattr(hexis_rlm, "HexisLocalREPL", StubREPL)
+
+        snapshot = {
+            "energy": {"current": 10},
+            "agent": {"tools": ["recall_recent", "recall", "create_goal"]},
+        }
+        with pytest.raises(Stop):
+            await hexis_rlm.run_heartbeat_decision(
+                heartbeat_id="hb-live-tools",
+                turn_snapshot=snapshot,
+                llm_config={"provider": "openai", "model": "stub"},
+                dsn="postgresql://unused",
+                tool_registry=StubRegistry(),
+                loop=asyncio.get_running_loop(),
+                max_iterations=1,
+                timeout_seconds=10,
+            )
+
+        assert captured["repl_context"]["agent"]["tools"] == [
+            "recall",
+            "manage_goals",
+            "plugin_tool",
+        ]
+        assert snapshot["agent"]["tools"] == ["recall_recent", "recall", "create_goal"]
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_legacy_heartbeat_decision_renders_live_registry_tools(self, monkeypatch):
+        import services.external_calls as external_calls
+
+        rendered_contexts = []
+
+        class StubConn:
+            async def fetchval(self, query, payload):
+                assert "render_heartbeat_decision_prompt" in query
+                rendered_contexts.append(json.loads(payload))
+                return "rendered prompt"
+
+        class StubRegistry:
+            async def get_enabled_tools(self, context):
+                return [
+                    TestHeartbeatToolTruth._fake_handler("recall"),
+                    TestHeartbeatToolTruth._fake_handler("self_repair"),
+                ]
+
+        async def fake_load_llm_config(conn, key):
+            return {"provider": "openai", "model": "stub"}
+
+        async def fake_chat_json(**kwargs):
+            return {"reasoning": "ok", "actions": [{"action": "rest", "params": {}}]}, "{}"
+
+        monkeypatch.setattr(external_calls, "load_llm_config", fake_load_llm_config)
+        monkeypatch.setattr(external_calls, "chat_json", fake_chat_json)
+
+        processor = external_calls.ExternalCallProcessor(tool_registry=StubRegistry())
+        await processor._process_heartbeat_decision_call(
+            StubConn(),
+            {
+                "heartbeat_id": "hb-legacy",
+                "context": {
+                    "agent": {"tools": ["recall_recent", "recall", "disabled_tool"]},
+                },
+            },
+        )
+
+        assert len(rendered_contexts) == 1
+        assert rendered_contexts[0]["agent"]["tools"] == ["recall", "self_repair"]
