@@ -157,7 +157,9 @@ class ExternalCallProcessor:
             max_tokens = 2048
         if max_tokens <= 0:
             max_tokens = 2048
-        user_prompt = await render_heartbeat_decision_prompt_db(conn, context)
+        user_prompt = await render_heartbeat_decision_prompt_db(
+            conn, context, tool_registry=self._tool_registry
+        )
         base_prompt = load_heartbeat_prompt().strip()
         system_prompt = (
             base_prompt
