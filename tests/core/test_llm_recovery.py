@@ -305,3 +305,74 @@ async def test_empty_success_response_uses_reserve(monkeypatch):
         ],
     )
     assert result["content"] == "reserve answer" and len(calls) == 2
+
+
+async def test_empty_response_without_fallbacks_preserves_finish_reason(monkeypatch):
+    async def complete(**request):
+        return NS(
+            choices=[NS(message=NS(content="", tool_calls=[]), finish_reason="length")]
+        )
+
+    monkeypatch.setattr(llm.litellm, "acompletion", complete)
+    result = await llm.chat_completion(
+        provider="openai",
+        model="primary",
+        endpoint=None,
+        api_key="k",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    assert result["content"] == ""
+    assert result["finish_reason"] == "length"
+
+
+async def test_unsupported_model_named_stream_does_not_disable_streaming(monkeypatch):
+    calls, events = [], []
+
+    async def complete(**request):
+        calls.append(deepcopy(request))
+        raise bad("Unsupported model: stream-v1")
+
+    monkeypatch.setattr(llm.litellm, "acompletion", complete)
+    with pytest.raises(llm.litellm.BadRequestError):
+        await llm.stream_chat_completion(
+            provider="openai",
+            model="stream-v1",
+            endpoint=None,
+            api_key="k",
+            messages=[{"role": "user", "content": "hello"}],
+            on_recovery=events.append,
+        )
+    assert len(calls) == 1
+    assert events == []
+
+
+async def test_fallback_route_resolves_its_own_provider_credentials(monkeypatch):
+    from core import llm_config
+
+    seen_keys = []
+
+    async def fake_apply(cfg):
+        if cfg.get("provider") == "chutes":
+            cfg["api_key"] = "fresh-chutes-token"
+        return cfg
+
+    async def complete(**request):
+        seen_keys.append(request.get("api_key"))
+        if len(seen_keys) == 1:
+            raise llm.litellm.AuthenticationError(
+                message="expired", model="m", llm_provider="openai"
+            )
+        return answer("Recovered via chutes")
+
+    monkeypatch.setattr(llm_config, "apply_provider_credentials", fake_apply)
+    monkeypatch.setattr(llm.litellm, "acompletion", complete)
+    result = await llm.chat_completion(
+        provider="openai",
+        model="primary",
+        endpoint=None,
+        api_key="primary-key",
+        messages=[{"role": "user", "content": "hello"}],
+        fallbacks=[{"provider": "chutes", "model": "reserve"}],
+    )
+    assert result["content"] == "Recovered via chutes"
+    assert seen_keys == ["primary-key", "fresh-chutes-token"]

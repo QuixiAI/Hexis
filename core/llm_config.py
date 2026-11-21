@@ -162,10 +162,14 @@ async def load_llm_config(
             fallback_routes = json.loads(fallback_routes)
         if isinstance(fallback_routes, list):
             cfg["fallbacks"] = fallback_routes
+    has_usable_fallback = any(
+        isinstance(route, dict) and route.get("provider") and route.get("model")
+        for route in (cfg.get("fallbacks") or [])
+    )
     try:
         await apply_provider_credentials(cfg)
     except Exception as exc:
-        if not cfg.get("fallbacks"):
+        if not has_usable_fallback:
             raise
         # Dispatch retries credential resolution and records any failure before
         # using the configured fallback. Expired primary auth must not prevent

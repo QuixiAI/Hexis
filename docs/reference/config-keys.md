@@ -67,7 +67,9 @@ primary retries cannot consume the whole turn. Already delivered text/reasoning
 is not replayed automatically. Runtime receipts inform the model and agent-turn
 event log; failed chat replies stay in continuity until a subsequent successful
 reply, with no age cutoff. Conversational replies are asked to acknowledge the
-interruption; structured calls retain their schema.
+interruption; if a provider rejects `response_format`, the retry omits
+provider-enforced schema validation and instructs the model to preserve the
+requested format.
 
 ### Community-model opening dividers
 

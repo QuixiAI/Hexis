@@ -12,11 +12,13 @@ RETURNS TEXT LANGUAGE sql STABLE AS $$
     END
     FROM agent_turns t
     WHERE t.session_id::text = p_session_id
-      AND t.mode = 'chat' AND t.status = 'failed'
+      AND t.mode = 'chat'
+      AND (t.status = 'failed' OR t.stopped_reason = 'timeout')
       AND t.created_at > COALESCE((
           SELECT MAX(ok.created_at) FROM agent_turns ok
           WHERE ok.session_id = t.session_id AND ok.mode = 'chat'
             AND ok.status = 'completed'
+            AND COALESCE(ok.stopped_reason, '') <> 'timeout'
       ), '-infinity'::timestamptz);
 $$;
 

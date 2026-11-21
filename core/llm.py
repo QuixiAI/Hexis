@@ -1101,12 +1101,33 @@ async def _compatible_completion(
                 request.pop("stream_options")
                 kind = "stream_options_fallback"
             elif (
-                "stream" in detail
-                and any(
-                    word in detail
-                    for word in ("unsupported", "not supported", "not allowed")
+                request.get("stream")
+                and (
+                    any(
+                        phrase in detail
+                        for phrase in (
+                            "streaming is not supported",
+                            "streaming not supported",
+                            "streaming is not allowed",
+                            "stream is not supported",
+                            "stream not supported",
+                            "stream is not allowed",
+                            "unsupported parameter: stream",
+                            "unsupported parameter: 'stream'",
+                            'unsupported parameter: "stream"',
+                            "unsupported value: 'stream'",
+                            'unsupported value: "stream"',
+                        )
+                    )
+                    or (
+                        "stream" in detail
+                        and "parameter" in detail
+                        and any(
+                            word in detail
+                            for word in ("unsupported", "not supported", "not allowed")
+                        )
+                    )
                 )
-                and request.get("stream")
             ):
                 request.pop("stream", None)
                 request.pop("stream_options", None)
@@ -1149,60 +1170,72 @@ def _with_fallbacks(call):
         last_error = None
         for index, route in enumerate(routes):
             attempt = dict(options)
-            if route is not None:
-                cfg = normalize_llm_config(route)
-                attempt.update(
-                    {
-                        key: cfg.get(key)
-                        for key in (
-                            "provider",
-                            "model",
-                            "endpoint",
-                            "api_key",
-                            "auth_mode",
-                        )
-                    }
-                )
-                notice = {
-                    "kind": "model_fallback",
-                    "attempt": index,
-                    "provider": cfg["provider"],
-                    "model": cfg["model"],
-                    "previous_error_type": type(last_error).__name__,
-                }
-                notices.append(notice)
-                await _emit(on_recovery, notice)
-                runtime_notice = {
-                    "role": "system",
-                    "content": (
-                        "[Current response: verified runtime recovery facts] An inference request failed "
-                        f"({type(last_error).__name__}). This same agent's turn is continuing on a fallback inference route. "
-                        "When producing a conversational reply, briefly acknowledge the inference interruption "
-                        "and fallback, then continue the user's request. For structured output, preserve its schema. "
-                        "The underlying root cause is unconfirmed. Do not claim a dependency failed, a code fix "
-                        "was performed, or an old defect recurred unless independently verified. Do not claim "
-                        "unconfirmed tools or actions succeeded. This notice concerns the current response, "
-                        "not any remembered past incident. Preserve identity and boundaries."
-                    ),
-                }
-                preamble_end = next(
-                    (
-                        i
-                        for i, msg in enumerate(options["messages"])
-                        if msg.get("role") not in {"system", "developer"}
-                    ),
-                    len(options["messages"]),
-                )
-                attempt["messages"] = [
-                    *options["messages"][:preamble_end],
-                    runtime_notice,
-                    *options["messages"][preamble_end:],
-                ]
             try:
+                if route is not None:
+                    if fallbacks and deadline - time.monotonic() <= 0:
+                        raise last_error or TimeoutError(
+                            "Inference timeout budget exhausted"
+                        )
+                    from core.llm_config import apply_provider_credentials
+
+                    route_cfg = dict(route)
+                    await apply_provider_credentials(route_cfg)
+                    cfg = normalize_llm_config(route_cfg)
+                    attempt.update(
+                        {
+                            key: cfg.get(key)
+                            for key in (
+                                "provider",
+                                "model",
+                                "endpoint",
+                                "api_key",
+                                "auth_mode",
+                            )
+                        }
+                    )
+                    notice = {
+                        "kind": "model_fallback",
+                        "attempt": index,
+                        "provider": cfg["provider"],
+                        "model": cfg["model"],
+                        "previous_error_type": type(last_error).__name__,
+                    }
+                    notices.append(notice)
+                    await _emit(on_recovery, notice)
+                    runtime_notice = {
+                        "role": "system",
+                        "content": (
+                            "[Current response: verified runtime recovery facts] An inference request failed "
+                            f"({type(last_error).__name__}). This same agent's turn is continuing on a fallback inference route. "
+                            "When producing a conversational reply, briefly acknowledge the inference interruption "
+                            "and fallback, then continue the user's request. For structured output, preserve its schema. "
+                            "The underlying root cause is unconfirmed. Do not claim a dependency failed, a code fix "
+                            "was performed, or an old defect recurred unless independently verified. Do not claim "
+                            "unconfirmed tools or actions succeeded. This notice concerns the current response, "
+                            "not any remembered past incident. Preserve identity and boundaries."
+                        ),
+                    }
+                    preamble_end = next(
+                        (
+                            i
+                            for i, msg in enumerate(options["messages"])
+                            if msg.get("role") not in {"system", "developer"}
+                        ),
+                        len(options["messages"]),
+                    )
+                    attempt["messages"] = [
+                        *options["messages"][:preamble_end],
+                        runtime_notice,
+                        *options["messages"][preamble_end:],
+                    ]
                 if fallbacks:
                     # Reserve time for every remaining route rather than let
                     # primary retries consume the whole turn deadline.
-                    remaining = max(0.1, deadline - time.monotonic())
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise last_error or TimeoutError(
+                            "Inference timeout budget exhausted"
+                        )
                     attempt_budget = remaining / (len(routes) - index)
                     result = await asyncio.wait_for(
                         call(**attempt, on_recovery=on_recovery),
@@ -1210,8 +1243,10 @@ def _with_fallbacks(call):
                     )
                 else:
                     result = await call(**attempt, on_recovery=on_recovery)
-                if not (result.get("content") or "").strip() and not result.get(
-                    "tool_calls"
+                if (
+                    index < len(routes) - 1
+                    and not (result.get("content") or "").strip()
+                    and not result.get("tool_calls")
                 ):
                     raise RuntimeError("Inference returned no answer or tool calls")
                 if notices:
