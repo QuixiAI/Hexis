@@ -151,7 +151,17 @@ INSERT INTO config_defaults (key, value, description) VALUES
     (
         'integrations.gmail.ambient_poll_interval_seconds',
         '900'::jsonb,
-        'How often the ongoing-sync ambient responsibility (#110) re-checks Gmail for new messages after a backfill runs.'
+        'Legacy poll interval for Gmail ambient responsibilities; incremental Gmail sync uses integrations.gmail.incremental_sync_interval_seconds.'
+    ),
+    (
+        'integrations.gmail.incremental_sync_interval_seconds',
+        '300'::jsonb,
+        'How often the maintenance worker checks Gmail history.list for newly arrived messages.'
+    ),
+    (
+        'integrations.gmail.incremental_sync_max_messages',
+        '100'::jsonb,
+        'Maximum number of newly arrived Gmail messages processed per incremental sync pass.'
     )
 ON CONFLICT (key) DO UPDATE SET
     value = EXCLUDED.value,
@@ -792,6 +802,17 @@ BEGIN
         completed_at = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = p_attempt_id;
+
+    -- Recover errored sync cursors for this connection on reconnect (#110).
+    IF to_regclass('public.connector_sync_cursors') IS NOT NULL THEN
+        UPDATE connector_sync_cursors
+        SET status = 'active',
+            last_error = NULL,
+            last_started_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE connection_id = row_connection.id
+          AND status = 'error';
+    END IF;
 
     RETURN jsonb_build_object(
         'attempt_id', row_attempt.id::text,

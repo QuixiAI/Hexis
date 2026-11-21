@@ -118,11 +118,10 @@ async def test_connector_backfill_job_cursor_lifecycle(db_pool):
     assert status["jobs"][0]["status"] == "completed"
 
 
-async def test_enqueue_gmail_backfill_creates_ongoing_sync_responsibility(db_pool):
-    """#110: a Gmail backfill previously had no ongoing-sync mechanism --
-    the ambient responsibility evaluator was fully implemented but nothing
-    ever created a row for it to evaluate. Enqueuing a backfill now ensures
-    one exists, idempotently."""
+async def test_enqueue_gmail_backfill_does_not_create_synthetic_ambient_responsibility(db_pool):
+    """#110: ongoing Gmail sync is handled directly by incremental history.list
+    sync on connector_sync_cursors rather than a synthetic system ambient
+    responsibility that spams outbox notifications."""
     marker = get_test_identifier("connector-ambient")
 
     async with db_pool.acquire() as conn:
@@ -137,32 +136,198 @@ async def test_enqueue_gmail_backfill_creates_ongoing_sync_responsibility(db_poo
 
             rows = await conn.fetch(
                 """
-                SELECT id, status, sources FROM ambient_responsibilities
-                WHERE sources @> jsonb_build_array(
-                    jsonb_build_object('connector_id', 'gmail', 'account_key', $1::text)
-                )
+                SELECT id FROM ambient_responsibilities
+                WHERE created_by = 'system'
+                  AND title = 'Ongoing Gmail sync'
+                  AND sources @> jsonb_build_array(
+                      jsonb_build_object('connector_id', 'gmail', 'account_key', $1::text)
+                  )
                 """,
                 account.lower(),
             )
-            assert len(rows) == 1
-            assert rows[0]["status"] in ("active", "proposed", "blocked")
+            assert rows == []
+        finally:
+            await tr.rollback()
 
-            # A second backfill for the same account must not duplicate it.
+
+async def test_claim_due_gmail_incremental_syncs_respects_memory_policy_and_backfill_state(db_pool):
+    """#110: incremental Gmail sync respects integrations.gmail.memory_policy
+    ('forget' never syncs, 'remember' auto-syncs connected accounts, 'ask' syncs
+    opted-in cursors) and never races active or truncated backfills."""
+    marker = get_test_identifier("gmail-inc-claim")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Isolate from any pre-existing gmail connections in the test DB.
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail'"
+            )
+            account = await _connected_gmail(conn, marker)
+
+            # 1. memory_policy='ask' without a cursor -> not claimed.
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"ask\"'::jsonb)")
+            assert _j(await conn.fetchval("SELECT claim_due_gmail_incremental_syncs(5)")) == []
+
+            # 2. memory_policy='forget' even with a cursor -> never claimed.
             await conn.fetchval(
-                "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages')",
+                "SELECT advance_connector_cursor('gmail', $1, 'messages', '{\"history_id\": \"100\"}'::jsonb, CURRENT_TIMESTAMP)",
                 account,
             )
-            rows_again = await conn.fetch(
+            await conn.execute(
+                "UPDATE connector_sync_cursors SET last_completed_at = CURRENT_TIMESTAMP - INTERVAL '1 hour' WHERE account_key = $1",
+                account,
+            )
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"forget\"'::jsonb)")
+            assert _j(await conn.fetchval("SELECT claim_due_gmail_incremental_syncs(5)")) == []
+
+            # 3. memory_policy='ask' with an opted-in completed cursor -> claimed once, then backs off.
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"ask\"'::jsonb)")
+            claimed = _j(await conn.fetchval("SELECT claim_due_gmail_incremental_syncs(5)"))
+            assert len(claimed) == 1
+            assert claimed[0]["account_key"] == account
+            assert claimed[0]["cursor_value"]["history_id"] == "100"
+            # Immediately calling again backs off because last_started_at was stamped.
+            assert _j(await conn.fetchval("SELECT claim_due_gmail_incremental_syncs(5)")) == []
+
+            # 4. Leftover page_token (unfinished paginated backfill) is not claimed for incremental sync.
+            await conn.execute(
                 """
-                SELECT id FROM ambient_responsibilities
-                WHERE sources @> jsonb_build_array(
-                    jsonb_build_object('connector_id', 'gmail', 'account_key', $1::text)
+                UPDATE connector_sync_cursors
+                SET cursor_value = '{"history_id": "100", "page_token": "page-2"}'::jsonb,
+                    last_started_at = CURRENT_TIMESTAMP - INTERVAL '1 hour',
+                    last_completed_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                WHERE account_key = $1
+                """,
+                account,
+            )
+            assert _j(await conn.fetchval("SELECT claim_due_gmail_incremental_syncs(5)")) == []
+
+            # 5. memory_policy='remember' auto-claims a newly connected Gmail account with no cursor yet.
+            account2 = await _connected_gmail(conn, f"{marker}-remember")
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+            claimed_new = _j(await conn.fetchval("SELECT claim_due_gmail_incremental_syncs(5)"))
+            assert [c["account_key"] for c in claimed_new] == [account2]
+        finally:
+            await tr.rollback()
+
+
+async def test_migration_0265_retires_synthetic_sync_and_recovers_stalled_cursor(db_pool):
+    """#110: migration 0265 disables system 'Ongoing Gmail sync' rows (without
+    touching user monitors), recovers pre-0246 stalled cursors with leftover
+    page_token, and reconnect clears errored cursors."""
+    from pathlib import Path
+
+    migration_sql = (
+        Path(__file__).resolve().parents[2]
+        / "db"
+        / "migrations"
+        / "0265_gmail_incremental_sync.sql"
+    ).read_text(encoding="utf-8")
+    marker = get_test_identifier("mig-0265")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            account = await _connected_gmail(conn, marker)
+            # Seed a synthetic system responsibility (as 0246 created) AND a user monitor.
+            sys_resp = _j(await conn.fetchval(
+                "SELECT create_ambient_responsibility($1::jsonb)",
+                json.dumps({
+                    "title": "Ongoing Gmail sync",
+                    "user_intent": "Keep ingesting new Gmail messages",
+                    "kind": "monitor",
+                    "created_by": "system",
+                    "sources": [{"connector_id": "gmail", "account_key": account}],
+                }),
+            ))
+            user_resp = _j(await conn.fetchval(
+                "SELECT create_ambient_responsibility($1::jsonb)",
+                json.dumps({
+                    "title": f"Watch Alice emails {marker}",
+                    "user_intent": "Tell me when Alice emails",
+                    "kind": "monitor",
+                    "created_by": "user",
+                    "sources": [{"connector_id": "gmail", "account_key": account, "from": "alice@example.com"}],
+                }),
+            ))
+
+            # Seed a stalled cursor (leftover page_token, no pending/in_progress job).
+            await conn.fetchval(
+                """
+                SELECT advance_connector_cursor(
+                    'gmail', $1, 'messages',
+                    '{"page_token": "stuck-page-2", "history_id": "200"}'::jsonb,
+                    CURRENT_TIMESTAMP - INTERVAL '2 days'
                 )
                 """,
-                account.lower(),
+                account,
             )
-            assert len(rows_again) == 1
-            assert rows_again[0]["id"] == rows[0]["id"]
+            before_status = _j(await conn.fetchval("SELECT get_connector_backfill_status('gmail', $1)", account))
+            assert before_status["cursors"][0]["stalled"] is True
+            assert before_status["cursors"][0]["sync_age_seconds"] is not None
+
+            # Run migration 0265.
+            await conn.execute(migration_sql)
+
+            sys_status = await conn.fetchval(
+                "SELECT status FROM ambient_responsibilities WHERE id = $1::uuid",
+                sys_resp["output"]["responsibility_id"],
+            )
+            user_status = await conn.fetchval(
+                "SELECT status FROM ambient_responsibilities WHERE id = $1::uuid",
+                user_resp["output"]["responsibility_id"],
+            )
+            after_status = _j(await conn.fetchval("SELECT get_connector_backfill_status('gmail', $1)", account))
+
+            assert sys_status == "disabled"
+            assert user_status == "active"
+            assert after_status["cursors"][0]["stalled"] is False
+            assert any(j["status"] == "pending" for j in after_status["jobs"])
+
+            # Errored cursor recovers to active when Gmail reconnects.
+            conn_id = after_status["cursors"][0]["connection_id"]
+            await conn.fetchval(
+                "SELECT record_gmail_incremental_sync_error($1::uuid, 'messages', 'token revoked', TRUE)",
+                conn_id,
+            )
+            err_cursor = await conn.fetchrow(
+                "SELECT status, last_error FROM connector_sync_cursors WHERE connection_id = $1::uuid",
+                conn_id,
+            )
+            assert err_cursor["status"] == "error"
+            assert err_cursor["last_error"] == "token revoked"
+
+            # Reconnect via complete_connection_attempt.
+            attempt = _j(await conn.fetchval(
+                """
+                SELECT start_connection_attempt(
+                    'gmail', '["read", "search"]'::jsonb, ARRAY[]::text[], '{}'::jsonb,
+                    NULL, NULL, 'test', $1, CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+                )
+                """,
+                f"{marker}-reconnect",
+            ))
+            await conn.fetchval(
+                """
+                SELECT complete_connection_attempt(
+                    $1::uuid, $2, $2, 'integration.gmail.default',
+                    ARRAY['https://www.googleapis.com/auth/gmail.readonly']::text[],
+                    '["read", "search"]'::jsonb, '{"test": true}'::jsonb
+                )
+                """,
+                attempt["attempt_id"],
+                account,
+            )
+            recovered_cursor = await conn.fetchrow(
+                "SELECT status, last_error, last_started_at FROM connector_sync_cursors WHERE connection_id = $1::uuid",
+                conn_id,
+            )
+            assert recovered_cursor["status"] == "active"
+            assert recovered_cursor["last_error"] is None
+            assert recovered_cursor["last_started_at"] is None
         finally:
             await tr.rollback()
 

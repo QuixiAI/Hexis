@@ -23,6 +23,7 @@ from services.connector_cognition import (
 )
 from services.gmail_backfill import (
     GmailBackfillError,
+    GmailPermissionError,
     _connected_account_email,
     _gmail_get,
     _upsert_source_item,
@@ -849,10 +850,17 @@ async def run_ambient_responsibility_step(
             status, decision, observations = await evaluate_ambient_responsibility(
                 pool, claim
             )
-        except (GmailBackfillError, GmailOAuthError) as exc:
+        except (GmailPermissionError, GmailOAuthError) as exc:
             status, decision, observations = (
                 "blocked",
                 {"reason": "provider_unavailable", "error": str(exc)},
+                [],
+            )
+        except GmailBackfillError as exc:
+            logger.warning("Ambient Gmail evaluation failed transiently: %s", exc)
+            status, decision, observations = (
+                "failed",
+                {"reason": "provider_transient_error", "error": str(exc)},
                 [],
             )
         except Exception as exc:

@@ -398,3 +398,114 @@ async def test_metric_threshold_blocks_without_provider_and_fires_with_current_v
                 "DELETE FROM ambient_responsibilities WHERE title = ANY($1::text[])",
                 [missing_title, ready_title],
             )
+
+
+async def test_transient_gmail_error_retries_instead_of_permanently_blocking(db_pool, monkeypatch):
+    """#110: a transient Gmail API error (GmailBackfillError) must mark the run
+    failed (with backoff retry, keeping status='active'), while a permission/auth
+    error marks it blocked."""
+    from services import ambient_responsibilities
+    from services.gmail_backfill import GmailBackfillError, GmailPermissionError
+
+    marker = get_test_identifier("ambient-gmail-err")
+    title = f"ambient gmail transient {marker}"
+    account = f"eric-{marker}@example.com"
+
+    async with db_pool.acquire() as conn:
+        attempt = _coerce_json(
+            await conn.fetchval(
+                """
+                SELECT start_connection_attempt(
+                    'gmail',
+                    '["read", "search"]'::jsonb,
+                    ARRAY[]::text[],
+                    '{}'::jsonb,
+                    NULL,
+                    NULL,
+                    'test',
+                    $1,
+                    CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+                )
+                """,
+                marker,
+            )
+        )
+        await conn.fetchval(
+            """
+            SELECT complete_connection_attempt(
+                $1::uuid,
+                $2,
+                $2,
+                'integration.gmail.default',
+                ARRAY['https://www.googleapis.com/auth/gmail.readonly']::text[],
+                '["read", "search"]'::jsonb,
+                '{"test": true}'::jsonb
+            )
+            """,
+            attempt["attempt_id"],
+            account,
+        )
+        created = _coerce_json(
+            await conn.fetchval(
+                "SELECT manage_ambient_responsibility_tool($1::jsonb)",
+                json.dumps(
+                    {
+                        "action": "create",
+                        "title": title,
+                        "kind": "monitor",
+                        "user_intent": "Watch for emails from Alice.",
+                        "trigger": {"kind": "interval", "every_seconds": 60},
+                        "sources": [{"connector_id": "gmail", "account_key": account, "from": "alice@example.com"}],
+                    }
+                ),
+            )
+        )
+        resp_id = created["output"]["responsibility_id"]
+        await conn.execute(
+            "UPDATE ambient_responsibilities SET next_check_at = NOW() - INTERVAL '1 second' WHERE id = $1::uuid",
+            resp_id,
+        )
+
+    try:
+        async def transient_boom(pool, claim):
+            raise GmailBackfillError("Gmail 503 temporary outage")
+
+        monkeypatch.setattr(ambient_responsibilities, "_evaluate_gmail", transient_boom)
+        res1 = await run_ambient_responsibility_step(db_pool, limit=5)
+        assert res1["failed"] >= 1
+
+        async with db_pool.acquire() as conn:
+            row1 = await conn.fetchrow(
+                "SELECT status, next_check_at, consecutive_errors FROM ambient_responsibilities WHERE id = $1::uuid",
+                resp_id,
+            )
+        assert row1["status"] == "active"
+        assert row1["next_check_at"] is not None
+        assert row1["consecutive_errors"] >= 1
+
+        # Now simulate a real permission error -> should become blocked.
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE ambient_responsibilities SET next_check_at = NOW() - INTERVAL '1 second', cooldown_until = NULL WHERE id = $1::uuid",
+                resp_id,
+            )
+
+        async def perm_boom(pool, claim):
+            raise GmailPermissionError("Missing mail permission")
+
+        monkeypatch.setattr(ambient_responsibilities, "_evaluate_gmail", perm_boom)
+        res2 = await run_ambient_responsibility_step(db_pool, limit=5)
+        assert res2["blocked"] >= 1
+
+        async with db_pool.acquire() as conn:
+            row2 = await conn.fetchrow(
+                "SELECT status, next_check_at FROM ambient_responsibilities WHERE id = $1::uuid",
+                resp_id,
+            )
+        assert row2["status"] == "blocked"
+        assert row2["next_check_at"] is None
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM ambient_responsibilities WHERE title = $1", title)
+            await conn.execute("DELETE FROM integration_connections WHERE account_key = $1", account)
+            await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)

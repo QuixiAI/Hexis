@@ -39,6 +39,10 @@ class GmailPermissionError(GmailBackfillError):
     """Google didn't grant mail access; retrying can't help, only signing in again."""
 
 
+class GmailNotFoundError(GmailBackfillError):
+    """Gmail returned 404 (expired historyId or deleted message)."""
+
+
 GMAIL_READ_SCOPES = {
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
@@ -48,6 +52,44 @@ NO_MAIL_PERMISSION = (
     "Google didn't give Hexis permission to read this mailbox. Sign in to Gmail again "
     "(Connections → Gmail), and on Google's screen make sure the box to read your email is ticked."
 )
+NO_CREDENTIALS_MESSAGE = (
+    "Saved Gmail credentials are missing. Sign in to Gmail again "
+    "(Connections → Gmail) to resume email sync."
+)
+
+
+def _max_history_id(current: Any, candidate: Any) -> str | None:
+    """Keep the newest (highest numeric) Gmail historyId.
+
+    Gmail /users/me/messages returns newest-first, so blindly overwriting
+    history_id during backfill walks it backwards. Numeric IDs compare by
+    integer value; non-numeric fixtures preserve the first seen value.
+    """
+    cur = str(current).strip() if current is not None and str(current).strip() else None
+    cand = str(candidate).strip() if candidate is not None and str(candidate).strip() else None
+    if not cur:
+        return cand
+    if not cand:
+        return cur
+    cur_is_int = cur.isdigit()
+    cand_is_int = cand.isdigit()
+    if cur_is_int and cand_is_int:
+        return str(max(int(cur), int(cand)))
+    if cand_is_int and not cur_is_int:
+        return cand
+    return cur
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
 
 
 def _json(value: Any) -> Any:
@@ -241,6 +283,8 @@ async def _gmail_get(
     except IntegrationHttpError as exc:
         if exc.status_code == 403 and "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in (exc.response_body or ""):
             raise GmailPermissionError(NO_MAIL_PERMISSION) from exc
+        if exc.status_code == 404:
+            raise GmailNotFoundError(format_provider_error("Gmail", exc)) from exc
         raise GmailBackfillError(format_provider_error("Gmail", exc)) from exc
     if not isinstance(payload, dict):
         raise GmailBackfillError("Gmail API returned an invalid payload.")
@@ -504,6 +548,7 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
                     params={"format": "full"},
                 )
                 items_seen += 1
+                last_history_id = _max_history_id(last_history_id, message.get("historyId"))
                 if options["skip_unimportant"] and not worth_reading(message):
                     items_skipped += 1
                     continue
@@ -513,7 +558,7 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
                 await _upsert_source_item(pool, job, source)
                 items_stored += 1
                 last_message_id = source["provider_item_id"]
-                last_history_id = source["metadata"].get("gmail_history_id") or last_history_id
+                last_history_id = _max_history_id(last_history_id, source["metadata"].get("gmail_history_id"))
                 timestamp = source.get("item_timestamp")
                 if isinstance(timestamp, datetime) and (
                     high_watermark is None or timestamp > high_watermark
@@ -589,18 +634,471 @@ async def process_gmail_backfill_job(pool: Any, job: dict[str, Any]) -> dict[str
         return await _fail_job(pool, job_id, str(exc))
 
 
+async def _advance_cursor(
+    pool: Any,
+    connector_id: str,
+    account_key: str,
+    cursor_key: str,
+    cursor_value: dict[str, Any],
+    high_watermark: datetime | None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    async with pool.acquire() as conn:
+        raw = await conn.fetchval(
+            """
+            SELECT advance_connector_cursor(
+                $1,
+                $2,
+                $3,
+                $4::jsonb,
+                $5,
+                $6::jsonb
+            )
+            """,
+            connector_id,
+            account_key,
+            cursor_key,
+            _json_dumps(cursor_value),
+            high_watermark,
+            _json_dumps(metadata or {}),
+        )
+    return _json(raw) or {}
+
+
+async def _record_incremental_error(
+    pool: Any,
+    connection_id: str,
+    cursor_key: str,
+    error: str,
+    *,
+    needs_reauth: bool = False,
+) -> dict[str, Any]:
+    async with pool.acquire() as conn:
+        raw = await conn.fetchval(
+            """
+            SELECT record_gmail_incremental_sync_error(
+                $1::uuid,
+                $2,
+                $3,
+                $4::boolean
+            )
+            """,
+            connection_id,
+            cursor_key,
+            error[:2000],
+            needs_reauth,
+        )
+    return _json(raw) or {}
+
+
+async def _mark_connection_needs_reauth(pool: Any, connection_id: str) -> None:
+    if not connection_id:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE integration_connections SET status = 'needs_reauth', updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $1::uuid AND status = 'connected'",
+            connection_id,
+        )
+
+
+def _check_read_scopes(credentials: dict[str, Any]) -> None:
+    granted = credentials.get("scopes")
+    if isinstance(granted, list) and granted and not GMAIL_READ_SCOPES.intersection(granted):
+        raise GmailPermissionError(NO_MAIL_PERMISSION)
+
+
+async def _sync_expired_history_catchup(
+    pool: Any,
+    credentials: dict[str, Any],
+    cursor: dict[str, Any],
+    cursor_value: dict[str, Any],
+    *,
+    max_messages: int,
+) -> dict[str, Any]:
+    """Recover from an expired Gmail startHistoryId (HTTP 404).
+
+    Refreshes historyId from /users/me/profile and performs a bounded catch-up
+    of recent messages since high_watermark (tagged acquisition='import' so a
+    stale history reset does not flood live alerts).
+    """
+    account_key = str(cursor.get("account_key") or "").strip().lower()
+    cursor_key = str(cursor.get("cursor_key") or "messages")
+    profile = await _gmail_get(credentials, GOOGLE_GMAIL_PROFILE_URL)
+    latest_history_id = _max_history_id(None, profile.get("historyId"))
+
+    prev_watermark = _parse_timestamp(cursor.get("high_watermark"))
+    query_parts = [_SKIP_QUERY]
+    if prev_watermark is not None:
+        query_parts.append(f"after:{int(prev_watermark.timestamp())}")
+
+    listed = await _gmail_get(
+        credentials,
+        "/users/me/messages",
+        params={
+            "q": " ".join(query_parts),
+            "maxResults": min(max_messages, 100),
+            "includeSpamTrash": False,
+        },
+    )
+    stubs = listed.get("messages") if isinstance(listed.get("messages"), list) else []
+    items_stored = 0
+    items_skipped = 0
+    high_watermark = prev_watermark
+    last_message_id = cursor_value.get("last_message_id")
+    job_stub = {"account_key": account_key, "connector_id": GMAIL_CONNECTOR_ID}
+
+    for stub in stubs[:max_messages]:
+        if not isinstance(stub, dict) or not isinstance(stub.get("id"), str):
+            continue
+        try:
+            message = await _gmail_get(
+                credentials,
+                f"/users/me/messages/{stub['id']}",
+                params={"format": "full"},
+            )
+        except GmailNotFoundError:
+            continue
+        latest_history_id = _max_history_id(latest_history_id, message.get("historyId"))
+        if not worth_reading(message):
+            items_skipped += 1
+            continue
+        source = gmail_message_to_source_item(message)
+        source["metadata"]["acquisition"] = "import"
+        await _upsert_source_item(pool, job_stub, source)
+        items_stored += 1
+        last_message_id = source["provider_item_id"]
+        ts = source.get("item_timestamp")
+        if isinstance(ts, datetime) and (high_watermark is None or ts > high_watermark):
+            high_watermark = ts
+
+    next_cursor = {
+        **cursor_value,
+        "page_token": None,
+        "history_id": latest_history_id,
+        "last_message_id": last_message_id,
+    }
+    await _advance_cursor(
+        pool,
+        GMAIL_CONNECTOR_ID,
+        account_key,
+        cursor_key,
+        next_cursor,
+        high_watermark,
+        {
+            "sync_mode": "history_expired_resync",
+            "items_stored": items_stored,
+            "items_skipped": items_skipped,
+        },
+    )
+    return {
+        "account_key": account_key,
+        "resynced": True,
+        "history_id": latest_history_id,
+        "items_stored": items_stored,
+        "items_skipped": items_skipped,
+    }
+
+
+async def sync_gmail_cursor_incremental(
+    pool: Any,
+    credentials: dict[str, Any],
+    cursor: dict[str, Any],
+    *,
+    max_messages: int = 100,
+) -> dict[str, Any]:
+    """Incrementally sync newly arrived messages for one Gmail cursor via history.list."""
+    account_key = str(cursor.get("account_key") or "").strip().lower()
+    cursor_key = str(cursor.get("cursor_key") or "messages")
+    raw_cursor_value = _json(cursor.get("cursor_value"))
+    cursor_value = dict(raw_cursor_value) if isinstance(raw_cursor_value, dict) else {}
+
+    account_email = await _connected_account_email(credentials)
+    if account_email and account_key and account_email != account_key:
+        raise GmailBackfillError(
+            f"Saved Gmail credentials are for {account_email}, but the Gmail sync cursor is for {account_key}."
+        )
+
+    start_history_id = str(cursor_value.get("history_id") or "").strip() or None
+    if not start_history_id:
+        profile = await _gmail_get(credentials, GOOGLE_GMAIL_PROFILE_URL)
+        profile_history_id = _max_history_id(None, profile.get("historyId"))
+        next_cursor = {
+            **cursor_value,
+            "page_token": None,
+            "history_id": profile_history_id,
+        }
+        await _advance_cursor(
+            pool,
+            GMAIL_CONNECTOR_ID,
+            account_key,
+            cursor_key,
+            next_cursor,
+            _parse_timestamp(cursor.get("high_watermark")),
+            {"sync_mode": "baseline_seed"},
+        )
+        return {
+            "account_key": account_key,
+            "seeded": True,
+            "history_id": profile_history_id,
+            "items_stored": 0,
+            "items_skipped": 0,
+        }
+
+    # Collect newly added message IDs from Gmail history.list.
+    collected_ids: list[str] = []
+    seen_ids: set[str] = set()
+    page_token: str | None = None
+    top_level_history_id: str | None = start_history_id
+    last_completed_entry_history_id: str | None = start_history_id
+    truncated = False
+
+    try:
+        while True:
+            params: dict[str, Any] = {
+                "startHistoryId": start_history_id,
+                "historyTypes": "messageAdded",
+                "maxResults": 100,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            resp = await _gmail_get(credentials, "/users/me/history", params=params)
+            top_level_history_id = _max_history_id(top_level_history_id, resp.get("historyId"))
+
+            entries = resp.get("history") if isinstance(resp.get("history"), list) else []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                added = entry.get("messagesAdded") if isinstance(entry.get("messagesAdded"), list) else []
+                for item in added:
+                    if not isinstance(item, dict):
+                        continue
+                    msg_stub = item.get("message")
+                    msg_id = msg_stub.get("id") if isinstance(msg_stub, dict) else None
+                    if isinstance(msg_id, str) and msg_id and msg_id not in seen_ids:
+                        seen_ids.add(msg_id)
+                        collected_ids.append(msg_id)
+                last_completed_entry_history_id = _max_history_id(
+                    last_completed_entry_history_id,
+                    entry.get("id"),
+                )
+                if len(collected_ids) >= max_messages:
+                    truncated = True
+                    break
+
+            if truncated:
+                break
+            next_token = resp.get("nextPageToken")
+            if isinstance(next_token, str) and next_token:
+                page_token = next_token
+            else:
+                break
+    except GmailNotFoundError:
+        logger.warning(
+            "Gmail historyId %s expired for %s; resyncing baseline and recent messages",
+            start_history_id,
+            account_key,
+        )
+        return await _sync_expired_history_catchup(
+            pool,
+            credentials,
+            cursor,
+            cursor_value,
+            max_messages=max_messages,
+        )
+
+    items_stored = 0
+    items_skipped = 0
+    high_watermark = _parse_timestamp(cursor.get("high_watermark"))
+    last_message_id = cursor_value.get("last_message_id")
+    next_history_id = last_completed_entry_history_id if truncated else top_level_history_id
+    job_stub = {"account_key": account_key, "connector_id": GMAIL_CONNECTOR_ID}
+
+    for msg_id in collected_ids:
+        try:
+            message = await _gmail_get(
+                credentials,
+                f"/users/me/messages/{msg_id}",
+                params={"format": "full"},
+            )
+        except GmailNotFoundError:
+            logger.debug("Gmail message %s disappeared before incremental fetch; skipping", msg_id)
+            continue
+        if not truncated:
+            next_history_id = _max_history_id(next_history_id, message.get("historyId"))
+        if not worth_reading(message):
+            items_skipped += 1
+            continue
+        source = gmail_message_to_source_item(message)
+        source["metadata"]["acquisition"] = "incremental_sync"
+        await _upsert_source_item(pool, job_stub, source)
+        items_stored += 1
+        last_message_id = source["provider_item_id"]
+        ts = source.get("item_timestamp")
+        if isinstance(ts, datetime) and (high_watermark is None or ts > high_watermark):
+            high_watermark = ts
+
+    next_cursor = {
+        **cursor_value,
+        "page_token": None,
+        "history_id": next_history_id,
+        "last_message_id": last_message_id,
+    }
+    await _advance_cursor(
+        pool,
+        GMAIL_CONNECTOR_ID,
+        account_key,
+        cursor_key,
+        next_cursor,
+        high_watermark,
+        {
+            "sync_mode": "incremental",
+            "items_stored": items_stored,
+            "items_skipped": items_skipped,
+            "truncated": truncated,
+        },
+    )
+    return {
+        "account_key": account_key,
+        "history_id": next_history_id,
+        "items_stored": items_stored,
+        "items_skipped": items_skipped,
+        "truncated": truncated,
+    }
+
+
 async def run_gmail_backfill_step(pool: Any, *, limit: int | None = None) -> int:
     """Claim and process due Gmail backfill jobs; returns jobs handled."""
-    if load_default_credentials() is None:
-        return 0
     async with pool.acquire() as conn:
         raw = await conn.fetchval(
             "SELECT claim_connector_backfill_jobs_for('gmail', $1::int)",
             limit,
         )
     jobs = _json(raw) or []
-    if not isinstance(jobs, list):
-        jobs = []
+    if not isinstance(jobs, list) or not jobs:
+        return 0
+    if load_default_credentials() is None:
+        logger.warning(
+            "Gmail backfill has %d due job(s) but saved Gmail credentials are missing",
+            len(jobs),
+        )
+        for job in jobs:
+            job_id = str(job.get("id") or "")
+            if not job_id:
+                continue
+            await _mark_connection_needs_reauth(pool, str(job.get("connection_id") or ""))
+            await _fail_job(pool, job_id, NO_CREDENTIALS_MESSAGE, final=True)
+        return len(jobs)
     for job in jobs:
         await process_gmail_backfill_job(pool, job)
     return len(jobs)
+
+
+async def run_gmail_incremental_sync_step(pool: Any, *, limit: int | None = None) -> dict[str, Any]:
+    """Claim and incrementally sync due Gmail cursors via history.list."""
+    async with pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT claim_due_gmail_incremental_syncs($1::int)",
+            limit,
+        )
+        raw_max = await conn.fetchval(
+            "SELECT COALESCE(get_config_int('integrations.gmail.incremental_sync_max_messages'), 100)"
+        )
+    cursors = _json(raw) or []
+    if not isinstance(cursors, list) or not cursors:
+        return {"skipped": True, "reason": "no_due_gmail_syncs"}
+
+    max_messages = _coerce_int(raw_max, 100, minimum=1, maximum=500)
+
+    if load_default_credentials() is None:
+        logger.warning(
+            "Gmail incremental sync has %d due cursor(s) but saved Gmail credentials are missing",
+            len(cursors),
+        )
+        for cursor in cursors:
+            await _record_incremental_error(
+                pool,
+                str(cursor.get("connection_id") or ""),
+                str(cursor.get("cursor_key") or "messages"),
+                NO_CREDENTIALS_MESSAGE,
+                needs_reauth=True,
+            )
+        return {
+            "failed": True,
+            "error": NO_CREDENTIALS_MESSAGE,
+            "accounts_failed": len(cursors),
+        }
+
+    try:
+        credentials = await refresh_default_credentials_if_needed()
+        _check_read_scopes(credentials)
+    except (GmailPermissionError, GmailOAuthError) as exc:
+        logger.warning("Gmail incremental sync cannot authenticate: %s", exc)
+        for cursor in cursors:
+            await _record_incremental_error(
+                pool,
+                str(cursor.get("connection_id") or ""),
+                str(cursor.get("cursor_key") or "messages"),
+                str(exc),
+                needs_reauth=True,
+            )
+        return {
+            "failed": True,
+            "error": str(exc),
+            "accounts_failed": len(cursors),
+        }
+
+    synced_accounts = 0
+    failed_accounts = 0
+    items_stored = 0
+    items_skipped = 0
+    seeded = 0
+    resynced = 0
+    last_error: str | None = None
+
+    for cursor in cursors:
+        conn_id = str(cursor.get("connection_id") or "")
+        cursor_key = str(cursor.get("cursor_key") or "messages")
+        account_key = str(cursor.get("account_key") or "")
+        try:
+            outcome = await sync_gmail_cursor_incremental(
+                pool,
+                credentials,
+                cursor,
+                max_messages=max_messages,
+            )
+            synced_accounts += 1
+            items_stored += int(outcome.get("items_stored") or 0)
+            items_skipped += int(outcome.get("items_skipped") or 0)
+            if outcome.get("seeded"):
+                seeded += 1
+            if outcome.get("resynced"):
+                resynced += 1
+        except (GmailPermissionError, GmailOAuthError) as exc:
+            failed_accounts += 1
+            last_error = str(exc)
+            logger.warning("Gmail incremental sync permission/auth error for %s: %s", account_key, exc)
+            await _record_incremental_error(pool, conn_id, cursor_key, str(exc), needs_reauth=True)
+        except GmailBackfillError as exc:
+            failed_accounts += 1
+            last_error = str(exc)
+            logger.warning("Gmail incremental sync failed for %s: %s", account_key, exc)
+            await _record_incremental_error(pool, conn_id, cursor_key, str(exc), needs_reauth=False)
+        except Exception as exc:
+            failed_accounts += 1
+            last_error = str(exc)
+            logger.exception("Gmail incremental sync failed unexpectedly for %s", account_key)
+            await _record_incremental_error(pool, conn_id, cursor_key, str(exc), needs_reauth=False)
+
+    summary: dict[str, Any] = {
+        "synced_accounts": synced_accounts,
+        "failed_accounts": failed_accounts,
+        "items_stored": items_stored,
+        "items_skipped": items_skipped,
+        "seeded": seeded,
+        "resynced": resynced,
+    }
+    if failed_accounts and not synced_accounts:
+        summary["failed"] = True
+        summary["error"] = last_error or "Gmail incremental sync failed"
+    return summary

@@ -48,7 +48,10 @@ from services.connector_cognition import (
     run_connector_importance_step,
     run_user_model_synthesis_step,
 )
-from services.gmail_backfill import run_gmail_backfill_step
+from services.gmail_backfill import (
+    run_gmail_backfill_step,
+    run_gmail_incremental_sync_step,
+)
 from services.google_drive import run_drive_import_step
 from services.ambient_responsibilities import run_ambient_responsibility_step
 from services.summarization import run_memory_summarization_step
@@ -907,6 +910,7 @@ class MaintenanceWorker:
             ("skill_improvement", self._run_skill_improvement_if_due),
             ("learning_skill_application", self._run_approved_learning_skill),
             ("gmail_backfill", self._run_gmail_backfill_jobs),
+            ("gmail_incremental_sync", self._run_gmail_incremental_sync),
             ("google_drive_import", self._run_drive_import_jobs),
             ("channel_backfill", self._run_channel_backfill_jobs),
             ("connector_cognition", self._run_connector_cognition),
@@ -1164,6 +1168,14 @@ class MaintenanceWorker:
             logger.info("Gmail connector backfill jobs handled: %s", handled)
             return {"handled": handled}
         return {"skipped": True, "reason": "no_due_gmail_backfill_jobs"}
+
+    async def _run_gmail_incremental_sync(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        result = await run_gmail_incremental_sync_step(self.pool)
+        if not result.get("skipped"):
+            logger.info("Gmail incremental sync: %s", result)
+        return result
 
     async def _run_drive_import_jobs(self) -> dict[str, Any]:
         if not self.pool:
