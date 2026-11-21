@@ -142,6 +142,7 @@ async def test_conditional_gmail_mark_read_action_only_when_argument_true(db_poo
         tr = conn.transaction()
         await tr.start()
         try:
+            await conn.execute("SELECT set_config('integrations.gmail.heartbeat_digest_enabled', 'true'::jsonb)")
             await _sync_tool(conn, "email_read", requires_approval=False)
             plain_read = _j(await conn.fetchval(
                 "SELECT evaluate_tool_call('email_read', $1::jsonb, $2::jsonb)",
@@ -161,6 +162,121 @@ async def test_conditional_gmail_mark_read_action_only_when_argument_true(db_poo
     assert mark_read["allowed"] is False
     assert mark_read["connector_action"]["connector_id"] == "gmail"
     assert mark_read["connector_action"]["action_kind"] == "mark_read"
+
+
+async def test_gmail_heartbeat_and_memory_policies_enforced_mechanically(db_pool):
+    """#100: heartbeat inbox reads require integrations.gmail.heartbeat_digest_enabled,
+    and ingest_emails requires integrations.gmail.memory_policy='remember'."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _sync_tool(conn, "email_list", requires_approval=False)
+            await _sync_tool(conn, "email_read", requires_approval=False)
+            await _sync_tool(conn, "email_search", requires_approval=False)
+            await _sync_tool(conn, "ingest_emails", requires_approval=False)
+
+            await conn.execute("SELECT set_config('integrations.gmail.heartbeat_digest_enabled', 'false'::jsonb)")
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"forget\"'::jsonb)")
+
+            # Heartbeat inbox reads are denied when heartbeat_digest_enabled is false.
+            hb_list = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('email_list', '{}'::jsonb, '{\"tool_context\": \"heartbeat\", \"energy_available\": 20}'::jsonb)"
+            ))
+            hb_search = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('email_search', '{\"query\": \"invoice\"}'::jsonb, '{\"tool_context\": \"heartbeat\", \"energy_available\": 20}'::jsonb)"
+            ))
+            assert hb_list["allowed"] is False
+            assert hb_list["error_type"] == "context_denied"
+            assert "heartbeat_digest_enabled" in hb_list["reason"]
+            assert hb_search["allowed"] is False
+
+            # Live chat reads remain allowed even when heartbeat_digest_enabled is false.
+            chat_list = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('email_list', '{}'::jsonb, '{\"tool_context\": \"chat\"}'::jsonb)"
+            ))
+            assert chat_list["allowed"] is True
+
+            # ingest_emails is denied whenever memory_policy <> 'remember' (even in chat).
+            chat_ingest_forget = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('ingest_emails', '{}'::jsonb, '{\"tool_context\": \"chat\"}'::jsonb)"
+            ))
+            assert chat_ingest_forget["allowed"] is False
+            assert "memory_policy" in chat_ingest_forget["reason"]
+
+            # Enabling both allows heartbeat ingest_emails.
+            await conn.execute("SELECT set_config('integrations.gmail.heartbeat_digest_enabled', 'true'::jsonb)")
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+            hb_ingest_ok = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('ingest_emails', '{}'::jsonb, '{\"tool_context\": \"heartbeat\", \"energy_available\": 20}'::jsonb)"
+            ))
+            assert hb_ingest_ok["allowed"] is True
+        finally:
+            await tr.rollback()
+
+
+async def test_gmail_draft_policy_gating_and_audit_via_migration_0266(db_pool):
+    """#100: migration 0266 adds the gmail/draft capability & tool map so
+    autonomous gmail_draft requires a matching standing policy and logs audit."""
+    from pathlib import Path
+
+    migration_sql = (
+        Path(__file__).resolve().parents[2]
+        / "db"
+        / "migrations"
+        / "0266_gmail_draft_and_policy_controls.sql"
+    ).read_text(encoding="utf-8")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute(migration_sql)
+            await _sync_tool(conn, "gmail_draft", requires_approval=True)
+            await conn.execute("SELECT grant_tool_approval('gmail_draft')")
+
+            manifest = _j(await conn.fetchval(
+                "SELECT capability_manifest FROM integration_connectors WHERE id = 'gmail'"
+            ))
+            assert "draft" in manifest
+            assert "https://www.googleapis.com/auth/gmail.compose" in manifest["draft"]["scopes"]
+
+            # Denied in heartbeat without a standing gmail/draft policy.
+            denied = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('gmail_draft', $1::jsonb, $2::jsonb)",
+                json.dumps({"to": "recruiter@example.com", "subject": "Re: Role", "body": "No thanks"}),
+                json.dumps({"tool_context": "heartbeat", "energy_available": 20}),
+            ))
+            assert denied["allowed"] is False
+            assert denied["connector_action"]["connector_id"] == "gmail"
+            assert denied["connector_action"]["action_kind"] == "draft"
+
+            # Grant a narrow standing policy for drafts to recruiter@example.com.
+            policy = _j(await conn.fetchval(
+                """
+                SELECT grant_connector_action_policy(
+                    'gmail', 'draft', NULL,
+                    '{"allowed_targets": ["recruiter@example.com"], "max_per_day": 5}'::jsonb,
+                    TRUE, FALSE, ARRAY['heartbeat']::text[], NULL,
+                    'test-session', 'Allow drafting polite declines to recruiter@example.com', 'user'
+                )
+                """
+            ))
+            allowed = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('gmail_draft', $1::jsonb, $2::jsonb)",
+                json.dumps({"to": "recruiter@example.com", "subject": "Re: Role", "body": "No thanks"}),
+                json.dumps({"tool_context": "heartbeat", "energy_available": 20}),
+            ))
+            wrong_target = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('gmail_draft', $1::jsonb, $2::jsonb)",
+                json.dumps({"to": "ceo@example.com", "subject": "Hi", "body": "Hey"}),
+                json.dumps({"tool_context": "heartbeat", "energy_available": 20}),
+            ))
+            assert allowed["allowed"] is True
+            assert allowed["connector_action"]["policy_id"] == policy["policy_id"]
+            assert wrong_target["allowed"] is False
+        finally:
+            await tr.rollback()
 
 
 async def test_connector_action_policy_can_be_revoked(db_pool):

@@ -32,6 +32,8 @@ INSERT INTO connector_action_tool_map (
      '{"tool_module": "core.tools.gmail_actions"}'::jsonb),
     ('gmail_reply', 'gmail', 'reply', 'thread_id', 'account_key', 'external_message',
      '{"tool_module": "core.tools.gmail_actions"}'::jsonb),
+    ('gmail_draft', 'gmail', 'draft', 'to', 'account_key', 'provider_state_change',
+     '{"tool_module": "core.tools.gmail_actions"}'::jsonb),
     ('gmail_label', 'gmail', 'label', 'message_id', 'account_key', 'provider_state_change',
      '{"tool_module": "core.tools.gmail_actions"}'::jsonb),
     ('gmail_spam_triage', 'gmail', 'spam_triage', 'message_id', 'account_key', 'provider_state_change',
@@ -613,6 +615,31 @@ BEGIN
     END IF;
     IF COALESCE(array_length(tool.allowed_contexts, 1), 0) > 0 AND NOT (ctx = ANY(tool.allowed_contexts)) THEN
         RETURN jsonb_build_object('allowed', false, 'reason', format('Tool %L not allowed in %s context', tool.name, ctx), 'error_type', 'context_denied');
+    END IF;
+
+    -- Mechanical enforcement of Gmail autonomy and memory policies (#100):
+    -- heartbeat inbox reading requires integrations.gmail.heartbeat_digest_enabled,
+    -- and ingest_emails requires integrations.gmail.memory_policy = 'remember'.
+    IF ctx = 'heartbeat'
+       AND tool.name IN ('email_list', 'email_read', 'email_search', 'ingest_emails')
+       AND NOT COALESCE(get_config_bool('integrations.gmail.heartbeat_digest_enabled'), FALSE) THEN
+        RETURN jsonb_build_object(
+            'allowed', false,
+            'reason', 'Autonomous Gmail checks during heartbeat are disabled (integrations.gmail.heartbeat_digest_enabled is false). Enable heartbeat email checks in Connections → Gmail to allow background inbox reading.',
+            'error_type', 'context_denied'
+        );
+    END IF;
+
+    IF tool.name = 'ingest_emails'
+       AND lower(COALESCE(get_config_text('integrations.gmail.memory_policy'), 'ask')) <> 'remember' THEN
+        RETURN jsonb_build_object(
+            'allowed', false,
+            'reason', format(
+                'Email memory ingestion is blocked because integrations.gmail.memory_policy is %L (must be ''remember''). Update the Gmail memory policy in Connections → Gmail first.',
+                COALESCE(get_config_text('integrations.gmail.memory_policy'), 'ask')
+            ),
+            'error_type', 'context_denied'
+        );
     END IF;
 
     cost := COALESCE(NULLIF(cfg #>> ARRAY['costs', tool.name], '')::int, tool.default_energy_cost);

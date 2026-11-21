@@ -157,6 +157,24 @@ class TestAuthFailures:
         assert result.output["ui"]["connector_id"] == "gmail"
 
     @pytest.mark.asyncio
+    async def test_default_registry_ignores_ambient_gmail_env_credentials(self, monkeypatch, tmp_path):
+        """#100 / Experience Bar #5: email read tools must not silently reuse
+        ambient GOOGLE_GMAIL_CREDENTIALS env vars when Hexis Gmail is unconnected."""
+        import json
+        import core.auth.store as auth_store
+        from core.tools.registry import create_default_registry
+
+        monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "empty-auth")
+        monkeypatch.setenv("GOOGLE_GMAIL_CREDENTIALS", json.dumps(_fake_credentials()))
+
+        registry = create_default_registry(pool=None)
+        handler = registry.get("email_list")
+        assert handler is not None
+        result = await handler.execute({}, _make_context())
+        assert not result.success
+        assert result.error_type == ToolErrorType.AUTH_FAILED
+
+    @pytest.mark.asyncio
     async def test_read_no_credentials(self):
         handler = EmailReadHandler()
         result = await handler.execute({"message_id": "abc"}, _make_context())

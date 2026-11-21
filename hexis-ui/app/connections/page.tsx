@@ -24,6 +24,8 @@ import { Spinner } from "../components/ui/spinner";
 import { DriveControls } from "./drive-controls";
 import {
   BackfillJob,
+  ConnectorActionAuditEntry,
+  ConnectorActionPolicy,
   ConnectorSummary,
   IntegrationStatusData,
   asRecord,
@@ -175,6 +177,15 @@ export default function ConnectionsPage() {
           onAction={runAction}
         />
         <SourceItemsPanel summaries={summaries} />
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <ActionPoliciesPanel
+          policies={data?.action_policies || []}
+          actionBusy={actionBusy}
+          onAction={runAction}
+        />
+        <ActionAuditPanel entries={data?.action_audit || []} />
       </div>
     </div>
   );
@@ -1493,6 +1504,142 @@ function SourceItemsPanel({ summaries }: { summaries: ConnectorSummary[] }) {
             >
               <span className="min-w-0 truncate">{summary.connector.display_name}</span>
               <span className="font-semibold">{summary.sourceItemCount}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function summarizePolicyConstraints(constraints: Record<string, unknown>): string[] {
+  const notes: string[] = [];
+  const targets = stringArray(constraints.allowed_targets);
+  if (targets.length) notes.push(`Targets: ${targets.join(", ")}`);
+  const domains = stringArray(constraints.allowed_domains);
+  if (domains.length) notes.push(`Domains: ${domains.join(", ")}`);
+  if (typeof constraints.max_per_day === "number") {
+    notes.push(`Limit: ${constraints.max_per_day}/day`);
+  }
+  if (typeof constraints.max_per_hour === "number") {
+    notes.push(`Limit: ${constraints.max_per_hour}/hr`);
+  }
+  return notes;
+}
+
+function ActionPoliciesPanel({
+  policies,
+  actionBusy,
+  onAction,
+}: {
+  policies: ConnectorActionPolicy[];
+  actionBusy: string | null;
+  onAction: IntegrationActionHandler;
+}) {
+  return (
+    <Card className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold">Standing action policies</h2>
+        <Badge variant="muted">{policies.length}</Badge>
+      </div>
+      {policies.length === 0 ? (
+        <p className="text-sm text-[var(--ink-soft)]">
+          No standing autonomous action policies granted. Outward actions require explicit approval.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {policies.map((policy) => {
+            const constraintNotes = summarizePolicyConstraints(asRecord(policy.constraints));
+            const busyKey = `policy:${policy.policy_id}:revoke`;
+            return (
+              <div
+                key={policy.policy_id}
+                className="flex flex-wrap items-start justify-between gap-3 rounded-md border border-[var(--outline)] px-3 py-2.5 text-sm"
+              >
+                <div className="min-w-0 flex-1 space-y-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">
+                      {humanize(policy.connector_id)} · {humanize(policy.action_kind)}
+                    </span>
+                    <Badge variant={policy.allow_autonomous ? "warning" : "muted"}>
+                      {policy.allow_autonomous ? "Autonomous" : "Approval required"}
+                    </Badge>
+                    {policy.account_key ? (
+                      <span className="text-xs text-[var(--ink-soft)]">{policy.account_key}</span>
+                    ) : null}
+                  </div>
+                  {policy.rationale ? (
+                    <p className="text-xs text-[var(--ink-soft)]">{policy.rationale}</p>
+                  ) : null}
+                  {constraintNotes.length ? (
+                    <p className="text-xs text-[var(--ink-soft)]">
+                      {constraintNotes.join(" · ")}
+                    </p>
+                  ) : null}
+                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={Boolean(actionBusy)}
+                  onClick={async () => {
+                    if (
+                      await confirmAction(
+                        `Revoke standing ${policy.connector_id} ${policy.action_kind} policy?`,
+                        { confirmLabel: "Revoke", destructive: true }
+                      )
+                    ) {
+                      void onAction(busyKey, "revoke_action_policy", {
+                        policy_id: policy.policy_id,
+                        reason: "revoked from web connections",
+                      });
+                    }
+                  }}
+                  className="px-2.5 py-1 text-xs"
+                >
+                  Revoke policy
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function ActionAuditPanel({ entries }: { entries: ConnectorActionAuditEntry[] }) {
+  return (
+    <Card className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold">Recent action audit</h2>
+        <Badge variant="muted">{entries.length}</Badge>
+      </div>
+      {entries.length === 0 ? (
+        <p className="text-sm text-[var(--ink-soft)]">No audited connector actions yet.</p>
+      ) : (
+        <div className="space-y-2">
+          {entries.slice(0, 12).map((entry) => (
+            <div
+              key={entry.audit_id}
+              className="flex items-start justify-between gap-3 rounded-md border border-[var(--outline)] px-3 py-2 text-xs"
+            >
+              <div className="min-w-0 flex-1 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium text-[var(--foreground)]">
+                    {humanize(entry.connector_id)} · {humanize(entry.action_kind)}
+                  </span>
+                  {entry.target ? (
+                    <span className="truncate text-[var(--ink-soft)]">→ {entry.target}</span>
+                  ) : null}
+                </div>
+                <p className="text-[var(--ink-soft)]">
+                  {entry.tool_name}
+                  {entry.reason ? ` · ${entry.reason}` : ""}
+                </p>
+              </div>
+              <Badge variant={entry.decision === "allowed" ? "success" : "error"}>
+                {entry.decision}
+              </Badge>
             </div>
           ))}
         </div>

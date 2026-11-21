@@ -940,18 +940,17 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
 
         return _resolve
 
-    def _gmail_credentials_resolver() -> dict[str, Any] | None:
-        env_credentials = _json_env_resolver(
-            "GOOGLE_GMAIL_CREDENTIALS", "GOOGLE_CALENDAR_CREDENTIALS"
-        )()
-        if env_credentials:
-            return env_credentials
-        try:
-            from core.auth.google_gmail import load_default_credentials
+    async def _gmail_credentials_resolver() -> dict[str, Any] | None:
+        # Use only Hexis's saved Gmail OAuth credential (never silently consume
+        # ambient environment credentials) and refresh expired tokens in place.
+        from core.auth.google_gmail import (
+            load_default_credentials,
+            refresh_default_credentials_if_needed,
+        )
 
-            return load_default_credentials()
-        except Exception:
+        if load_default_credentials() is None:
             return None
+        return await refresh_default_credentials_if_needed()
 
     builder = ToolRegistryBuilder(pool)
     builder.add_all(create_memory_tools())

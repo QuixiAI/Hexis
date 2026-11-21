@@ -48,7 +48,32 @@ export async function GET(): Promise<Response> {
       SELECT
         integration_status(NULL) AS integration,
         list_channel_adapter_status(NULL) AS channel_runtime,
-        get_connector_backfill_status(NULL, NULL) AS backfill
+        get_connector_backfill_status(NULL, NULL) AS backfill,
+        list_connector_action_policies(NULL, NULL, FALSE) AS action_policies,
+        COALESCE(
+          (
+            SELECT jsonb_agg(
+              jsonb_build_object(
+                'audit_id', id::text,
+                'policy_id', policy_id::text,
+                'connector_id', connector_id,
+                'account_key', account_key,
+                'action_kind', action_kind,
+                'tool_name', tool_name,
+                'target', target,
+                'decision', decision,
+                'reason', reason,
+                'sensitivity', sensitivity,
+                'created_at', created_at
+              )
+              ORDER BY created_at DESC
+            )
+            FROM (
+              SELECT * FROM connector_action_audit ORDER BY created_at DESC LIMIT 25
+            ) recent_audit
+          ),
+          '[]'::jsonb
+        ) AS action_audit
     `);
     const row = rows[0] ?? {};
     const integration = asRecord(normalizeJsonValue(row.integration));
@@ -64,6 +89,8 @@ export async function GET(): Promise<Response> {
         cursors: asArray(backfill.cursors),
         item_counts: asArray(backfill.item_counts),
       },
+      action_policies: asArray(normalizeJsonValue(row.action_policies)),
+      action_audit: asArray(normalizeJsonValue(row.action_audit)),
       generated_at: new Date().toISOString(),
     });
   } catch (error: unknown) {

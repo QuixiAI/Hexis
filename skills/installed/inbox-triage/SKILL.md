@@ -6,7 +6,7 @@ requires:
   tools: [email_list, email_read]
 contexts: [chat]
 aliases: [inbox, triage, cleanup, archive, unsubscribe]
-bound_tools: [email_list, email_read, email_search, search_contacts, recall, remember, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, manage_backlog, todoist_create_task, asana_create_task]
+bound_tools: [email_list, email_read, email_search, search_contacts, recall, remember, gmail_draft, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, manage_backlog, todoist_create_task, asana_create_task]
 ---
 
 # Inbox Triage
