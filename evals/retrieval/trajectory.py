@@ -24,6 +24,7 @@ class ScriptedRLM:
         messages: list[dict[str, str]],
         llm_config: dict[str, Any],
         max_tokens: int = 4096,
+        **_kwargs: Any,
     ) -> str:
         self.prompts.append(messages)
         if not self.responses:
