@@ -284,3 +284,410 @@ async def test_email_text_is_cleaned_of_markup_padding_and_tracking_links():
     assert gmail_backfill.clean_email_text("See https://github.com/a/b") == "See https://github.com/a/b"
 
     assert gmail_backfill.clean_email_text("Thanks!\n\n> On Monday you wrote:\n> old text") == "Thanks!"
+
+
+async def test_backfill_preserves_highest_numeric_history_id(db_pool, monkeypatch, tmp_path):
+    """#110: Gmail /users/me/messages returns newest-first; paging through older
+    messages must keep the highest numeric historyId instead of walking it backwards."""
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    marker = get_test_identifier("gmail-max-hist")
+    account = f"eric-{marker}@example.com"
+    save_auth(
+        GMAIL_DEFAULT_CREDENTIAL_REF,
+        {
+            "type": "authorized_user",
+            "token": "access-token",
+            "refresh_token": "refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "client",
+            "client_secret": "secret",
+            "expires_ms": now_ms() + 3_600_000,
+            "account_email": account,
+            "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        },
+    )
+    await _connected_gmail(db_pool, marker, account)
+    async with db_pool.acquire() as conn:
+        await conn.fetchval(
+            "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages', '{\"max_messages\": 2}'::jsonb)",
+            account,
+        )
+
+    newest = _message("msg-new", subject="Newest", body="Newest body", internal_ms="1720000000000")
+    newest["historyId"] = "5000"
+    older = _message("msg-old", subject="Older", body="Older body", internal_ms="1710000000000")
+    older["historyId"] = "4000"
+
+    async def fake_gmail_get(credentials, path, *, params=None):
+        if path == "/users/me/messages":
+            return {"messages": [{"id": "msg-new"}, {"id": "msg-old"}]}
+        if path == "/users/me/messages/msg-new":
+            return newest
+        if path == "/users/me/messages/msg-old":
+            return older
+        raise AssertionError(f"Unexpected path: {path}")
+
+    monkeypatch.setattr(gmail_backfill, "_gmail_get", fake_gmail_get)
+    await gmail_backfill.run_gmail_backfill_step(db_pool, limit=5)
+
+    async with db_pool.acquire() as conn:
+        status = _j(await conn.fetchval("SELECT get_connector_backfill_status('gmail', $1)", account))
+    assert status["cursors"][0]["cursor_value"]["history_id"] == "5000"
+
+
+async def test_run_gmail_incremental_sync_seeds_baseline_and_syncs_history_list(
+    db_pool, monkeypatch, tmp_path
+):
+    """#110: incremental sync seeds history_id from /users/me/profile when absent,
+    then consumes /users/me/history (messageAdded), filters non-worth-reading mail,
+    skips deleted messages (404), and advances the cursor."""
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    marker = get_test_identifier("gmail-inc-sync")
+    account = f"eric-{marker}@example.com"
+    save_auth(
+        GMAIL_DEFAULT_CREDENTIAL_REF,
+        {
+            "type": "authorized_user",
+            "token": "access-token",
+            "refresh_token": "refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "client",
+            "client_secret": "secret",
+            "expires_ms": now_ms() + 3_600_000,
+            "account_email": account,
+            "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        },
+    )
+
+    prev_policy = None
+    prev_gmail_statuses: list[tuple[str, str]] = []
+    try:
+        async with db_pool.acquire() as conn:
+            prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            prev_rows = await conn.fetch(
+                "SELECT id::text AS id, status FROM integration_connections WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            prev_gmail_statuses = [(r["id"], r["status"]) for r in prev_rows]
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+        await _connected_gmail(db_pool, marker, account)
+
+        calls: list[tuple[str, dict | None]] = []
+
+        async def seed_gmail_get(credentials, path, *, params=None):
+            calls.append((path, params))
+            if path == gmail_backfill.GOOGLE_GMAIL_PROFILE_URL:
+                return {"emailAddress": account, "historyId": "9000"}
+            raise AssertionError(f"Unexpected seed path: {path}")
+
+        monkeypatch.setattr(gmail_backfill, "_gmail_get", seed_gmail_get)
+        seed_result = await gmail_backfill.run_gmail_incremental_sync_step(db_pool, limit=5)
+        assert seed_result["seeded"] == 1
+        assert seed_result["synced_accounts"] == 1
+
+        # Make the cursor due again so the second pass runs history.list.
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE connector_sync_cursors
+                SET last_started_at = CURRENT_TIMESTAMP - INTERVAL '1 hour',
+                    last_completed_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                WHERE account_key = $1
+                """,
+                account,
+            )
+
+        good_msg = _message("msg-live-1", subject="Important note", body="Live incoming email.", internal_ms="1725000000000")
+        good_msg["historyId"] = "9010"
+        promo_msg = _message("msg-promo", subject="Big Sale", body="50% off!", internal_ms="1725000001000")
+        promo_msg["labelIds"] = ["INBOX", "CATEGORY_PROMOTIONS"]
+        promo_msg["historyId"] = "9011"
+
+        async def history_gmail_get(credentials, path, *, params=None):
+            calls.append((path, params))
+            if path == "/users/me/history":
+                assert params["startHistoryId"] == "9000"
+                assert params["historyTypes"] == "messageAdded"
+                return {
+                    "historyId": "9020",
+                    "history": [
+                        {
+                            "id": "9010",
+                            "messagesAdded": [
+                                {"message": {"id": "msg-live-1"}},
+                                {"message": {"id": "msg-deleted"}},
+                            ],
+                        },
+                        {
+                            "id": "9011",
+                            "messagesAdded": [
+                                {"message": {"id": "msg-promo"}},
+                                {"message": {"id": "msg-live-1"}},  # duplicate ID
+                            ],
+                        },
+                    ],
+                }
+            if path == "/users/me/messages/msg-live-1":
+                return good_msg
+            if path == "/users/me/messages/msg-promo":
+                return promo_msg
+            if path == "/users/me/messages/msg-deleted":
+                raise gmail_backfill.GmailNotFoundError("Message not found")
+            raise AssertionError(f"Unexpected history path: {path}")
+
+        monkeypatch.setattr(gmail_backfill, "_gmail_get", history_gmail_get)
+        sync_result = await gmail_backfill.run_gmail_incremental_sync_step(db_pool, limit=5)
+
+        assert sync_result["synced_accounts"] == 1
+        assert sync_result["items_stored"] == 1
+        assert sync_result["items_skipped"] == 1
+        assert [p for p, _ in calls if p in {gmail_backfill.GOOGLE_GMAIL_PROFILE_URL, "/users/me/history"}] == [
+            gmail_backfill.GOOGLE_GMAIL_PROFILE_URL,
+            "/users/me/history",
+        ]
+
+        async with db_pool.acquire() as conn:
+            status = _j(await conn.fetchval("SELECT get_connector_backfill_status('gmail', $1)", account))
+            items = await conn.fetch(
+                "SELECT provider_item_id, raw_metadata FROM connector_source_items WHERE account_key = $1",
+                account,
+            )
+        assert status["cursors"][0]["cursor_value"]["history_id"] == "9020"
+        assert [row["provider_item_id"] for row in items] == ["msg-live-1"]
+        assert _j(items[0]["raw_metadata"])["acquisition"] == "incremental_sync"
+    finally:
+        async with db_pool.acquire() as conn:
+            if prev_policy is None:
+                await conn.execute("DELETE FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            else:
+                await conn.execute("SELECT set_config('integrations.gmail.memory_policy', $1::jsonb)", prev_policy)
+            await conn.execute("DELETE FROM integration_connections WHERE account_key = $1", account)
+            await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)
+            for conn_id, status in prev_gmail_statuses:
+                await conn.execute(
+                    "UPDATE integration_connections SET status = $2 WHERE id = $1::uuid",
+                    conn_id,
+                    status,
+                )
+
+
+async def test_run_gmail_incremental_sync_recovers_from_expired_history_id_404(
+    db_pool, monkeypatch, tmp_path
+):
+    """#110: if startHistoryId expired (Gmail 404), incremental sync refreshes
+    the baseline from /users/me/profile and performs a bounded catch-up tagged
+    as import so it doesn't flood live alerts."""
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    marker = get_test_identifier("gmail-hist-404")
+    account = f"eric-{marker}@example.com"
+    save_auth(
+        GMAIL_DEFAULT_CREDENTIAL_REF,
+        {
+            "type": "authorized_user",
+            "token": "access-token",
+            "refresh_token": "refresh-token",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": "client",
+            "client_secret": "secret",
+            "expires_ms": now_ms() + 3_600_000,
+            "account_email": account,
+            "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        },
+    )
+
+    prev_policy = None
+    prev_gmail_statuses: list[tuple[str, str]] = []
+    try:
+        async with db_pool.acquire() as conn:
+            prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            prev_rows = await conn.fetch(
+                "SELECT id::text AS id, status FROM integration_connections WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            prev_gmail_statuses = [(r["id"], r["status"]) for r in prev_rows]
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+        await _connected_gmail(db_pool, marker, account)
+        async with db_pool.acquire() as conn:
+            await conn.fetchval(
+                "SELECT advance_connector_cursor('gmail', $1, 'messages', '{\"history_id\": \"100\"}'::jsonb, CURRENT_TIMESTAMP - INTERVAL '10 days')",
+                account,
+            )
+            await conn.execute(
+                """
+                UPDATE connector_sync_cursors
+                SET last_started_at = CURRENT_TIMESTAMP - INTERVAL '1 hour',
+                    last_completed_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+                WHERE account_key = $1
+                """,
+                account,
+            )
+
+        catchup_msg = _message("msg-catchup", subject="Catchup", body="Recent mail during outage.", internal_ms="1726000000000")
+        catchup_msg["historyId"] = "9950"
+
+        async def fake_gmail_get(credentials, path, *, params=None):
+            if path == "/users/me/history":
+                raise gmail_backfill.GmailNotFoundError("404 historyId too old")
+            if path == gmail_backfill.GOOGLE_GMAIL_PROFILE_URL:
+                return {"emailAddress": account, "historyId": "9999"}
+            if path == "/users/me/messages":
+                assert "after:" in (params or {}).get("q", "")
+                return {"messages": [{"id": "msg-catchup"}]}
+            if path == "/users/me/messages/msg-catchup":
+                return catchup_msg
+            raise AssertionError(f"Unexpected path: {path}")
+
+        monkeypatch.setattr(gmail_backfill, "_gmail_get", fake_gmail_get)
+        result = await gmail_backfill.run_gmail_incremental_sync_step(db_pool, limit=5)
+
+        assert result["resynced"] == 1
+        assert result["items_stored"] == 1
+        async with db_pool.acquire() as conn:
+            status = _j(await conn.fetchval("SELECT get_connector_backfill_status('gmail', $1)", account))
+            item = await conn.fetchrow(
+                "SELECT provider_item_id, raw_metadata FROM connector_source_items WHERE account_key = $1",
+                account,
+            )
+        assert status["cursors"][0]["cursor_value"]["history_id"] == "9999"
+        assert item["provider_item_id"] == "msg-catchup"
+        assert _j(item["raw_metadata"])["acquisition"] == "import"
+    finally:
+        async with db_pool.acquire() as conn:
+            if prev_policy is None:
+                await conn.execute("DELETE FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            else:
+                await conn.execute("SELECT set_config('integrations.gmail.memory_policy', $1::jsonb)", prev_policy)
+            await conn.execute("DELETE FROM integration_connections WHERE account_key = $1", account)
+            await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)
+            for conn_id, status in prev_gmail_statuses:
+                await conn.execute(
+                    "UPDATE integration_connections SET status = $2 WHERE id = $1::uuid",
+                    conn_id,
+                    status,
+                )
+
+
+async def test_missing_credentials_fails_loud_for_backfill_and_incremental_sync(
+    db_pool, monkeypatch, tmp_path
+):
+    """#110 / Experience Bar #8: missing credentials must not silently return 0
+    when Gmail backfill jobs or incremental sync cursors are actually due."""
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "empty-auth")
+    marker = get_test_identifier("gmail-nocreds")
+    account = f"eric-{marker}@example.com"
+
+    prev_policy = None
+    prev_gmail_statuses: list[tuple[str, str]] = []
+    try:
+        async with db_pool.acquire() as conn:
+            prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            prev_rows = await conn.fetch(
+                "SELECT id::text AS id, status FROM integration_connections WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            prev_gmail_statuses = [(r["id"], r["status"]) for r in prev_rows]
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+        await _connected_gmail(db_pool, marker, account)
+
+        # 1. Incremental sync due with missing credentials -> fails loud + marks needs_reauth.
+        inc_result = await gmail_backfill.run_gmail_incremental_sync_step(db_pool, limit=5)
+        assert inc_result["failed"] is True
+        assert "credentials are missing" in inc_result["error"]
+
+        async with db_pool.acquire() as conn:
+            conn_status = await conn.fetchval(
+                "SELECT status FROM integration_connections WHERE connector_id = 'gmail' AND account_key = $1",
+                account,
+            )
+            assert conn_status == "needs_reauth"
+
+            # 2. Re-mark connected and queue a backfill job -> run_gmail_backfill_step fails it loud.
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'connected' WHERE connector_id = 'gmail' AND account_key = $1",
+                account,
+            )
+            job = _j(await conn.fetchval(
+                "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages')",
+                account,
+            ))
+
+        handled = await gmail_backfill.run_gmail_backfill_step(db_pool, limit=5)
+        assert handled == 1
+
+        async with db_pool.acquire() as conn:
+            status = _j(await conn.fetchval("SELECT get_connector_backfill_status('gmail', $1)", account))
+        failed_job = next(j for j in status["jobs"] if j["job_id"] == job["job_id"])
+        assert failed_job["status"] == "failed"
+        assert "credentials are missing" in failed_job["error"]
+    finally:
+        async with db_pool.acquire() as conn:
+            if prev_policy is None:
+                await conn.execute("DELETE FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            else:
+                await conn.execute("SELECT set_config('integrations.gmail.memory_policy', $1::jsonb)", prev_policy)
+            await conn.execute("DELETE FROM integration_connections WHERE account_key = $1", account)
+            await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)
+            for conn_id, status in prev_gmail_statuses:
+                await conn.execute(
+                    "UPDATE integration_connections SET status = $2 WHERE id = $1::uuid",
+                    conn_id,
+                    status,
+                )
+
+
+async def test_is_transient_oauth_error_distinguishes_503_from_invalid_grant():
+    from core.auth.google_gmail import GmailOAuthError
+    from core.integration_reliability import IntegrationHttpError
+
+    http_503 = IntegrationHttpError(
+        "Service Unavailable",
+        provider="google_oauth",
+        error_kind="provider_transient",
+        status_code=503,
+    )
+    transient_err = GmailOAuthError("temporary outage")
+    transient_err.__cause__ = http_503
+    assert gmail_backfill.is_transient_oauth_error(transient_err) is True
+
+    timeout_err = GmailOAuthError("timed out")
+    timeout_err.__cause__ = IntegrationHttpError(
+        "timeout",
+        provider="google_oauth",
+        error_kind="timeout",
+        status_code=None,
+    )
+    assert gmail_backfill.is_transient_oauth_error(timeout_err) is True
+
+    policy_err = GmailOAuthError("blocked by policy")
+    policy_err.__cause__ = IntegrationHttpError(
+        "domain blocked",
+        provider="google_oauth",
+        error_kind="domain_policy",
+        status_code=None,
+    )
+    assert gmail_backfill.is_transient_oauth_error(policy_err) is False
+
+    http_400 = IntegrationHttpError(
+        "invalid_grant",
+        provider="google_oauth",
+        error_kind="provider_client_error",
+        status_code=400,
+    )
+    revoked_err = GmailOAuthError("invalid_grant")
+    revoked_err.__cause__ = http_400
+    assert gmail_backfill.is_transient_oauth_error(revoked_err) is False
+    assert gmail_backfill.is_transient_oauth_error(GmailOAuthError("no creds")) is False

@@ -279,9 +279,6 @@ BEGIN
         normalized_cursor,
         COALESCE(p_metadata, '{}'::jsonb)
     );
-    IF row_connection.connector_id = 'gmail' THEN
-        PERFORM ensure_gmail_ambient_responsibility(row_connection.account_key);
-    END IF;
 
     SELECT id
     INTO existing_id
@@ -1081,6 +1078,132 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION claim_due_gmail_incremental_syncs(
+    p_limit INT DEFAULT 5
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    lim INT := GREATEST(COALESCE(p_limit, 5), 1);
+    interval_s INT := GREATEST(
+        COALESCE(get_config_int('integrations.gmail.incremental_sync_interval_seconds'), 300),
+        30
+    );
+    memory_policy TEXT := lower(COALESCE(get_config_text('integrations.gmail.memory_policy'), ''));
+    row_conn integration_connections%ROWTYPE;
+    row_cursor connector_sync_cursors%ROWTYPE;
+    claimed JSONB := '[]'::jsonb;
+BEGIN
+    IF memory_policy = 'forget' THEN
+        RETURN '[]'::jsonb;
+    END IF;
+
+    FOR row_conn IN
+        SELECT ic.*
+        FROM integration_connections ic
+        LEFT JOIN connector_sync_cursors c
+               ON c.connection_id = ic.id
+              AND c.cursor_key = 'messages'
+        WHERE ic.connector_id = 'gmail'
+          AND ic.status = 'connected'
+          AND (memory_policy = 'remember' OR c.id IS NOT NULL)
+          AND (c.id IS NULL OR c.status = 'active')
+          AND (c.id IS NULL OR NULLIF(btrim(COALESCE(c.cursor_value->>'page_token', '')), '') IS NULL)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM connector_backfill_jobs j
+              WHERE j.connection_id = ic.id
+                AND j.cursor_key = 'messages'
+                AND j.status IN ('pending', 'in_progress', 'paused')
+          )
+          AND (
+              c.id IS NULL
+              OR (
+                  (c.last_completed_at IS NULL OR c.last_completed_at <= CURRENT_TIMESTAMP - make_interval(secs => interval_s))
+                  AND (c.last_started_at IS NULL OR c.last_started_at <= CURRENT_TIMESTAMP - make_interval(secs => interval_s))
+              )
+          )
+        ORDER BY COALESCE(c.last_completed_at, '1970-01-01'::timestamptz) ASC, ic.created_at ASC
+        LIMIT lim
+        FOR UPDATE OF ic SKIP LOCKED
+    LOOP
+        PERFORM ensure_connector_cursor(
+            row_conn.connector_id,
+            row_conn.account_key,
+            'messages',
+            jsonb_build_object('sync_mode', 'incremental')
+        );
+
+        UPDATE connector_sync_cursors
+        SET last_started_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE connection_id = row_conn.id
+          AND cursor_key = 'messages'
+        RETURNING * INTO row_cursor;
+
+        claimed := claimed || jsonb_build_array(jsonb_build_object(
+            'cursor_id', row_cursor.id::text,
+            'connection_id', row_cursor.connection_id::text,
+            'connector_id', row_cursor.connector_id,
+            'account_key', row_cursor.account_key,
+            'cursor_key', row_cursor.cursor_key,
+            'cursor_value', row_cursor.cursor_value,
+            'high_watermark', row_cursor.high_watermark,
+            'status', row_cursor.status,
+            'last_completed_at', row_cursor.last_completed_at,
+            'last_error', row_cursor.last_error
+        ));
+    END LOOP;
+
+    RETURN claimed;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION record_gmail_incremental_sync_error(
+    p_connection_id UUID,
+    p_cursor_key TEXT,
+    p_error TEXT,
+    p_needs_reauth BOOLEAN DEFAULT FALSE
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    normalized_cursor TEXT := COALESCE(NULLIF(btrim(p_cursor_key), ''), 'messages');
+    row_cursor connector_sync_cursors%ROWTYPE;
+BEGIN
+    -- Lock connection before cursor (same order as complete_connection_attempt
+    -- and claim_due_gmail_incremental_syncs) to avoid lock-order deadlocks.
+    IF p_needs_reauth THEN
+        UPDATE integration_connections
+        SET status = 'needs_reauth',
+            last_error = NULLIF(left(COALESCE(p_error, ''), 2000), ''),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = p_connection_id
+          AND status = 'connected';
+    END IF;
+
+    UPDATE connector_sync_cursors
+    SET status = CASE WHEN p_needs_reauth THEN 'error' ELSE status END,
+        last_error = NULLIF(left(COALESCE(p_error, ''), 2000), ''),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE connection_id = p_connection_id
+      AND cursor_key = normalized_cursor
+    RETURNING * INTO row_cursor;
+
+    IF row_cursor.id IS NULL THEN
+        RETURN jsonb_build_object('status', 'missing', 'connection_id', p_connection_id::text);
+    END IF;
+
+    RETURN jsonb_build_object(
+        'cursor_id', row_cursor.id::text,
+        'connection_id', row_cursor.connection_id::text,
+        'status', row_cursor.status,
+        'last_error', row_cursor.last_error,
+        'needs_reauth', p_needs_reauth
+    );
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION get_connector_backfill_status(
     p_connector_id TEXT DEFAULT NULL,
     p_account_key TEXT DEFAULT NULL
@@ -1095,25 +1218,40 @@ DECLARE
 BEGIN
     SELECT COALESCE(jsonb_agg(
         jsonb_build_object(
-            'cursor_id', id::text,
-            'connection_id', connection_id::text,
-            'connector_id', connector_id,
-            'account_key', account_key,
-            'cursor_key', cursor_key,
-            'cursor_value', cursor_value,
-            'high_watermark', high_watermark,
-            'status', status,
-            'last_started_at', last_started_at,
-            'last_completed_at', last_completed_at,
-            'last_error', last_error,
-            'updated_at', updated_at
+            'cursor_id', c.id::text,
+            'connection_id', c.connection_id::text,
+            'connector_id', c.connector_id,
+            'account_key', c.account_key,
+            'cursor_key', c.cursor_key,
+            'cursor_value', c.cursor_value,
+            'high_watermark', c.high_watermark,
+            'status', c.status,
+            'last_started_at', c.last_started_at,
+            'last_completed_at', c.last_completed_at,
+            'last_error', c.last_error,
+            'stalled', (
+                NULLIF(btrim(COALESCE(c.cursor_value->>'page_token', '')), '') IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM connector_backfill_jobs j
+                    WHERE j.connection_id = c.connection_id
+                      AND j.cursor_key = c.cursor_key
+                      AND j.status IN ('pending', 'in_progress', 'paused')
+                )
+            ),
+            'sync_age_seconds', CASE
+                WHEN c.last_completed_at IS NOT NULL
+                THEN GREATEST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - c.last_completed_at))::INT, 0)
+                ELSE NULL
+            END,
+            'updated_at', c.updated_at
         )
-        ORDER BY updated_at DESC, connector_id, account_key, cursor_key
+        ORDER BY c.updated_at DESC, c.connector_id, c.account_key, c.cursor_key
     ), '[]'::jsonb)
     INTO cursors
-    FROM connector_sync_cursors
-    WHERE (p_connector_id IS NULL OR connector_id = p_connector_id)
-      AND (p_account_key IS NULL OR account_key = p_account_key);
+    FROM connector_sync_cursors c
+    WHERE (p_connector_id IS NULL OR c.connector_id = p_connector_id)
+      AND (p_account_key IS NULL OR c.account_key = p_account_key);
 
     SELECT COALESCE(jsonb_agg(
         jsonb_build_object(
