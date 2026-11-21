@@ -43,6 +43,20 @@ class GmailNotFoundError(GmailBackfillError):
     """Gmail returned 404 (expired historyId or deleted message)."""
 
 
+def is_transient_oauth_error(exc: Exception) -> bool:
+    """Return True when a GmailOAuthError wraps a transient HTTP/network outage
+    (e.g. 5xx, 429, timeout, network) rather than revoked/missing credentials
+    or policy denials."""
+    cause = exc.__cause__
+    if isinstance(cause, IntegrationHttpError):
+        if cause.transient:
+            return True
+        status = cause.status_code
+        if status is not None and (status == 429 or status >= 500):
+            return True
+    return False
+
+
 GMAIL_READ_SCOPES = {
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
@@ -759,7 +773,6 @@ async def _sync_expired_history_catchup(
             )
         except GmailNotFoundError:
             continue
-        latest_history_id = _max_history_id(latest_history_id, message.get("historyId"))
         if not worth_reading(message):
             items_skipped += 1
             continue
@@ -849,6 +862,7 @@ async def sync_gmail_cursor_incremental(
     collected_ids: list[str] = []
     seen_ids: set[str] = set()
     page_token: str | None = None
+    seen_page_tokens: set[str] = set()
     top_level_history_id: str | None = start_history_id
     last_completed_entry_history_id: str | None = start_history_id
     truncated = False
@@ -890,6 +904,15 @@ async def sync_gmail_cursor_incremental(
                 break
             next_token = resp.get("nextPageToken")
             if isinstance(next_token, str) and next_token:
+                if next_token in seen_page_tokens:
+                    logger.warning(
+                        "Gmail history.list repeated pageToken %s for %s; stopping pagination",
+                        next_token,
+                        account_key,
+                    )
+                    truncated = True
+                    break
+                seen_page_tokens.add(next_token)
                 page_token = next_token
             else:
                 break
@@ -924,8 +947,6 @@ async def sync_gmail_cursor_incremental(
         except GmailNotFoundError:
             logger.debug("Gmail message %s disappeared before incremental fetch; skipping", msg_id)
             continue
-        if not truncated:
-            next_history_id = _max_history_id(next_history_id, message.get("historyId"))
         if not worth_reading(message):
             items_skipped += 1
             continue
@@ -1032,8 +1053,8 @@ async def run_gmail_incremental_sync_step(pool: Any, *, limit: int | None = None
     try:
         credentials = await refresh_default_credentials_if_needed()
         _check_read_scopes(credentials)
-    except (GmailPermissionError, GmailOAuthError) as exc:
-        logger.warning("Gmail incremental sync cannot authenticate: %s", exc)
+    except GmailPermissionError as exc:
+        logger.warning("Gmail incremental sync lacks mail read permission: %s", exc)
         for cursor in cursors:
             await _record_incremental_error(
                 pool,
@@ -1041,6 +1062,26 @@ async def run_gmail_incremental_sync_step(pool: Any, *, limit: int | None = None
                 str(cursor.get("cursor_key") or "messages"),
                 str(exc),
                 needs_reauth=True,
+            )
+        return {
+            "failed": True,
+            "error": str(exc),
+            "accounts_failed": len(cursors),
+        }
+    except GmailOAuthError as exc:
+        transient = is_transient_oauth_error(exc)
+        logger.warning(
+            "Gmail incremental sync OAuth refresh failed (transient=%s): %s",
+            transient,
+            exc,
+        )
+        for cursor in cursors:
+            await _record_incremental_error(
+                pool,
+                str(cursor.get("connection_id") or ""),
+                str(cursor.get("cursor_key") or "messages"),
+                str(exc),
+                needs_reauth=not transient,
             )
         return {
             "failed": True,

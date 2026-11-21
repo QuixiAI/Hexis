@@ -1171,14 +1171,8 @@ DECLARE
     normalized_cursor TEXT := COALESCE(NULLIF(btrim(p_cursor_key), ''), 'messages');
     row_cursor connector_sync_cursors%ROWTYPE;
 BEGIN
-    UPDATE connector_sync_cursors
-    SET status = CASE WHEN p_needs_reauth THEN 'error' ELSE status END,
-        last_error = NULLIF(left(COALESCE(p_error, ''), 2000), ''),
-        updated_at = CURRENT_TIMESTAMP
-    WHERE connection_id = p_connection_id
-      AND cursor_key = normalized_cursor
-    RETURNING * INTO row_cursor;
-
+    -- Lock connection before cursor (same order as complete_connection_attempt
+    -- and claim_due_gmail_incremental_syncs) to avoid lock-order deadlocks.
     IF p_needs_reauth THEN
         UPDATE integration_connections
         SET status = 'needs_reauth',
@@ -1187,6 +1181,14 @@ BEGIN
         WHERE id = p_connection_id
           AND status = 'connected';
     END IF;
+
+    UPDATE connector_sync_cursors
+    SET status = CASE WHEN p_needs_reauth THEN 'error' ELSE status END,
+        last_error = NULLIF(left(COALESCE(p_error, ''), 2000), ''),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE connection_id = p_connection_id
+      AND cursor_key = normalized_cursor
+    RETURNING * INTO row_cursor;
 
     IF row_cursor.id IS NULL THEN
         RETURN jsonb_build_object('status', 'missing', 'connection_id', p_connection_id::text);

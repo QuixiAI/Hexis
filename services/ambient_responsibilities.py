@@ -28,6 +28,7 @@ from services.gmail_backfill import (
     _gmail_get,
     _upsert_source_item,
     gmail_message_to_source_item,
+    is_transient_oauth_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -850,12 +851,26 @@ async def run_ambient_responsibility_step(
             status, decision, observations = await evaluate_ambient_responsibility(
                 pool, claim
             )
-        except (GmailPermissionError, GmailOAuthError) as exc:
+        except GmailPermissionError as exc:
             status, decision, observations = (
                 "blocked",
                 {"reason": "provider_unavailable", "error": str(exc)},
                 [],
             )
+        except GmailOAuthError as exc:
+            if is_transient_oauth_error(exc):
+                logger.warning("Ambient Gmail OAuth refresh failed transiently: %s", exc)
+                status, decision, observations = (
+                    "failed",
+                    {"reason": "provider_transient_error", "error": str(exc)},
+                    [],
+                )
+            else:
+                status, decision, observations = (
+                    "blocked",
+                    {"reason": "provider_unavailable", "error": str(exc)},
+                    [],
+                )
         except GmailBackfillError as exc:
             logger.warning("Ambient Gmail evaluation failed transiently: %s", exc)
             status, decision, observations = (

@@ -363,15 +363,21 @@ async def test_run_gmail_incremental_sync_seeds_baseline_and_syncs_history_list(
         },
     )
 
-    async with db_pool.acquire() as conn:
-        prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
-        await conn.execute(
-            "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail'"
-        )
-        await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
-    await _connected_gmail(db_pool, marker, account)
-
+    prev_policy = None
+    prev_gmail_statuses: list[tuple[str, str]] = []
     try:
+        async with db_pool.acquire() as conn:
+            prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            prev_rows = await conn.fetch(
+                "SELECT id::text AS id, status FROM integration_connections WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            prev_gmail_statuses = [(r["id"], r["status"]) for r in prev_rows]
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+        await _connected_gmail(db_pool, marker, account)
+
         calls: list[tuple[str, dict | None]] = []
 
         async def seed_gmail_get(credentials, path, *, params=None):
@@ -463,6 +469,12 @@ async def test_run_gmail_incremental_sync_seeds_baseline_and_syncs_history_list(
                 await conn.execute("SELECT set_config('integrations.gmail.memory_policy', $1::jsonb)", prev_policy)
             await conn.execute("DELETE FROM integration_connections WHERE account_key = $1", account)
             await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)
+            for conn_id, status in prev_gmail_statuses:
+                await conn.execute(
+                    "UPDATE integration_connections SET status = $2 WHERE id = $1::uuid",
+                    conn_id,
+                    status,
+                )
 
 
 async def test_run_gmail_incremental_sync_recovers_from_expired_history_id_404(
@@ -491,14 +503,20 @@ async def test_run_gmail_incremental_sync_recovers_from_expired_history_id_404(
         },
     )
 
-    async with db_pool.acquire() as conn:
-        prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
-        await conn.execute(
-            "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail'"
-        )
-        await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
-    await _connected_gmail(db_pool, marker, account)
+    prev_policy = None
+    prev_gmail_statuses: list[tuple[str, str]] = []
     try:
+        async with db_pool.acquire() as conn:
+            prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            prev_rows = await conn.fetch(
+                "SELECT id::text AS id, status FROM integration_connections WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            prev_gmail_statuses = [(r["id"], r["status"]) for r in prev_rows]
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+        await _connected_gmail(db_pool, marker, account)
         async with db_pool.acquire() as conn:
             await conn.fetchval(
                 "SELECT advance_connector_cursor('gmail', $1, 'messages', '{\"history_id\": \"100\"}'::jsonb, CURRENT_TIMESTAMP - INTERVAL '10 days')",
@@ -551,6 +569,12 @@ async def test_run_gmail_incremental_sync_recovers_from_expired_history_id_404(
                 await conn.execute("SELECT set_config('integrations.gmail.memory_policy', $1::jsonb)", prev_policy)
             await conn.execute("DELETE FROM integration_connections WHERE account_key = $1", account)
             await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)
+            for conn_id, status in prev_gmail_statuses:
+                await conn.execute(
+                    "UPDATE integration_connections SET status = $2 WHERE id = $1::uuid",
+                    conn_id,
+                    status,
+                )
 
 
 async def test_missing_credentials_fails_loud_for_backfill_and_incremental_sync(
@@ -564,15 +588,21 @@ async def test_missing_credentials_fails_loud_for_backfill_and_incremental_sync(
     marker = get_test_identifier("gmail-nocreds")
     account = f"eric-{marker}@example.com"
 
-    async with db_pool.acquire() as conn:
-        prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
-        await conn.execute(
-            "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail'"
-        )
-        await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
-    await _connected_gmail(db_pool, marker, account)
-
+    prev_policy = None
+    prev_gmail_statuses: list[tuple[str, str]] = []
     try:
+        async with db_pool.acquire() as conn:
+            prev_policy = await conn.fetchval("SELECT value FROM config WHERE key = 'integrations.gmail.memory_policy'")
+            prev_rows = await conn.fetch(
+                "SELECT id::text AS id, status FROM integration_connections WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            prev_gmail_statuses = [(r["id"], r["status"]) for r in prev_rows]
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'revoked' WHERE connector_id = 'gmail' AND status <> 'revoked'"
+            )
+            await conn.execute("SELECT set_config('integrations.gmail.memory_policy', '\"remember\"'::jsonb)")
+        await _connected_gmail(db_pool, marker, account)
+
         # 1. Incremental sync due with missing credentials -> fails loud + marks needs_reauth.
         inc_result = await gmail_backfill.run_gmail_incremental_sync_step(db_pool, limit=5)
         assert inc_result["failed"] is True
@@ -611,3 +641,53 @@ async def test_missing_credentials_fails_loud_for_backfill_and_incremental_sync(
                 await conn.execute("SELECT set_config('integrations.gmail.memory_policy', $1::jsonb)", prev_policy)
             await conn.execute("DELETE FROM integration_connections WHERE account_key = $1", account)
             await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)
+            for conn_id, status in prev_gmail_statuses:
+                await conn.execute(
+                    "UPDATE integration_connections SET status = $2 WHERE id = $1::uuid",
+                    conn_id,
+                    status,
+                )
+
+
+async def test_is_transient_oauth_error_distinguishes_503_from_invalid_grant():
+    from core.auth.google_gmail import GmailOAuthError
+    from core.integration_reliability import IntegrationHttpError
+
+    http_503 = IntegrationHttpError(
+        "Service Unavailable",
+        provider="google_oauth",
+        error_kind="provider_transient",
+        status_code=503,
+    )
+    transient_err = GmailOAuthError("temporary outage")
+    transient_err.__cause__ = http_503
+    assert gmail_backfill.is_transient_oauth_error(transient_err) is True
+
+    timeout_err = GmailOAuthError("timed out")
+    timeout_err.__cause__ = IntegrationHttpError(
+        "timeout",
+        provider="google_oauth",
+        error_kind="timeout",
+        status_code=None,
+    )
+    assert gmail_backfill.is_transient_oauth_error(timeout_err) is True
+
+    policy_err = GmailOAuthError("blocked by policy")
+    policy_err.__cause__ = IntegrationHttpError(
+        "domain blocked",
+        provider="google_oauth",
+        error_kind="domain_policy",
+        status_code=None,
+    )
+    assert gmail_backfill.is_transient_oauth_error(policy_err) is False
+
+    http_400 = IntegrationHttpError(
+        "invalid_grant",
+        provider="google_oauth",
+        error_kind="provider_client_error",
+        status_code=400,
+    )
+    revoked_err = GmailOAuthError("invalid_grant")
+    revoked_err.__cause__ = http_400
+    assert gmail_backfill.is_transient_oauth_error(revoked_err) is False
+    assert gmail_backfill.is_transient_oauth_error(GmailOAuthError("no creds")) is False
