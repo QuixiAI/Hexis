@@ -213,6 +213,7 @@ class IngestLLM:
             model=self._cfg["model"],
             endpoint=self._cfg.get("endpoint"),
             api_key=self._cfg.get("api_key"),
+            fallbacks=self._cfg.get("fallbacks"),
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens or self.max_tokens,
@@ -221,8 +222,8 @@ class IngestLLM:
             reasoning_effort=self.reasoning_effort,
         )
         await record_llm_usage(
-            provider=self._cfg["provider"],
-            model=self._cfg["model"],
+            provider=result.get("provider", self._cfg["provider"]),
+            model=result.get("model", self._cfg["model"]),
             raw_response=result.get("raw"),
             source="ingest",
         )

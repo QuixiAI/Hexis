@@ -485,3 +485,15 @@ async def test_get_appraisal_db_context_runs_against_real_schema(db_pool):
     assert any(
         g.get("title") == "Appraisal context goal pin" for g in goals.get("active", [])
     )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_subconscious_runtime_failure_is_visible_without_inventing_affect():
+    from unittest.mock import AsyncMock
+    from services.agent import SubconsciousOutput, render_subconscious_signals_db
+    conn = AsyncMock()
+    output = SubconsciousOutput(runtime_recoveries=[{"kind":"appraisal_failed"}])
+    text = await render_subconscious_signals_db(conn, output)
+    assert "appraisal_failed" in text
+    assert "not evidence of emotional neutrality" in text
+    conn.fetchval.assert_not_called()

@@ -80,3 +80,15 @@ async def test_real_override_wins_over_fallback(db_pool):
             assert cfg["model"] == "override-model"
         finally:
             await tr.rollback()
+
+
+async def test_global_inference_fallbacks_survive_primary_credential_failure(db_pool, monkeypatch):
+    from unittest.mock import AsyncMock
+    from core import llm_config
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            routes = [{"provider":"openai_compatible", "model":"reserve", "endpoint":"http://localhost:4000/v1"}]
+            await conn.execute("INSERT INTO config(key,value) VALUES ('llm.fallbacks',$1::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", json.dumps(routes))
+            monkeypatch.setattr(llm_config, "apply_provider_credentials", AsyncMock(side_effect=RuntimeError("expired")))
+            cfg = await load_llm_config(conn, "llm.test_primary")
+            assert cfg["fallbacks"] == routes

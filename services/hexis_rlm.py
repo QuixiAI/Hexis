@@ -298,6 +298,7 @@ async def _llm_completion(
         model=llm_config["model"],
         endpoint=llm_config.get("endpoint"),
         api_key=llm_config.get("api_key"),
+        fallbacks=llm_config.get("fallbacks"),
         messages=messages,
         temperature=0.7,
         max_tokens=max_tokens,
@@ -305,8 +306,8 @@ async def _llm_completion(
     import asyncio
     from core.usage import record_llm_usage
     asyncio.ensure_future(record_llm_usage(
-        provider=llm_config["provider"],
-        model=llm_config["model"],
+        provider=result.get("provider", llm_config["provider"]),
+        model=result.get("model", llm_config["model"]),
         raw_response=result.get("raw"),
         source="rlm",
     ))

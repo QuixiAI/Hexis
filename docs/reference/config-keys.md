@@ -53,6 +53,22 @@ SELECT set_config('agent.name', '"MyAgent"'::jsonb);
 | `llm.extraction.*` | text | Conscious-extraction LLM (falls back to subconscious) |
 | `llm.inbound_disposition` | object/null | Optional ambiguity-classifier override (falls back to `llm.subconscious`) |
 
+### Inference recovery
+
+`llm.fallbacks` is an ordered JSON array of explicitly configured fallback
+inference routes (using the usual `provider`, `model`, `endpoint`, and
+credential fields). A role's `fallbacks` array overrides this global list;
+`[]` disables fallback for that role.
+
+Recovery retries temporary transport/server failures, adapts explicitly rejected
+optional features (such as `stream_options`, streaming, or late system messages
+on Codex), and preserves instructions and tools. Routes share a time budget so
+primary retries cannot consume the whole turn. Already delivered text/reasoning
+is not replayed automatically. Runtime receipts inform the model and agent-turn
+event log; failed chat replies stay in continuity until a subsequent successful
+reply, with no age cutoff. Conversational replies are asked to acknowledge the
+interruption; structured calls retain their schema.
+
 ### Community-model opening dividers
 
 Some community models emit an unwanted `---`, `***`, or `___` before their
