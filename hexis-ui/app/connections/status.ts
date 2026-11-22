@@ -116,7 +116,7 @@ export type ConnectorActionAuditEntry = {
   target: string | null;
   decision: string;
   reason: string | null;
-  sensitivity: string | null;
+  tool_context?: string | null;
   created_at: string | null;
 };
 

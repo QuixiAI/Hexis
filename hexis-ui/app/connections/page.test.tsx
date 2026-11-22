@@ -122,7 +122,7 @@ describe("Wave B connections setup", () => {
               target: "recruiter@example.com",
               decision: "allowed",
               reason: "preauthorized_policy",
-              sensitivity: "provider_state_change",
+              tool_context: "heartbeat",
               created_at: "2026-11-21T01:00:00Z",
             },
           ],

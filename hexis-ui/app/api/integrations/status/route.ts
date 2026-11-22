@@ -63,7 +63,7 @@ export async function GET(): Promise<Response> {
                 'target', target,
                 'decision', decision,
                 'reason', reason,
-                'sensitivity', sensitivity,
+                'tool_context', tool_context,
                 'created_at', created_at
               )
               ORDER BY created_at DESC

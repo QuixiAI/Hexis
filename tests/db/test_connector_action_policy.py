@@ -272,11 +272,32 @@ async def test_gmail_draft_policy_gating_and_audit_via_migration_0266(db_pool):
                 json.dumps({"to": "ceo@example.com", "subject": "Hi", "body": "Hey"}),
                 json.dumps({"tool_context": "heartbeat", "energy_available": 20}),
             ))
+            sneaky_cc = _j(await conn.fetchval(
+                "SELECT evaluate_tool_call('gmail_draft', $1::jsonb, $2::jsonb)",
+                json.dumps({
+                    "to": "recruiter@example.com",
+                    "cc": "outside@evil.com",
+                    "subject": "Re: Role",
+                    "body": "No thanks",
+                }),
+                json.dumps({"tool_context": "heartbeat", "energy_available": 20}),
+            ))
             assert allowed["allowed"] is True
             assert allowed["connector_action"]["policy_id"] == policy["policy_id"]
             assert wrong_target["allowed"] is False
+            assert sneaky_cc["allowed"] is False
         finally:
             await tr.rollback()
+
+
+async def test_integration_status_payload_includes_action_policies_and_audit(db_pool):
+    """#100: /api/integrations/status SQL queries for action_policies and
+    connector_action_audit must match the live schema cleanly."""
+    from apps.hexis_api import _integration_status_payload
+
+    payload = await _integration_status_payload(db_pool, None)
+    assert isinstance(payload.get("action_policies"), list)
+    assert isinstance(payload.get("action_audit"), list)
 
 
 async def test_connector_action_policy_can_be_revoked(db_pool):

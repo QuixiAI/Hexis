@@ -1224,7 +1224,7 @@ async def _integration_status_payload(
                     'target', target,
                     'decision', decision,
                     'reason', reason,
-                    'sensitivity', sensitivity,
+                    'tool_context', tool_context,
                     'created_at', created_at
                 )
                 ORDER BY created_at DESC
@@ -1602,13 +1602,13 @@ async def integration_action(req: IntegrationActionRequest):
                 reason,
             )
         payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
-        if payload.get("status") == "missing":
+        if payload.get("status") != "revoked":
             return JSONResponse(
                 {
                     "success": False,
                     "output": payload,
                     "display_output": None,
-                    "error": "Action policy not found.",
+                    "error": "Action policy not found or already inactive.",
                     "error_type": "invalid_params",
                 },
                 status_code=404,

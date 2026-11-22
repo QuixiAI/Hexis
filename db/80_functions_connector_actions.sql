@@ -193,6 +193,9 @@ AS $$
 DECLARE
     constraints JSONB := COALESCE(p_constraints, '{}'::jsonb);
     target TEXT := NULLIF(btrim(COALESCE(p_target, '')), '');
+    recipient TEXT;
+    recipients TEXT[] := ARRAY[]::TEXT[];
+    addr_field TEXT;
     max_per_day INT;
     used_today INT;
 BEGIN
@@ -215,6 +218,44 @@ BEGIN
        AND NOT _connector_action_jsonb_text_has(constraints->'allowed_recipients', target) THEN
         RETURN jsonb_build_object('allowed', FALSE, 'reason', 'recipient is not in the policy allowlist');
     END IF;
+
+    -- For email tools carrying comma-separated to/cc/bcc headers, enforce
+    -- recipient/target allowlists and denylists on every address (#100).
+    IF p_arguments IS NOT NULL AND jsonb_typeof(p_arguments) = 'object' THEN
+        FOREACH addr_field IN ARRAY ARRAY['to', 'cc', 'bcc']
+        LOOP
+            IF NULLIF(btrim(COALESCE(p_arguments->>addr_field, '')), '') IS NOT NULL THEN
+                FOR recipient IN
+                    SELECT NULLIF(btrim(part), '')
+                    FROM unnest(string_to_array(p_arguments->>addr_field, ',')) AS part
+                LOOP
+                    IF recipient IS NOT NULL THEN
+                        recipients := recipients || recipient;
+                    END IF;
+                END LOOP;
+            END IF;
+        END LOOP;
+    END IF;
+
+    FOREACH recipient IN ARRAY recipients
+    LOOP
+        IF constraints ? 'denied_targets'
+           AND _connector_action_jsonb_text_has(constraints->'denied_targets', recipient) THEN
+            RETURN jsonb_build_object('allowed', FALSE, 'reason', 'recipient is denied by policy constraints');
+        END IF;
+        IF constraints ? 'denied_recipients'
+           AND _connector_action_jsonb_text_has(constraints->'denied_recipients', recipient) THEN
+            RETURN jsonb_build_object('allowed', FALSE, 'reason', 'recipient is denied by policy constraints');
+        END IF;
+        IF constraints ? 'allowed_targets'
+           AND NOT _connector_action_jsonb_text_has(constraints->'allowed_targets', recipient) THEN
+            RETURN jsonb_build_object('allowed', FALSE, 'reason', 'recipient is not in the policy allowlist');
+        END IF;
+        IF constraints ? 'allowed_recipients'
+           AND NOT _connector_action_jsonb_text_has(constraints->'allowed_recipients', recipient) THEN
+            RETURN jsonb_build_object('allowed', FALSE, 'reason', 'recipient is not in the policy allowlist');
+        END IF;
+    END LOOP;
 
     IF constraints ? 'max_per_day' AND p_policy_id IS NOT NULL THEN
         BEGIN
@@ -604,6 +645,8 @@ DECLARE
     action_policy JSONB;
     approval_ok BOOLEAN := FALSE;
     approval_request UUID;
+    purpose_goal_id UUID;
+    assigned_energy_multiplier DOUBLE PRECISION;
 BEGIN
     SELECT * INTO tool FROM tool_definitions WHERE name = p_tool_name;
     IF NOT FOUND THEN
@@ -643,6 +686,30 @@ BEGIN
     END IF;
 
     cost := COALESCE(NULLIF(cfg #>> ARRAY['costs', tool.name], '')::int, tool.default_energy_cost);
+    IF tool.metadata ? 'outbound'
+       AND lower(COALESCE(p_arguments->>'purpose_kind', '')) = 'goal' THEN
+        BEGIN
+            purpose_goal_id := NULLIF(p_arguments->>'purpose_reference', '')::uuid;
+        EXCEPTION WHEN OTHERS THEN
+            purpose_goal_id := NULL;
+        END;
+        IF purpose_goal_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM memories
+            WHERE id = purpose_goal_id
+              AND type = 'goal'
+              AND goal_origin = 'user_request'::goal_source
+        ) THEN
+            assigned_energy_multiplier := LEAST(
+                GREATEST(
+                    COALESCE(get_config_float('outbound.assigned_goal_energy_multiplier'), 0.25),
+                    0
+                ),
+                1
+            );
+            cost := CEIL(cost * assigned_energy_multiplier)::integer;
+        END IF;
+    END IF;
+
     IF ctx = 'heartbeat' AND p_context ? 'energy_available' THEN
         BEGIN energy_available := NULLIF(p_context->>'energy_available', '')::int;
         EXCEPTION WHEN OTHERS THEN energy_available := NULL; END;
