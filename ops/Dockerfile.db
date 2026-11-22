@@ -1,4 +1,4 @@
-FROM postgres:16-bullseye
+FROM postgres:16-bookworm
 
 # 1. Install Build Dependencies
 RUN apt-get update && apt-get install -y \
