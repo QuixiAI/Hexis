@@ -832,9 +832,9 @@ function GmailControls({
 
   const capabilities =
     accessTier === "manage"
-      ? ["read", "search", "send", "reply", "label", "spam_triage", "delete"]
+      ? ["read", "search", "draft", "send", "reply", "label", "spam_triage", "delete"]
       : accessTier === "write"
-        ? ["read", "search", "send", "reply"]
+        ? ["read", "search", "draft", "send", "reply"]
         : ["read", "search"];
   const pendingAttempt =
     summary.activeAttempts[0] ||
