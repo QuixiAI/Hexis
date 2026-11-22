@@ -22,7 +22,9 @@ from core.integration_reliability import (
 
 GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1"
 SCOPE_SEND = "https://www.googleapis.com/auth/gmail.send"
+SCOPE_COMPOSE = "https://www.googleapis.com/auth/gmail.compose"
 SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"
+DRAFT_SCOPES = {SCOPE_COMPOSE, SCOPE_MODIFY, "https://mail.google.com/"}
 
 
 class GmailActionError(RuntimeError):
@@ -35,6 +37,14 @@ def _scope_set(credentials: dict[str, Any]) -> set[str]:
 
 def _require_scope(credentials: dict[str, Any], scope: str, capability: str) -> None:
     if scope not in _scope_set(credentials):
+        raise GmailActionError(
+            f"Saved Gmail credentials do not include {capability}. "
+            f"Reconnect Gmail with the {capability} capability before using this action."
+        )
+
+
+def _require_any_scope(credentials: dict[str, Any], scopes: set[str], capability: str) -> None:
+    if not scopes.intersection(_scope_set(credentials)):
         raise GmailActionError(
             f"Saved Gmail credentials do not include {capability}. "
             f"Reconnect Gmail with the {capability} capability before using this action."
@@ -191,6 +201,55 @@ async def reply_gmail_message(
         "account_key": account,
         "message_id": sent.get("id"),
         "thread_id": sent.get("threadId") or thread_id,
+        "to": _split_addresses(to),
+        "cc": _split_addresses(cc),
+        "subject": subject,
+    }
+
+
+async def create_gmail_draft(
+    *,
+    account_key: str | None,
+    to: str,
+    subject: str,
+    body: str,
+    thread_id: str | None = None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+) -> dict[str, Any]:
+    """Create a reversible Gmail draft (standalone or reply inside a thread) without sending."""
+    credentials = await refresh_default_credentials_if_needed()
+    _require_any_scope(credentials, DRAFT_SCOPES, "draft")
+    account = _check_account(credentials, account_key)
+    raw = _raw_message(
+        from_email=account,
+        to=to,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        in_reply_to=in_reply_to,
+        references=references,
+    )
+    message_payload: dict[str, Any] = {"raw": raw}
+    if thread_id and thread_id.strip():
+        message_payload["threadId"] = thread_id.strip()
+    created = await _gmail_request(
+        credentials,
+        "POST",
+        "/users/me/drafts",
+        json_body={"message": message_payload},
+    )
+    draft_message = created.get("message") if isinstance(created.get("message"), dict) else {}
+    return {
+        "drafted": True,
+        "connector_id": "gmail",
+        "account_key": account,
+        "draft_id": created.get("id"),
+        "message_id": draft_message.get("id"),
+        "thread_id": draft_message.get("threadId") or (thread_id.strip() if thread_id else None),
         "to": _split_addresses(to),
         "cc": _split_addresses(cc),
         "subject": subject,

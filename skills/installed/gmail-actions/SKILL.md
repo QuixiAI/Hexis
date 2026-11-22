@@ -1,12 +1,12 @@
 ---
 name: gmail-actions
-description: Send Gmail messages, reply to threads, apply labels, triage spam, and delete messages with explicit action authorization
+description: Draft, send, reply to threads, apply labels, triage spam, and delete Gmail messages with explicit action authorization
 category: communication
 requires:
-  tools: [gmail_send, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, connector_action_policy_status]
+  tools: [gmail_draft, gmail_send, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, connector_action_policy_status]
 contexts: [chat, heartbeat]
-aliases: [email, emails, mail, inbox, message, reply, send, unread, archive, spam]
-bound_tools: [gmail_send, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, connector_action_policy_status]
+aliases: [email, emails, mail, inbox, message, reply, send, draft, unread, archive, spam]
+bound_tools: [gmail_draft, gmail_send, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, connector_action_policy_status]
 ---
 
 # Gmail Actions
@@ -24,7 +24,8 @@ Use this only after Gmail is connected and the user asks for an outward Gmail ac
 ## Flow
 
 1. If the user asks for ongoing behavior, use `connector-action-authorization` first.
-2. For a one-off send, call `gmail_send` with `to`, `subject`, and `body`.
+2. To stage a message or reply for the user's review without sending, call `gmail_draft` with `to`, `subject`, `body`, and optional `thread_id`.
+3. For a one-off send, call `gmail_send` with `to`, `subject`, and `body`.
 3. For a reply, call `gmail_reply` with `thread_id`, recipient, subject, and body.
 4. For labels, call `gmail_label` with explicit `add_label_ids` and/or `remove_label_ids`.
 5. For spam triage, call `gmail_spam_triage` with `mark_spam`, `mark_not_spam`, or `archive`.

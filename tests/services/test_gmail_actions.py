@@ -169,3 +169,60 @@ async def test_delete_gmail_message_can_permanently_delete(monkeypatch, tmp_path
 
     assert result["deleted"] is True
     assert result["permanent"] is True
+
+
+async def test_create_gmail_draft_posts_rfc822_draft_with_compose_or_modify_scope(monkeypatch, tmp_path):
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    _save_credentials("eric@example.com", [gmail_actions.SCOPE_COMPOSE])
+
+    async def fake_request(credentials, method, path, *, json_body=None):
+        assert method == "POST"
+        assert path == "/users/me/drafts"
+        assert json_body["message"]["threadId"] == "thread-42"
+        decoded = _decode_raw(json_body["message"]["raw"])
+        assert "From: eric@example.com" in decoded
+        assert "To: recruiter@example.com" in decoded
+        assert "Subject: Re: Opportunity" in decoded
+        assert "In-Reply-To: <orig-42@example.com>" in decoded
+        assert "No, thank you." in decoded
+        return {"id": "draft-1", "message": {"id": "msg-draft-1", "threadId": "thread-42"}}
+
+    monkeypatch.setattr(gmail_actions, "_gmail_request", fake_request)
+
+    result = await gmail_actions.create_gmail_draft(
+        account_key="eric@example.com",
+        to="recruiter@example.com",
+        subject="Re: Opportunity",
+        body="No, thank you.",
+        thread_id="thread-42",
+        in_reply_to="<orig-42@example.com>",
+    )
+
+    assert result["drafted"] is True
+    assert result["draft_id"] == "draft-1"
+    assert result["message_id"] == "msg-draft-1"
+    assert result["thread_id"] == "thread-42"
+
+    # gmail.send alone does not grant /users/me/drafts; must fail with clear scope error.
+    _save_credentials("eric@example.com", [gmail_actions.SCOPE_SEND])
+    with pytest.raises(gmail_actions.GmailActionError, match="do not include draft"):
+        await gmail_actions.create_gmail_draft(
+            account_key="eric@example.com",
+            to="recruiter@example.com",
+            subject="Re: Opportunity",
+            body="No, thank you.",
+        )
+
+
+async def test_gmail_draft_tool_is_registered_for_heartbeat_and_chat():
+    from core.tools.base import ToolContext
+    from core.tools.registry import create_default_registry
+
+    registry = create_default_registry(pool=None)
+    handler = registry.get("gmail_draft")
+    assert handler is not None
+    assert handler.spec.requires_approval is True
+    assert ToolContext.HEARTBEAT in handler.spec.allowed_contexts
+    assert ToolContext.CHAT in handler.spec.allowed_contexts

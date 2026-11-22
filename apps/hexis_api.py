@@ -1208,6 +1208,37 @@ async def _integration_status_payload(
         backfill_raw = await conn.fetchval(
             "SELECT get_connector_backfill_status($1, NULL)", normalized_id
         )
+        action_policies_raw = await conn.fetchval(
+            "SELECT list_connector_action_policies($1, NULL, FALSE)", normalized_id
+        )
+        action_audit_raw = await conn.fetchval(
+            """
+            SELECT COALESCE(jsonb_agg(
+                jsonb_build_object(
+                    'audit_id', id::text,
+                    'policy_id', policy_id::text,
+                    'connector_id', connector_id,
+                    'account_key', account_key,
+                    'action_kind', action_kind,
+                    'tool_name', tool_name,
+                    'target', target,
+                    'decision', decision,
+                    'reason', reason,
+                    'tool_context', tool_context,
+                    'created_at', created_at
+                )
+                ORDER BY created_at DESC
+            ), '[]'::jsonb)
+            FROM (
+                SELECT *
+                FROM connector_action_audit
+                WHERE ($1::text IS NULL OR connector_id = $1)
+                ORDER BY created_at DESC
+                LIMIT 25
+            ) recent_audit
+            """,
+            normalized_id,
+        )
         gmail_memory_policy = (
             await conn.fetchval(
                 "SELECT COALESCE(get_config_text('integrations.gmail.memory_policy'), 'ask')"
@@ -1256,6 +1287,10 @@ async def _integration_status_payload(
             else []
         ),
     }
+    action_policies = _json_value(action_policies_raw)
+    action_audit = _json_value(action_audit_raw)
+    payload["action_policies"] = action_policies if isinstance(action_policies, list) else []
+    payload["action_audit"] = action_audit if isinstance(action_audit, list) else []
     payload["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return payload
 
@@ -1550,6 +1585,43 @@ async def integration_action(req: IntegrationActionRequest):
             for key, value in req.model_extra.items()
             if key not in {"action", "arguments", "source_session_id"}
         }
+
+    if action == "revoke_action_policy":
+        raw_policy_id = str(action_arguments.get("policy_id") or "").strip()
+        try:
+            policy_uuid = str(uuid.UUID(raw_policy_id))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="valid policy_id UUID is required"
+            ) from exc
+        reason = str(action_arguments.get("reason") or "revoked from web connections").strip()
+        async with pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT revoke_connector_action_policy($1::uuid, $2)",
+                policy_uuid,
+                reason,
+            )
+        payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if payload.get("status") != "revoked":
+            return JSONResponse(
+                {
+                    "success": False,
+                    "output": payload,
+                    "display_output": None,
+                    "error": "Action policy not found or already inactive.",
+                    "error_type": "invalid_params",
+                },
+                status_code=404,
+            )
+        return JSONResponse(
+            {
+                "success": True,
+                "output": payload,
+                "display_output": "Connector action policy revoked.",
+                "error": None,
+                "error_type": None,
+            }
+        )
 
     if action == "revoke_connection":
         connector_id = (

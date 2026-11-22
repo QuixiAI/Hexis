@@ -41,6 +41,27 @@ GMAIL_SETUP_HINT = (
 )
 
 
+async def _resolve_gmail_credentials(
+    resolver: Callable[[], Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve Gmail credentials from a sync or async resolver without falling
+    back to ambient environment credentials.
+
+    Returns (credentials, auth_error_message).
+    """
+    if not resolver:
+        return None, None
+    from core.auth.google_gmail import GmailOAuthError
+
+    try:
+        resolved = resolver()
+        if inspect.isawaitable(resolved):
+            resolved = await resolved
+    except GmailOAuthError as exc:
+        return None, str(exc)
+    return (resolved if isinstance(resolved, dict) else None), None
+
+
 async def _gmail_setup_required_result(context: ToolExecutionContext) -> ToolResult:
     """Return a Gmail auth failure with the setup UI attached when available."""
     display = "Gmail is not connected. Open the Gmail setup panel to approve access with Google."
@@ -508,9 +529,9 @@ class EmailListHandler(_GmailCredentials, ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        credentials = None
-        if self._credentials_resolver:
-            credentials = self._credentials_resolver()
+        credentials, auth_error = await _resolve_gmail_credentials(self._credentials_resolver)
+        if auth_error:
+            return ToolResult.error_result(auth_error, ToolErrorType.AUTH_FAILED)
 
         if not credentials:
             return await _gmail_setup_required_result(context)
@@ -654,9 +675,9 @@ class EmailReadHandler(_GmailCredentials, ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        credentials = None
-        if self._credentials_resolver:
-            credentials = self._credentials_resolver()
+        credentials, auth_error = await _resolve_gmail_credentials(self._credentials_resolver)
+        if auth_error:
+            return ToolResult.error_result(auth_error, ToolErrorType.AUTH_FAILED)
 
         if not credentials:
             return await _gmail_setup_required_result(context)
@@ -787,9 +808,9 @@ class EmailSearchHandler(_GmailCredentials, ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        credentials = None
-        if self._credentials_resolver:
-            credentials = self._credentials_resolver()
+        credentials, auth_error = await _resolve_gmail_credentials(self._credentials_resolver)
+        if auth_error:
+            return ToolResult.error_result(auth_error, ToolErrorType.AUTH_FAILED)
 
         if not credentials:
             return await _gmail_setup_required_result(context)
@@ -1004,9 +1025,9 @@ class IngestEmailsHandler(_GmailCredentials, ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        credentials = None
-        if self._credentials_resolver:
-            credentials = self._credentials_resolver()
+        credentials, auth_error = await _resolve_gmail_credentials(self._credentials_resolver)
+        if auth_error:
+            return ToolResult.error_result(auth_error, ToolErrorType.AUTH_FAILED)
 
         if not credentials:
             return await _gmail_setup_required_result(context)

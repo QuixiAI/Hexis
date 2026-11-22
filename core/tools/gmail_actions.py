@@ -373,10 +373,99 @@ class GmailDeleteHandler(_ConnectedGmail, ToolHandler):
         )
 
 
+class GmailDraftHandler(_ConnectedGmail, ToolHandler):
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="gmail_draft",
+            description=(
+                "Create a Gmail draft (new message or reply inside an existing thread) using the connected Gmail account "
+                "without sending it. Use this to stage replies for the user's review and approval."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Gmail account/email.",
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient email address or comma-separated list.",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Draft email subject.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Plain-text draft email body.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Optional Gmail thread ID when drafting a reply.",
+                    },
+                    "in_reply_to": {
+                        "type": "string",
+                        "description": "Optional RFC Message-ID header of the message being replied to.",
+                    },
+                    "references": {
+                        "type": "string",
+                        "description": "Optional RFC References header value.",
+                    },
+                    "cc": {
+                        "type": "string",
+                        "description": "Optional CC recipients.",
+                    },
+                    "bcc": {
+                        "type": "string",
+                        "description": "Optional BCC recipients.",
+                    },
+                },
+                "required": ["to", "subject", "body"],
+            },
+            category=ToolCategory.EMAIL,
+            energy_cost=2,
+            is_read_only=False,
+            requires_approval=True,
+            supports_parallel=False,
+            allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
+        )
+
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        from core.auth.google_gmail import GmailOAuthError
+        from core.tools.email import _gmail_setup_required_result
+        from services.gmail_actions import GmailActionError, create_gmail_draft
+
+        try:
+            result = await create_gmail_draft(
+                account_key=arguments.get("account_key"),
+                to=str(arguments.get("to") or ""),
+                subject=str(arguments.get("subject") or ""),
+                body=str(arguments.get("body") or ""),
+                thread_id=arguments.get("thread_id"),
+                in_reply_to=arguments.get("in_reply_to"),
+                references=arguments.get("references"),
+                cc=arguments.get("cc"),
+                bcc=arguments.get("bcc"),
+            )
+        except GmailOAuthError:
+            return await _gmail_setup_required_result(context)
+        except GmailActionError as exc:
+            return ToolResult.error_result(str(exc), ToolErrorType.EXECUTION_FAILED)
+        return ToolResult.success_result(
+            result,
+            display_output=f"Created Gmail draft to {arguments.get('to')} ({result.get('draft_id')}).",
+        )
+
+
 def create_gmail_action_tools() -> list[ToolHandler]:
     return [
         GmailSendHandler(),
         GmailReplyHandler(),
+        GmailDraftHandler(),
         GmailLabelHandler(),
         GmailSpamTriageHandler(),
         GmailDeleteHandler(),

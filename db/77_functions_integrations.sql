@@ -48,6 +48,12 @@ INSERT INTO integration_connectors (
         "status": "available",
         "scopes": ["https://www.googleapis.com/auth/gmail.modify"]
       },
+      "draft": {
+        "label": "Create draft messages and replies",
+        "scope_kind": "write",
+        "status": "available",
+        "scopes": ["https://www.googleapis.com/auth/gmail.compose"]
+      },
       "send": {
         "label": "Send new messages",
         "scope_kind": "send",
@@ -78,11 +84,12 @@ INSERT INTO integration_connectors (
 	      "secret_storage": "~/.hexis/auth",
 	      "supported_surfaces": ["chat", "cli", "web", "channels"],
 	      "default_capabilities": ["read", "search"],
-      "capability_order": ["read", "search", "ingest", "label", "spam_triage", "send", "reply", "delete"],
+      "capability_order": ["read", "search", "ingest", "label", "spam_triage", "draft", "send", "reply", "delete"],
       "required_scopes": ["https://www.googleapis.com/auth/userinfo.email"],
       "scope_order": [
         "https://www.googleapis.com/auth/userinfo.email",
         "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.compose",
         "https://www.googleapis.com/auth/gmail.modify",
         "https://www.googleapis.com/auth/gmail.send"
       ],
@@ -101,6 +108,8 @@ INSERT INTO integration_connectors (
         "spam": "spam_triage",
         "modify": "label",
         "labels": "label",
+        "compose": "draft",
+        "drafts": "draft",
 	        "write": "send",
 	        "respond": "reply"
 	      },

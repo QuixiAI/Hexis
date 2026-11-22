@@ -90,6 +90,36 @@ export type SourceItemCount = {
   latest_item_at: string | null;
 };
 
+export type ConnectorActionPolicy = {
+  policy_id: string;
+  connector_id: string;
+  account_key: string | null;
+  action_kind: string;
+  status: string;
+  contexts: string[];
+  allow_autonomous: boolean;
+  requires_per_action_approval: boolean;
+  constraints: JsonRecord;
+  rationale: string | null;
+  expires_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type ConnectorActionAuditEntry = {
+  audit_id: string;
+  policy_id: string | null;
+  connector_id: string;
+  account_key: string | null;
+  action_kind: string;
+  tool_name: string;
+  target: string | null;
+  decision: string;
+  reason: string | null;
+  tool_context?: string | null;
+  created_at: string | null;
+};
+
 export type IntegrationStatusData = {
   connectors: IntegrationConnector[];
   connections: IntegrationConnection[];
@@ -100,6 +130,8 @@ export type IntegrationStatusData = {
     cursors: JsonRecord[];
     item_counts: SourceItemCount[];
   };
+  action_policies?: ConnectorActionPolicy[];
+  action_audit?: ConnectorActionAuditEntry[];
   generated_at?: string;
 };
 
