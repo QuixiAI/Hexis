@@ -166,9 +166,13 @@ async def _process_job(pool, job: dict[str, Any], *, config_override=None) -> No
 
     async def _ingest() -> int:
         if job["kind"] == "url":
-            return await pipeline.ingest_url(
-                str(payload.get("url") or ""), title=payload.get("title")
-            )
+            url_str = str(payload.get("url") or "")
+            from core.tools.web import _validate_url_host
+
+            host_errors = _validate_url_host(url_str)
+            if host_errors:
+                raise ValueError(f"Blocked ingestion URL: {'; '.join(host_errors)}")
+            return await pipeline.ingest_url(url_str, title=payload.get("title"))
         if job["kind"] == "artifact":
             return await _ingest_artifact()
         stored = await _stored_document(pool, payload.get("source_document_id"))

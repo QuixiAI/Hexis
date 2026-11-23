@@ -2629,6 +2629,19 @@ async def import_hmx(
                     source_lineage,
                 )
 
+        onboarding_interview = data.get("onboarding_interview")
+        if (
+            not reviewed
+            and isinstance(onboarding_interview, dict)
+            and isinstance(onboarding_interview.get("questions"), list)
+            and onboarding_interview.get("questions")
+        ):
+            await conn.fetchval(
+                "SELECT start_hmx_interview($1, $2::jsonb)",
+                export_id,
+                json.dumps(onboarding_interview),
+            )
+
     duplicate_refs = tuple(memory_result.get("duplicate_refs") or [])
     conflicts = tuple(
         [{"code": "duplicate_content", "ref": ref} for ref in duplicate_refs]

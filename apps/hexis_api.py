@@ -1436,6 +1436,112 @@ async def outreach_save_endpoint(req: OutreachRequest):
         return JSONResponse({"error": str(exc)}, status_code=400)
 
 
+class HmxInterviewAnswerRequest(BaseModel):
+    export_id: str
+    question_id: str
+    status: str = "answered"
+    answer: Any = None
+
+
+@app.get("/api/hmx/interviews")
+async def hmx_interviews_endpoint(export_id: str | None = None):
+    """List pending HMX onboarding interviews (or inspect a specific export_id)."""
+    from core.hmx_interview import list_pending_interviews, summarize_binding_effect
+
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+
+    target_export = (export_id or "").strip() or None
+    async with pool.acquire() as conn:
+        if target_export:
+            raw = await conn.fetchval("SELECT get_hmx_interview_state($1)", target_export)
+            state = _json_value(raw)
+            interviews = [state] if isinstance(state, dict) else []
+        else:
+            interviews = await list_pending_interviews(conn)
+
+    enriched: list[dict[str, Any]] = []
+    for iv in interviews:
+        answered_ids = {
+            a.get("question_id")
+            for a in (iv.get("answers") or [])
+            if isinstance(a, dict)
+            and (
+                a.get("status") == "skipped"
+                or (
+                    a.get("status") == "answered"
+                    and (a.get("binding_result") or {}).get("success", True) is not False
+                )
+            )
+        }
+        remaining = [
+            {**q, "effect_summary": summarize_binding_effect(q)}
+            for q in (iv.get("questions") or [])
+            if isinstance(q, dict) and q.get("id") not in answered_ids
+        ]
+        enriched.append({**iv, "remaining_questions": remaining})
+
+    return JSONResponse(
+        jsonable_encoder({"interviews": enriched, "count": len(enriched)})
+    )
+
+
+@app.post("/api/hmx/interviews/answer")
+async def hmx_interview_answer_endpoint(req: HmxInterviewAnswerRequest):
+    """Record an answer or skip for one HMX onboarding interview question."""
+    from core.hmx_interview import resolve_choice_value
+
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+
+    export_id = req.export_id.strip()
+    question_id = req.question_id.strip()
+    status_val = req.status.strip().lower()
+    if not export_id or not question_id:
+        raise HTTPException(status_code=422, detail="export_id and question_id are required")
+    if status_val not in ("answered", "skipped"):
+        raise HTTPException(status_code=422, detail="status must be 'answered' or 'skipped'")
+    if status_val == "answered" and req.answer is None:
+        raise HTTPException(status_code=422, detail="answer is required when status is 'answered'")
+
+    async with pool.acquire() as conn:
+        state_raw = await conn.fetchval("SELECT get_hmx_interview_state($1)", export_id)
+        state = _json_value(state_raw)
+        resolved_answer = req.answer
+        if isinstance(state, dict) and status_val == "answered":
+            question = next(
+                (
+                    q
+                    for q in (state.get("questions") or [])
+                    if isinstance(q, dict) and q.get("id") == question_id
+                ),
+                None,
+            )
+            if question is not None:
+                resolved_answer = resolve_choice_value(question, req.answer)
+
+        if status_val == "skipped":
+            raw = await conn.fetchval(
+                "SELECT record_hmx_interview_answer($1, $2, 'skipped')",
+                export_id,
+                question_id,
+            )
+        else:
+            raw = await conn.fetchval(
+                "SELECT record_hmx_interview_answer($1, $2, 'answered', $3::jsonb)",
+                export_id,
+                question_id,
+                json.dumps(resolved_answer),
+            )
+
+    payload = _json_value(raw) or {}
+    if not payload.get("success"):
+        return JSONResponse(jsonable_encoder(payload), status_code=400)
+    return JSONResponse(jsonable_encoder(payload))
+
+
 @app.get("/api/integrations/status")
 async def integration_status(connector_id: str | None = None):
     pool = _pool

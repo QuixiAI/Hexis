@@ -697,6 +697,215 @@ class DemoteToAnalysisHandler(ToolHandler):
             return _error_result(exc)
 
 
+class HmxInterviewStatusHandler(ToolHandler):
+    """Inspect pending (or specific) HMX onboarding interviews."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="hmx_interview_status",
+            description=(
+                "Inspect pending HMX onboarding interviews and their remaining questions, "
+                "options, and binding effects. Optionally filter to one export_id."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "export_id": {
+                        "type": "string",
+                        "description": "Optional HMX export_id to inspect a specific interview.",
+                    }
+                },
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=0,
+            is_read_only=True,
+            supports_parallel=True,
+            allowed_contexts=_AGENT_CONTEXTS,
+        )
+
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        if context.is_group or (context.tool_context == ToolContext.CHAT and not context.is_operator):
+            return ToolResult.error_result(
+                "HMX onboarding interviews are private to the primary operator in direct chat.",
+                ToolErrorType.PERMISSION_DENIED,
+            )
+        pool = _pool(context)
+        if not pool:
+            return _missing_pool()
+        import json as _json
+
+        from core.hmx_interview import list_pending_interviews, summarize_binding_effect
+
+        export_id = str(arguments.get("export_id") or "").strip() or None
+        try:
+            async with pool.acquire() as conn:
+                if export_id:
+                    raw = await conn.fetchval("SELECT get_hmx_interview_state($1)", export_id)
+                    state = _json.loads(raw) if isinstance(raw, str) else raw
+                    interviews = [state] if isinstance(state, dict) else []
+                else:
+                    interviews = await list_pending_interviews(conn)
+            enriched: list[dict[str, Any]] = []
+            for iv in interviews:
+                answered_ids = {
+                    a.get("question_id")
+                    for a in (iv.get("answers") or [])
+                    if isinstance(a, dict)
+                    and (
+                        a.get("status") == "skipped"
+                        or (
+                            a.get("status") == "answered"
+                            and (a.get("binding_result") or {}).get("success", True) is not False
+                        )
+                    )
+                }
+                remaining = []
+                for q in iv.get("questions") or []:
+                    if not isinstance(q, dict) or q.get("id") in answered_ids:
+                        continue
+                    remaining.append({**q, "effect_summary": summarize_binding_effect(q)})
+                enriched.append({**iv, "remaining_questions": remaining})
+            return ToolResult.success_result(
+                {"interviews": enriched, "count": len(enriched)},
+                f"{len(enriched)} HMX onboarding interview(s)",
+            )
+        except Exception as exc:
+            return _error_result(exc)
+
+
+class RecordHmxInterviewAnswerHandler(ToolHandler):
+    """Record an answer or skip for one HMX onboarding interview question."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="record_hmx_interview_answer",
+            description=(
+                "Record the user's answer (or skip) for an HMX onboarding interview question "
+                "and apply its bound action via Hexis's existing machinery. For choice questions, "
+                "either the option value or label may be passed. For freeform questions, pass "
+                "the clean extracted value from the user's reply."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "export_id": {
+                        "type": "string",
+                        "description": "The HMX export_id of the onboarding interview.",
+                    },
+                    "question_id": {
+                        "type": "string",
+                        "description": "The question id from the onboarding interview.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["answered", "skipped"],
+                        "default": "answered",
+                        "description": "Whether the user answered or skipped the question.",
+                    },
+                    "answer": {
+                        "description": "The user's answer value (required when status is 'answered').",
+                    },
+                },
+                "required": ["export_id", "question_id"],
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=0,
+            is_read_only=False,
+            requires_approval=False,
+            supports_parallel=False,
+            allowed_contexts={ToolContext.CHAT},
+        )
+
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
+        if context.is_group or (context.tool_context == ToolContext.CHAT and not context.is_operator):
+            return ToolResult.error_result(
+                "HMX onboarding interviews can only be answered by the primary operator in direct chat.",
+                ToolErrorType.PERMISSION_DENIED,
+            )
+        pool = _pool(context)
+        if not pool:
+            return _missing_pool()
+        import json as _json
+
+        from core.hmx_interview import resolve_choice_value
+
+        export_id = str(arguments.get("export_id") or "").strip()
+        question_id = str(arguments.get("question_id") or "").strip()
+        status = str(arguments.get("status") or "answered").strip().lower()
+        if not export_id or not question_id:
+            return ToolResult.error_result(
+                "export_id and question_id are required",
+                ToolErrorType.INVALID_PARAMS,
+            )
+        if status not in ("answered", "skipped"):
+            return ToolResult.error_result(
+                "status must be 'answered' or 'skipped'",
+                ToolErrorType.INVALID_PARAMS,
+            )
+        raw_answer = arguments.get("answer")
+        if status == "answered" and raw_answer is None:
+            return ToolResult.error_result(
+                "answer is required when status is 'answered'",
+                ToolErrorType.INVALID_PARAMS,
+            )
+
+        try:
+            async with pool.acquire() as conn:
+                state_raw = await conn.fetchval("SELECT get_hmx_interview_state($1)", export_id)
+                state = _json.loads(state_raw) if isinstance(state_raw, str) else state_raw
+                resolved_answer = raw_answer
+                if isinstance(state, dict) and status == "answered":
+                    question = next(
+                        (
+                            q
+                            for q in (state.get("questions") or [])
+                            if isinstance(q, dict) and q.get("id") == question_id
+                        ),
+                        None,
+                    )
+                    if question is not None:
+                        resolved_answer = resolve_choice_value(question, raw_answer)
+
+                if status == "skipped":
+                    res_raw = await conn.fetchval(
+                        "SELECT record_hmx_interview_answer($1, $2, 'skipped')",
+                        export_id,
+                        question_id,
+                    )
+                else:
+                    res_raw = await conn.fetchval(
+                        "SELECT record_hmx_interview_answer($1, $2, 'answered', $3::jsonb)",
+                        export_id,
+                        question_id,
+                        _json.dumps(resolved_answer),
+                    )
+            result = _json.loads(res_raw) if isinstance(res_raw, str) else (res_raw or {})
+            if not result.get("success"):
+                return ToolResult.error_result(
+                    str(result.get("error") or "Failed to record interview answer"),
+                    ToolErrorType.INVALID_PARAMS,
+                )
+            binding = result.get("binding_result") or {}
+            if status == "answered" and isinstance(binding, dict) and binding.get("success") is False:
+                display = (
+                    f"Recorded answer for '{question_id}', but binding failed: "
+                    f"{binding.get('error', 'unknown error')}"
+                )
+            elif status == "skipped":
+                display = f"Skipped onboarding question '{question_id}' ({result.get('interview_status')})."
+            else:
+                display = f"Applied onboarding answer for '{question_id}' ({result.get('interview_status')})."
+            return ToolResult.success_result(result, display)
+        except Exception as exc:
+            return _error_result(exc)
+
+
 def create_memory_exchange_tools() -> list[ToolHandler]:
     from .protected_replacement import create_protected_replacement_tools
 
@@ -711,4 +920,6 @@ def create_memory_exchange_tools() -> list[ToolHandler]:
         ImportQuoteHandler(),
         PromoteToStagedHandler(),
         DemoteToAnalysisHandler(),
+        HmxInterviewStatusHandler(),
+        RecordHmxInterviewAnswerHandler(),
     ] + create_protected_replacement_tools()
