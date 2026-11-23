@@ -270,9 +270,11 @@ function ConnectorCard({
                           ? "revoke_gmail"
                           : connector.id === "twitter_x"
                             ? "revoke_twitter_x"
-                            : ["notion", "spotify", "home_assistant", "weather", "trello"].includes(connector.id)
-                              ? "revoke_life"
-                              : "revoke_connection";
+                            : connector.id === "github_issues"
+                              ? "revoke_github"
+                              : ["notion", "spotify", "home_assistant", "weather", "trello"].includes(connector.id)
+                                ? "revoke_life"
+                                : "revoke_connection";
                       void onAction(
                         `${connector.id}:revoke:${connection.id}`,
                         revokeAction,
@@ -370,6 +372,10 @@ function ConnectorCard({
 
       {connector.id === "gmail" ? (
         <GmailControls summary={summary} actionBusy={actionBusy} onAction={onAction} />
+      ) : null}
+
+      {connector.id === "github_issues" ? (
+        <GitHubIssuesControls summary={summary} actionBusy={actionBusy} onAction={onAction} />
       ) : null}
 
       {connector.id === "google_drive" ? <DriveControls /> : null}
@@ -1163,6 +1169,242 @@ function GmailControls({
           </div>
         </details>
       ) : null}
+    </div>
+  );
+}
+
+function GitHubIssuesControls({
+  summary,
+  actionBusy,
+  onAction,
+}: {
+  summary: ConnectorSummary;
+  actionBusy: string | null;
+  onAction: IntegrationActionHandler;
+}) {
+  const setupManifest = asRecord(summary.connector.setup_manifest);
+  const capabilityManifest = asRecord(summary.connector.capability_manifest);
+  const tokenCreateUrl =
+    asString(setupManifest.token_create_url) ||
+    "https://github.com/settings/personal-access-tokens/new";
+  const cliCommand = asString(setupManifest.cli_command) || "hexis auth github setup-token";
+  const credentialsSaved = setupManifest.credentials_saved === true;
+  const verifiedLogin = asString(setupManifest.verified_login);
+  const pendingAction = asRecord(setupManifest.pending_action);
+  const pendingActionRepo = asString(pendingAction.repo);
+  const pendingActionKind = asString(pendingAction.action);
+  const pendingActionTitle = asString(pendingAction.title);
+
+  const availableCapabilities = (() => {
+    const ordered = stringArray(setupManifest.capability_order);
+    if (ordered.length > 0) return ordered;
+    return capabilityKeys(capabilityManifest);
+  })();
+  const defaultCapabilities = (() => {
+    const defaults = stringArray(setupManifest.default_capabilities);
+    return defaults.length > 0 ? defaults : ["search_issues", "read_issues", "create_issue"];
+  })();
+
+  const [token, setToken] = useState("");
+  const [selectedCapabilities, setSelectedCapabilities] = useState<string[]>(defaultCapabilities);
+  const [showReplaceForm, setShowReplaceForm] = useState(false);
+
+  const connection = summary.activeConnections[0] || null;
+  const pendingAttempt =
+    summary.activeAttempts[0] ||
+    summary.recentAttempts.find((attempt) =>
+      ["pending_user", "awaiting_input", "in_progress"].includes(attempt.status)
+    );
+  const isConnected = Boolean(connection) || credentialsSaved;
+  const connectBusy = actionBusy === "github_issues:connect";
+  const revokeBusy = actionBusy === "github_issues:revoke-local";
+
+  const toggleCapability = (cap: string) => {
+    setSelectedCapabilities((prev) =>
+      prev.includes(cap) ? prev.filter((item) => item !== cap) : [...prev, cap]
+    );
+  };
+
+  const handleConnect = async () => {
+    const cleaned = token.trim();
+    if (!cleaned || actionBusy) return;
+    setToken("");
+    await onAction("github_issues:connect", "connect_github_pat", {
+      token: cleaned,
+      capabilities: selectedCapabilities.length > 0 ? selectedCapabilities : defaultCapabilities,
+      ...(pendingAttempt ? { attempt_id: pendingAttempt.attempt_id } : {}),
+    });
+    setShowReplaceForm(false);
+  };
+
+  return (
+    <div className="space-y-3 rounded-md border border-[var(--outline)] px-3 py-3">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="text-xs font-semibold text-[var(--ink-soft)]">
+          GitHub Issues setup
+        </h3>
+        {isConnected ? (
+          <Badge variant="success">
+            {verifiedLogin ? `@${verifiedLogin}` : "Token saved"}
+          </Badge>
+        ) : (
+          <Badge variant="muted">Fine-grained PAT</Badge>
+        )}
+      </div>
+
+      {pendingActionRepo || pendingActionKind || pendingActionTitle ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          <p className="font-semibold">
+            Pending GitHub action ready to resume
+            {pendingActionKind ? `: ${humanize(pendingActionKind)}` : ""}
+            {pendingActionRepo ? ` on ${pendingActionRepo}` : ""}
+          </p>
+          {pendingActionTitle ? (
+            <p className="mt-1 text-amber-800">{pendingActionTitle}</p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {isConnected && !showReplaceForm ? (
+        <div className="space-y-2 text-xs text-[var(--ink-soft)]">
+          <p>
+            Verified in Hexis&apos;s private auth store (<code>~/.hexis/auth</code>)
+            {verifiedLogin ? (
+              <>
+                {" "}
+                as <strong>@{verifiedLogin}</strong>
+              </>
+            ) : null}
+            . Hexis never reads ambient <code>gh auth</code> or <code>GITHUB_TOKEN</code> environment variables.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={Boolean(actionBusy)}
+              onClick={() => setShowReplaceForm(true)}
+              className="px-2.5 py-1 text-xs"
+            >
+              Replace token
+            </Button>
+            {!connection && credentialsSaved ? (
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={Boolean(actionBusy)}
+                onClick={async () => {
+                  if (
+                    await confirmAction(
+                      `Disconnect GitHub Issues${verifiedLogin ? ` (@${verifiedLogin})` : ""}?`,
+                      { confirmLabel: "Disconnect", destructive: true }
+                    )
+                  ) {
+                    void onAction("github_issues:revoke-local", "revoke_github", {
+                      reason: "revoked from web connections",
+                    });
+                  }
+                }}
+                className="px-2.5 py-1 text-xs"
+              >
+                {revokeBusy ? "Disconnecting..." : "Disconnect"}
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <p className="text-xs text-[var(--ink-soft)]">
+            Public repositories can be read publicly, but creating, commenting on, or updating an issue
+            requires authenticating as a specific GitHub account.
+          </p>
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <a
+              href={tokenCreateUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 font-semibold text-[var(--teal)] underline"
+            >
+              Create fine-grained token on GitHub <ExternalLink size={12} />
+            </a>
+            <span className="text-[var(--ink-soft)]">
+              (scope to <strong>Issues: Read and write</strong>)
+            </span>
+          </div>
+
+          <div className="space-y-1">
+            <label
+              htmlFor="github-issues-pat-input"
+              className="block text-xs font-medium text-[var(--foreground)]"
+            >
+              GitHub personal access token
+            </label>
+            <TextInput
+              id="github-issues-pat-input"
+              type="password"
+              autoComplete="off"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+              placeholder="github_pat_... (or ghp_...)"
+              className="py-2 text-xs"
+            />
+            <p className="text-[11px] text-[var(--ink-soft)]">
+              Verified directly against GitHub and stored privately in <code>~/.hexis/auth</code> — never
+              saved in Postgres or chat. Prefer the terminal? Run <code>{cliCommand}</code>.
+            </p>
+          </div>
+
+          {availableCapabilities.length > 0 ? (
+            <div className="space-y-1.5">
+              <p className="text-[11px] font-medium text-[var(--ink-soft)]">Capabilities</p>
+              <div className="grid gap-1.5 sm:grid-cols-2">
+                {availableCapabilities.map((cap) => {
+                  const meta = asRecord(capabilityManifest[cap]);
+                  const label = asString(meta.label) || humanize(cap);
+                  return (
+                    <label
+                      key={cap}
+                      className="flex items-center gap-2 text-xs text-[var(--foreground)]"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedCapabilities.includes(cap)}
+                        onChange={() => toggleCapability(cap)}
+                      />
+                      <span>{label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              disabled={Boolean(actionBusy) || token.trim().length === 0}
+              onClick={() => void handleConnect()}
+              className="px-3 py-2 text-xs"
+            >
+              {connectBusy ? "Verifying..." : "Connect GitHub Issues"}
+            </Button>
+            {isConnected ? (
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={Boolean(actionBusy)}
+                onClick={() => {
+                  setToken("");
+                  setShowReplaceForm(false);
+                }}
+                className="px-2.5 py-1 text-xs"
+              >
+                Cancel
+              </Button>
+            ) : null}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

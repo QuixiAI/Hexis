@@ -1198,6 +1198,7 @@ async def _integration_status_payload(
         normalized_id if normalized_id in {"slack", "telegram", "signal"} else None
     )
     include_gmail_config = normalized_id in {None, "gmail"}
+    include_github_config = normalized_id in {None, "github_issues"}
     async with pool.acquire() as conn:
         integration_raw = await conn.fetchval(
             "SELECT integration_status($1)", normalized_id
@@ -1253,11 +1254,33 @@ async def _integration_status_payload(
             if include_gmail_config
             else None
         )
+        github_pending_action_raw = (
+            await conn.fetchval(
+                """
+                SELECT flow_state->'pending_action'
+                FROM connection_attempts
+                WHERE connector_id = 'github_issues'
+                  AND status IN ('pending_user', 'awaiting_input', 'error')
+                  AND flow_state ? 'pending_action'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+            if include_github_config
+            else None
+        )
 
     payload = _json_value(integration_raw) or {}
-    from core.tools.integrations import enrich_gmail_setup_runtime
+    from core.tools.integrations import (
+        enrich_github_setup_runtime,
+        enrich_gmail_setup_runtime,
+    )
 
     enrich_gmail_setup_runtime(payload)
+    enrich_github_setup_runtime(
+        payload,
+        pending_action=_json_value(github_pending_action_raw),
+    )
     if include_gmail_config:
         for connector in payload.get("connectors", []):
             if not isinstance(connector, dict) or connector.get("id") != "gmail":
@@ -1431,6 +1454,8 @@ _INTEGRATION_ACTION_TO_TOOL = {
     "setup_status": "integration_setup_status",
     "start_setup": "start_integration_setup",
     "configure_channel": "configure_channel_integration",
+    "github_setup_status": "github_setup_status",
+    "start_github_setup": "start_github_setup",
     "connect_gmail": "connect_gmail",
     "gmail_setup_status": "gmail_setup_status",
     "complete_gmail": "complete_gmail_connection",
@@ -1461,6 +1486,11 @@ def _integration_action_arguments(
             status_code=422,
             detail="Use connect_gmail for Gmail setup.",
         )
+    if action == "start_setup" and str(args.get("connector_id") or "").strip().lower().replace("-", "_") == "github_issues":
+        raise HTTPException(
+            status_code=422,
+            detail="Use start_github_setup for GitHub Issues setup.",
+        )
     if action in {"start_setup", "configure_channel", "verify_channel"}:
         connector_id = (
             str(args.get("connector_id") or "").strip().lower().replace("-", "_")
@@ -1489,6 +1519,7 @@ def _integration_action_arguments(
         args["connector_id"] = connector_id
     if action in {
         "start_setup",
+        "start_github_setup",
         "connect_gmail",
         "connect_twitter_x",
         "start_gmail_backfill",
@@ -1501,6 +1532,7 @@ def _integration_action_arguments(
         action
         in {
             "start_setup",
+            "start_github_setup",
             "connect_gmail",
             "connect_twitter_x",
             "start_gmail_backfill",
@@ -1650,6 +1682,101 @@ async def integration_action(req: IntegrationActionRequest):
                 "error": None,
                 "error_type": None,
             }
+        )
+
+    if action == "connect_github_pat":
+        from core.auth.github_pat import complete_github_connection_db
+
+        raw_token = action_arguments.get("token")
+        if not isinstance(raw_token, str) or not raw_token.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="GitHub personal access token is required.",
+            )
+        raw_caps = action_arguments.get("capabilities")
+        capabilities = (
+            [str(item) for item in raw_caps if str(item or "").strip()]
+            if isinstance(raw_caps, list)
+            else None
+        )
+        attempt_id = str(action_arguments.get("attempt_id") or "").strip() or None
+        try:
+            connected = await complete_github_connection_db(
+                pool,
+                token=raw_token,
+                capabilities=capabilities,
+                attempt_id=attempt_id,
+                source_channel="web",
+                source_session_id=req.source_session_id or "web-connections",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "output": {
+                        "connector_id": "github_issues",
+                        "connected": False,
+                    },
+                    "display_output": None,
+                    "error": str(exc),
+                    "error_type": "auth_failed",
+                },
+                status_code=400,
+            )
+
+        login = connected.get("login") or connected.get("account_key") or "GitHub"
+        from core.tools.integrations import _github_connector_setup_ui
+
+        connected["ui"] = _github_connector_setup_ui(
+            connected,
+            status="connected",
+            capabilities=connected.get("capabilities"),
+            pending_action=connected.get("pending_action"),
+            connected_accounts=[
+                {
+                    "account_key": connected.get("account_key"),
+                    "display_name": connected.get("display_name") or f"@{login}",
+                    "capabilities": connected.get("capabilities") or [],
+                    "status": "connected",
+                }
+            ],
+            credentials_saved=True,
+            verified_login=str(login),
+        )
+        return JSONResponse(
+            jsonable_encoder(
+                {
+                    "success": True,
+                    "output": connected,
+                    "display_output": f"GitHub Issues connected as @{login}.",
+                    "error": None,
+                    "error_type": None,
+                }
+            )
+        )
+
+    if action == "revoke_github":
+        from core.auth.github_pat import revoke_github_connection_db
+
+        account_key = str(action_arguments.get("account_key") or "").strip() or None
+        reason = str(action_arguments.get("reason") or "revoked from web connections").strip()
+        revoked = await revoke_github_connection_db(
+            pool,
+            account_key=account_key,
+            reason=reason,
+        )
+        return JSONResponse(
+            jsonable_encoder(
+                {
+                    "success": True,
+                    "output": revoked,
+                    "display_output": "GitHub Issues disconnected.",
+                    "error": None,
+                    "error_type": None,
+                }
+            )
         )
 
     if action == "save_gmail_client_secret":

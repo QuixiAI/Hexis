@@ -9,6 +9,8 @@ mcp:
   args: ["-y", "@modelcontextprotocol/server-github"]
   env_requires: [GITHUB_PERSONAL_ACCESS_TOKEN]
 bound_tools:
+  - github_setup_status
+  - start_github_setup
   - mcp_github_search_issues
   - mcp_github_list_issues
   - mcp_github_get_issue
@@ -37,10 +39,16 @@ unlocks the bound tools for this turn.
 
 ## If activation reports needs_setup
 
-Relay the exact `next_step` to the user (#102). It will point them to run
-`hexis auth github setup-token` in a terminal — never ask for or accept a
-token pasted into chat; the tool activation path already checks Hexis's own
-stored credential automatically on retry. Explain, if useful, why a public
-repo still needs this: reading it is public, but creating or commenting on
-an issue as a specific account is not. Do not claim GitHub capability is
-missing — it is installed and one step away.
+1. **Call `start_github_setup`** with a non-secret `pending_action` capturing what the
+   user asked to do (`action`, `repo`, `query`, `title`, `body`, `labels`,
+   `issue_number`, `authorized`). Never ask for or pass a token in chat or tool args.
+2. **Guide the user cleanly (#102):** explain that public repositories can be read
+   publicly, but creating, commenting on, or updating an issue requires authenticating
+   as a specific GitHub account. Give them both productized setup paths:
+   - The **Connections** page in the web dashboard (**GitHub Issues** card), or
+   - Running `hexis auth github setup-token` in a terminal.
+   Do not claim GitHub capability is missing — it is installed and one step away.
+3. **Resume immediately after setup:** once the user says they connected GitHub, check
+   `github_setup_status` (or activate `github-issues` directly) and resume the saved
+   `pending_action` without asking them to restate the repository, title, or body.
+   If `authorized` was false, confirm the title and body before filing.

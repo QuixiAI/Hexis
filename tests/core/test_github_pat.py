@@ -121,3 +121,38 @@ async def test_verify_pat_returns_login_on_success(monkeypatch):
 
 def test_config_key_is_namespaced():
     assert GITHUB_PAT_CONFIG_KEY == "token.github_pat"
+
+
+def test_github_skill_usability_uses_hexis_store_and_ignores_ambient_env(monkeypatch):
+    """#102: SkillSpec.usability() must check Hexis's managed PAT store, not
+    ambient GITHUB_PERSONAL_ACCESS_TOKEN, and mark github-issues usable once
+    connected."""
+    from pathlib import Path
+
+    from skills.loader import load_skills_from_dir
+
+    specs = {s.name: s for s in load_skills_from_dir(Path("skills/installed"))}
+    spec = specs["github-issues"]
+
+    # Even if ambient GITHUB_PERSONAL_ACCESS_TOKEN is set in process env,
+    # Hexis must NOT silently consume it.
+    available = {"github_setup_status", "start_github_setup"}
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_ambient_should_be_ignored")
+    monkeypatch.setattr("core.auth.github_pat.resolve_github_token", lambda: (None, ""))
+    status, reasons, next_step = spec.usability(available)
+    assert status == "needs_setup"
+    assert reasons == ["missing credential: github_issues"]
+    assert next_step is not None
+    assert "hexis auth github setup-token" in next_step
+    assert "Set GITHUB_PERSONAL_ACCESS_TOKEN in the service environment" not in next_step
+
+    # Once stored in Hexis's own auth store, github-issues reports usable.
+    monkeypatch.delenv("GITHUB_PERSONAL_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "core.auth.github_pat.resolve_github_token",
+        lambda: ("github_pat_stored_ok", "octocat"),
+    )
+    status, reasons, next_step = spec.usability(available)
+    assert status == "usable"
+    assert reasons == []
+    assert next_step is None

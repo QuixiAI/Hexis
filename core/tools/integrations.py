@@ -93,6 +93,210 @@ def enrich_gmail_setup_runtime(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+_GITHUB_PENDING_ACTION_ALLOWED_KEYS = {
+    "action",
+    "repo",
+    "query",
+    "title",
+    "body",
+    "labels",
+    "issue_number",
+    "authorized",
+    "notes",
+}
+
+_GITHUB_SETUP_STEPS = [
+    "Open https://github.com/settings/personal-access-tokens/new and create a fine-grained personal access token scoped to Issues (Read and write) on the target repository or repositories.",
+    "Connect it on the Connections page in the web dashboard or run `hexis auth github setup-token` in a terminal.",
+    "Never paste your token into chat. Hexis verifies the token against GitHub and stores it privately in ~/.hexis/auth.",
+    "Return to your conversation to continue the pending GitHub action.",
+]
+
+_GITHUB_WHY_NEEDED = (
+    "Public repositories can be read without signing in, but creating, commenting on, "
+    "or updating an issue requires authenticating as a specific GitHub account."
+)
+
+
+def _sanitize_github_pending_action(value: Any) -> dict[str, Any] | None:
+    """Whitelist non-secret task intent fields for resumable GitHub setup."""
+    if not isinstance(value, dict):
+        return None
+    sanitized: dict[str, Any] = {}
+    for key in _GITHUB_PENDING_ACTION_ALLOWED_KEYS:
+        if key not in value or value[key] is None:
+            continue
+        raw = value[key]
+        if key == "labels":
+            if isinstance(raw, list):
+                cleaned = [str(item).strip() for item in raw if str(item or "").strip()]
+                if cleaned:
+                    sanitized[key] = cleaned
+        elif key == "issue_number":
+            try:
+                sanitized[key] = int(raw)
+            except (TypeError, ValueError):
+                continue
+        elif key == "authorized":
+            sanitized[key] = bool(raw)
+        else:
+            text = str(raw).strip()
+            if text:
+                sanitized[key] = text
+    return sanitized or None
+
+
+def enrich_github_setup_runtime(
+    payload: dict[str, Any],
+    *,
+    pending_action: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach runtime GitHub PAT store availability without exposing secrets."""
+    connectors = payload.get("connectors")
+    if not isinstance(connectors, list):
+        return payload
+
+    try:
+        from core.auth.github_pat import (
+            GITHUB_CONNECTOR_ID,
+            GITHUB_PAT_CREATE_URL,
+            load_credentials,
+        )
+
+        creds = load_credentials()
+        credentials_saved = creds is not None
+        verified_login = creds.login if creds else None
+        token_url = GITHUB_PAT_CREATE_URL
+        connector_id = GITHUB_CONNECTOR_ID
+    except Exception:
+        credentials_saved = False
+        verified_login = None
+        token_url = "https://github.com/settings/personal-access-tokens/new"
+        connector_id = "github_issues"
+
+    clean_pending = _sanitize_github_pending_action(pending_action)
+
+    for connector in connectors:
+        if not isinstance(connector, dict) or connector.get("id") != connector_id:
+            continue
+        manifest = _json(connector.get("setup_manifest")) or {}
+        if not isinstance(manifest, dict):
+            manifest = {}
+        enriched = {
+            **manifest,
+            "credentials_saved": credentials_saved,
+            "verified_login": verified_login,
+            "token_create_url": manifest.get("token_create_url") or token_url,
+            "cli_command": manifest.get("cli_command") or "hexis auth github setup-token",
+            "setup_steps": manifest.get("setup_steps") or list(_GITHUB_SETUP_STEPS),
+        }
+        if clean_pending:
+            enriched["pending_action"] = clean_pending
+        connector["setup_manifest"] = enriched
+    return payload
+
+
+def _github_connector_setup_ui(
+    payload: dict[str, Any],
+    *,
+    status: str | None = None,
+    capabilities: Any = None,
+    pending_attempt: dict[str, Any] | None = None,
+    pending_action: dict[str, Any] | None = None,
+    connected_accounts: list[dict[str, Any]] | None = None,
+    credentials_saved: bool | None = None,
+    verified_login: str | None = None,
+    next_step: str | None = None,
+) -> dict[str, Any]:
+    """Build a transport-neutral setup card for GitHub Issues across chat/CLI/web."""
+    from core.auth.github_pat import (
+        GITHUB_CONNECTOR_ID,
+        GITHUB_DEFAULT_CAPABILITIES,
+        GITHUB_PAT_CREATE_URL,
+    )
+
+    connected = connected_accounts
+    if connected is None:
+        connected = [
+            item
+            for item in payload.get("connections", [])
+            if isinstance(item, dict)
+            and item.get("connector_id") == GITHUB_CONNECTOR_ID
+            and item.get("status") == "connected"
+        ]
+    pending = pending_attempt
+    if pending is None:
+        for item in payload.get("recent_attempts", []):
+            if not isinstance(item, dict) or item.get("connector_id") != GITHUB_CONNECTOR_ID:
+                continue
+            if item.get("status") in {"pending_user", "awaiting_input", "pending", "in_progress", "error"}:
+                pending = item
+                break
+
+    saved = (
+        bool(credentials_saved)
+        if credentials_saved is not None
+        else bool(payload.get("credentials_saved"))
+    )
+    resolved_status = status
+    if not resolved_status:
+        if saved or connected:
+            resolved_status = "connected"
+        elif pending:
+            resolved_status = "pending_authorization"
+        else:
+            resolved_status = "needs_setup"
+    if saved or connected:
+        resolved_status = "connected"
+
+    caps = (
+        [str(c) for c in capabilities if str(c or "").strip()]
+        if isinstance(capabilities, list) and capabilities
+        else list(GITHUB_DEFAULT_CAPABILITIES)
+    )
+    attempt_id = None
+    pending_next_step = None
+    if pending and resolved_status != "connected":
+        attempt_id = pending.get("attempt_id") or pending.get("id")
+        pending_next_step = pending.get("user_next_step") or pending.get("next_step")
+    if resolved_status != "connected":
+        attempt_id = attempt_id or payload.get("attempt_id")
+
+    resolved_next_step = (
+        next_step
+        or pending_next_step
+        or payload.get("next_step")
+        or payload.get("user_next_step")
+        or (
+            f"GitHub Issues is connected as @{verified_login}."
+            if resolved_status == "connected" and verified_login
+            else "Create a fine-grained GitHub token scoped to Issues (Read and write) at "
+            f"{GITHUB_PAT_CREATE_URL}, then save it on the Connections page or run "
+            "`hexis auth github setup-token` in a terminal. Never paste the token into chat."
+        )
+    )
+
+    return {
+        "kind": "connector_setup",
+        "connector_id": GITHUB_CONNECTOR_ID,
+        "display_name": "GitHub Issues",
+        "status": resolved_status,
+        "credentials_saved": saved,
+        "verified_login": verified_login,
+        "authorization_url": GITHUB_PAT_CREATE_URL,
+        "token_create_url": GITHUB_PAT_CREATE_URL,
+        "cli_command": "hexis auth github setup-token",
+        "never_paste_in_chat": True,
+        "attempt_id": attempt_id,
+        "capabilities": caps,
+        "pending_action": _sanitize_github_pending_action(pending_action),
+        "connected_accounts": connected,
+        "setup_steps": list(_GITHUB_SETUP_STEPS),
+        "next_step": resolved_next_step,
+        "why_needed": _GITHUB_WHY_NEEDED,
+    }
+
+
 def _gmail_capabilities_from_status(payload: dict[str, Any], fallback: Any = None) -> list[str]:
     if isinstance(fallback, list) and fallback:
         return [str(item) for item in fallback if str(item or "").strip()]
@@ -608,6 +812,7 @@ class IntegrationSetupStatusHandler(ToolHandler):
             )
         payload = _json(raw) or {}
         enrich_gmail_setup_runtime(payload)
+        enrich_github_setup_runtime(payload)
         from services.life_integrations import enrich_life_setup_status
 
         enrich_life_setup_status(payload, connector_id)
@@ -694,6 +899,11 @@ class StartIntegrationSetupHandler(ToolHandler):
         if connector_id == "twitter_x":
             return ToolResult.error_result(
                 "Use connect_twitter_x for Twitter/X OAuth setup. Use start_connector_backfill with export_path for archive import.",
+                ToolErrorType.INVALID_PARAMS,
+            )
+        if connector_id == "github_issues":
+            return ToolResult.error_result(
+                "Use start_github_setup for GitHub Issues setup.",
                 ToolErrorType.INVALID_PARAMS,
             )
         requested = arguments.get("capabilities")
@@ -2397,12 +2607,266 @@ class RevokeConnectorActionPolicyHandler(ToolHandler):
         )
 
 
+class GithubSetupStatusHandler(ToolHandler):
+    """Inspect GitHub Issues connector setup state without exposing secrets."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="github_setup_status",
+            description=(
+                "Show GitHub Issues connector setup status, verified GitHub login, "
+                "pending setup attempts, and any preserved pending GitHub action draft. "
+                "Never exposes tokens."
+            ),
+            parameters={"type": "object", "properties": {}},
+            category=ToolCategory.EXTERNAL,
+            energy_cost=1,
+            is_read_only=True,
+            supports_parallel=True,
+            allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
+        )
+
+    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        if not context.registry:
+            return ToolResult.error_result(
+                "github_setup_status requires an active tool registry.",
+                ToolErrorType.EXECUTION_FAILED,
+            )
+        from core.auth.github_pat import GITHUB_CONNECTOR_ID, load_credentials
+
+        creds = load_credentials()
+        credentials_saved = creds is not None
+        verified_login = creds.login if creds else None
+
+        pending_action: dict[str, Any] | None = None
+        async with context.registry.pool.acquire() as conn:
+            raw = await conn.fetchval("SELECT integration_status($1)", GITHUB_CONNECTOR_ID)
+            attempt_row = await conn.fetchrow(
+                """
+                SELECT id::text AS id, status, flow_state
+                FROM connection_attempts
+                WHERE connector_id = $1
+                  AND status IN ('pending_user', 'awaiting_input', 'error', 'complete')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                GITHUB_CONNECTOR_ID,
+            )
+            if attempt_row is not None:
+                flow_state = _json(attempt_row["flow_state"])
+                if isinstance(flow_state, dict):
+                    pending_action = _sanitize_github_pending_action(
+                        flow_state.get("pending_action")
+                    )
+
+        payload = _json(raw) or {}
+        enrich_github_setup_runtime(payload, pending_action=pending_action)
+        payload["connector_id"] = GITHUB_CONNECTOR_ID
+        payload["credentials_saved"] = credentials_saved
+        payload["verified_login"] = verified_login
+        payload["pending_action"] = pending_action
+
+        connected = [
+            item
+            for item in payload.get("connections", [])
+            if isinstance(item, dict) and item.get("status") == "connected"
+        ]
+        pending = [
+            item
+            for item in payload.get("recent_attempts", [])
+            if isinstance(item, dict)
+            and item.get("status") in {"pending_user", "awaiting_input", "error"}
+        ]
+        if credentials_saved:
+            who = f"@{verified_login}" if verified_login else "stored token"
+            display = f"GitHub Issues: connected ({who})"
+            if pending_action:
+                repo = pending_action.get("repo") or "target repo"
+                act = pending_action.get("action") or "pending action"
+                display += f"; pending action ready to resume ({act} on {repo})"
+        elif connected:
+            accounts = ", ".join(str(item.get("display_name") or item.get("account_key")) for item in connected)
+            display = f"GitHub Issues: connected ({accounts})"
+        elif pending:
+            display = "GitHub Issues: setup pending"
+        else:
+            display = "GitHub Issues: not connected"
+
+        payload["ui"] = _github_connector_setup_ui(
+            payload,
+            pending_action=pending_action,
+            credentials_saved=credentials_saved,
+            verified_login=verified_login,
+        )
+        return ToolResult.success_result(payload, display_output=display)
+
+
+class StartGithubSetupHandler(ToolHandler):
+    """Start a resumable GitHub Issues connector setup attempt."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="start_github_setup",
+            description=(
+                "Start the guided GitHub Issues setup flow when the user wants to search, "
+                "read, create, comment on, or update GitHub issues and GitHub is not yet "
+                "connected. Preserves the user's pending_action draft (repo, query, title, "
+                "body, labels, issue_number, authorized) so the task can resume immediately "
+                "once connected via the Connections page or `hexis auth github setup-token`. "
+                "Never ask for or pass a token here."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "capabilities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional GitHub capabilities to request (e.g. search_issues, "
+                            "read_issues, create_issue, comment_issue, update_issue)."
+                        ),
+                    },
+                    "pending_action": {
+                        "type": "object",
+                        "description": (
+                            "Non-secret draft of the user's intended GitHub action so it can "
+                            "resume immediately after setup (keys: action, repo, query, title, "
+                            "body, labels, issue_number, authorized, notes)."
+                        ),
+                    },
+                    "source_channel": {
+                        "type": "string",
+                        "description": "Optional source surface (chat, cli, web, slack, telegram, signal).",
+                    },
+                    "source_session_id": {
+                        "type": "string",
+                        "description": "Optional conversation/session identifier for resuming setup.",
+                    },
+                },
+            },
+            category=ToolCategory.EXTERNAL,
+            energy_cost=1,
+            is_read_only=False,
+            requires_approval=False,
+            supports_parallel=False,
+            allowed_contexts={ToolContext.CHAT, ToolContext.MCP},
+        )
+
+    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        if not context.registry:
+            return ToolResult.error_result(
+                "start_github_setup requires an active tool registry.",
+                ToolErrorType.EXECUTION_FAILED,
+            )
+        from core.auth.github_pat import (
+            GITHUB_CONNECTOR_ID,
+            GITHUB_DEFAULT_CAPABILITIES,
+            GITHUB_PAT_CREATE_URL,
+            load_credentials,
+        )
+
+        pending_action = _sanitize_github_pending_action(arguments.get("pending_action"))
+        requested = arguments.get("capabilities")
+        requested_json = json.dumps(requested) if requested is not None else None
+
+        creds = load_credentials()
+        if creds is not None:
+            payload: dict[str, Any] = {
+                "connector_id": GITHUB_CONNECTOR_ID,
+                "status": "connected",
+                "credentials_saved": True,
+                "verified_login": creds.login,
+                "capabilities": requested or list(GITHUB_DEFAULT_CAPABILITIES),
+                "pending_action": pending_action,
+            }
+            payload["ui"] = _github_connector_setup_ui(
+                payload,
+                status="connected",
+                capabilities=payload["capabilities"],
+                pending_action=pending_action,
+                credentials_saved=True,
+                verified_login=creds.login,
+            )
+            who = f"@{creds.login}" if creds.login else "your stored token"
+            return ToolResult.success_result(
+                payload,
+                display_output=(
+                    f"GitHub Issues is already connected as {who}. "
+                    "Activate the `github-issues` skill to continue."
+                ),
+            )
+
+        flow_state: dict[str, Any] = {"auth_mode": "fine_grained_pat"}
+        if pending_action:
+            flow_state["pending_action"] = pending_action
+
+        try:
+            async with context.registry.pool.acquire() as conn:
+                plan_raw = await conn.fetchval(
+                    "SELECT prepare_connection_attempt($1, $2::jsonb)",
+                    GITHUB_CONNECTOR_ID,
+                    requested_json,
+                )
+                plan = _json(plan_raw) or {}
+                next_step = _setup_next_step(plan)
+                attempt_raw = await conn.fetchval(
+                    """
+                    SELECT start_connection_attempt(
+                        $1,
+                        $2::jsonb,
+                        ARRAY[]::text[],
+                        $3::jsonb,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        CURRENT_TIMESTAMP + INTERVAL '24 hours'
+                    )
+                    """,
+                    GITHUB_CONNECTOR_ID,
+                    requested_json or json.dumps(plan.get("capabilities") or GITHUB_DEFAULT_CAPABILITIES),
+                    json.dumps(flow_state),
+                    GITHUB_PAT_CREATE_URL,
+                    next_step,
+                    arguments.get("source_channel"),
+                    arguments.get("source_session_id") or context.session_id,
+                )
+        except Exception as exc:
+            return ToolResult.error_result(str(exc), ToolErrorType.INVALID_PARAMS)
+
+        payload = _json(attempt_raw) or {}
+        payload["connector_id"] = GITHUB_CONNECTOR_ID
+        payload["status"] = "pending_setup"
+        payload["credentials_saved"] = False
+        payload["authorization_url"] = GITHUB_PAT_CREATE_URL
+        payload["cli_command"] = "hexis auth github setup-token"
+        payload["never_paste_in_chat"] = True
+        payload["pending_action"] = pending_action
+        payload["setup_plan"] = plan
+        payload["next_step"] = payload.get("user_next_step") or next_step
+        payload["why_needed"] = _GITHUB_WHY_NEEDED
+        payload["ui"] = _github_connector_setup_ui(
+            payload,
+            status="pending_authorization",
+            capabilities=payload.get("requested_capabilities") or plan.get("capabilities"),
+            pending_attempt=payload,
+            pending_action=pending_action,
+            credentials_saved=False,
+            next_step=payload["next_step"],
+        )
+        return ToolResult.success_result(payload, display_output=payload["next_step"])
+
+
 def create_integration_tools() -> list[ToolHandler]:
     return [
         IntegrationSetupStatusHandler(),
         StartIntegrationSetupHandler(),
         ConfigureChannelIntegrationHandler(),
         VerifyChannelIntegrationHandler(),
+        GithubSetupStatusHandler(),
+        StartGithubSetupHandler(),
         GmailSetupStatusHandler(),
         ConnectGmailHandler(),
         CompleteGmailConnectionHandler(),

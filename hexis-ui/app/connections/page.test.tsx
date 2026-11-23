@@ -150,4 +150,134 @@ describe("Wave B connections setup", () => {
       source_session_id: "web-connections",
     });
   });
+
+  it("connects GitHub Issues via masked PAT input and disconnects via revoke_github", async () => {
+    const posts: Record<string, unknown>[] = [];
+    let connected = false;
+    const githubConnector = {
+      id: "github_issues",
+      display_name: "GitHub Issues",
+      category: "productivity",
+      auth_type: "api_key",
+      status: "available",
+      capability_manifest: {
+        search_issues: { label: "Search issues", scope_kind: "read", status: "available" },
+        read_issues: { label: "Read and list issues", scope_kind: "read", status: "available" },
+        create_issue: { label: "Create issues", scope_kind: "write", status: "available" },
+        comment_issue: { label: "Comment on issues", scope_kind: "write", status: "available" },
+      },
+      setup_manifest: {
+        default_capabilities: ["search_issues", "read_issues", "create_issue"],
+        capability_order: ["search_issues", "read_issues", "create_issue", "comment_issue"],
+        token_create_url: "https://github.com/settings/personal-access-tokens/new",
+        cli_command: "hexis auth github setup-token",
+        pending_action: {
+          action: "create_issue",
+          repo: "QuixiAI/Hexis",
+          title: "Improve onboarding",
+        },
+      },
+      docs_url: "https://docs.github.com",
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "POST") {
+          const parsed = JSON.parse(String(init.body));
+          posts.push(parsed);
+          if (parsed.action === "connect_github_pat") {
+            connected = true;
+            return Response.json({
+              success: true,
+              display_output: "GitHub Issues connected as @octocat.",
+            });
+          }
+          if (parsed.action === "revoke_github") {
+            connected = false;
+            return Response.json({
+              success: true,
+              display_output: "GitHub Issues disconnected.",
+            });
+          }
+        }
+        return Response.json({
+          connectors: [
+            {
+              ...githubConnector,
+              setup_manifest: {
+                ...githubConnector.setup_manifest,
+                credentials_saved: connected,
+                verified_login: connected ? "octocat" : null,
+              },
+            },
+          ],
+          connections: connected
+            ? [
+                {
+                  id: "conn-gh-1",
+                  connector_id: "github_issues",
+                  account_key: "octocat",
+                  display_name: "@octocat",
+                  status: "connected",
+                  credential_ref: "token.github_pat",
+                  granted_scopes: [],
+                  capabilities: ["search_issues", "read_issues", "create_issue", "comment_issue"],
+                  source_channel: "web",
+                  source_session_id: "web-connections",
+                  last_error: null,
+                  connected_at: "2026-11-22T00:00:00Z",
+                  last_verified_at: "2026-11-22T00:00:00Z",
+                  revoked_at: null,
+                  updated_at: "2026-11-22T00:00:00Z",
+                },
+              ]
+            : [],
+          recent_attempts: [],
+          channel_runtime: [],
+          backfill: { jobs: [], cursors: [], item_counts: [] },
+        });
+      }) as unknown as typeof fetch
+    );
+
+    render(<ConnectionsPage />);
+    const tokenInput = (await screen.findByLabelText(
+      "GitHub personal access token"
+    )) as HTMLInputElement;
+    expect(tokenInput.type).toBe("password");
+    expect(screen.getByText(/Pending GitHub action ready to resume/)).toBeInTheDocument();
+    expect(screen.getByText("Improve onboarding")).toBeInTheDocument();
+
+    fireEvent.change(tokenInput, { target: { value: "github_pat_ui_test_123" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Comment on issues" }));
+    fireEvent.click(screen.getByRole("button", { name: "Connect GitHub Issues" }));
+
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toEqual({
+      action: "connect_github_pat",
+      arguments: {
+        token: "github_pat_ui_test_123",
+        capabilities: ["search_issues", "read_issues", "create_issue", "comment_issue"],
+      },
+      source_session_id: "web-connections",
+    });
+
+    const disconnectBtn = await screen.findByRole("button", { name: "Disconnect" });
+    fireEvent.click(disconnectBtn);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent(/Disconnect @octocat/);
+    const confirmButtons = screen.getAllByRole("button", { name: "Disconnect" });
+    fireEvent.click(confirmButtons[confirmButtons.length - 1]);
+
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toEqual({
+      action: "revoke_github",
+      arguments: {
+        connector_id: "github_issues",
+        account_key: "octocat",
+        reason: "revoked from web connections",
+      },
+      source_session_id: "web-connections",
+    });
+  });
 });
