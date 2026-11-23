@@ -274,8 +274,31 @@ class SkillSpec:
         )
         import os
 
-        missing_env = [v for v in env_wanted if not os.environ.get(v)]
+        missing_env: list[str] = []
+        for v in env_wanted:
+            if v == "GITHUB_PERSONAL_ACCESS_TOKEN":
+                # #102: never silently consume ambient GITHUB_PERSONAL_ACCESS_TOKEN;
+                # check Hexis's own managed credential store only.
+                from core.auth.github_pat import resolve_github_token
+
+                token, _login = resolve_github_token()
+                if not token:
+                    missing_env.append(v)
+            elif not os.environ.get(v):
+                missing_env.append(v)
         if missing_env:
+            if "GITHUB_PERSONAL_ACCESS_TOKEN" in missing_env:
+                return (
+                    "needs_setup",
+                    ["missing credential: github_issues"],
+                    (
+                        "GitHub needs a connected account before this can search, create, "
+                        "or comment on issues — reading a public repo is public, but acting "
+                        "on it as you is not. Connect GitHub Issues in Connections → GitHub Issues "
+                        "(or run `hexis auth github setup-token` in a terminal), never paste a "
+                        "token into chat."
+                    ),
+                )
             return (
                 "needs_setup",
                 [f"missing env var: {v}" for v in missing_env],

@@ -374,6 +374,59 @@ INSERT INTO integration_connectors (
     }'::jsonb,
     'https://docs.x.com',
     '{"provider": "twitter_x", "twitter_x_live_oauth": true, "twitter_x_archive_import": true, "seeded_by": "db/77_functions_integrations.sql"}'::jsonb
+),
+(
+    'github_issues',
+    'GitHub Issues',
+    'productivity',
+    'api_key',
+    'available',
+    '{
+      "search_issues": {"label": "Search issues", "scope_kind": "read", "status": "available", "scopes": []},
+      "read_issues": {"label": "Read and list issues", "scope_kind": "read", "status": "available", "scopes": []},
+      "create_issue": {"label": "Create issues", "scope_kind": "write", "status": "available", "scopes": []},
+      "comment_issue": {"label": "Comment on issues", "scope_kind": "write", "status": "available", "scopes": []},
+      "update_issue": {"label": "Update issue state, labels, or assignees", "scope_kind": "modify", "status": "available", "scopes": []}
+    }'::jsonb,
+    '{
+      "flow": "fine_grained_pat",
+      "setup_label": "GitHub Issues token",
+      "secret_storage": "~/.hexis/auth",
+      "never_paste_in_chat": true,
+      "supported_surfaces": ["chat", "cli", "web", "channels"],
+      "default_capabilities": ["search_issues", "read_issues", "create_issue"],
+      "capability_order": ["search_issues", "read_issues", "create_issue", "comment_issue", "update_issue"],
+      "required_scopes": [],
+      "scope_order": [],
+      "token_create_url": "https://github.com/settings/personal-access-tokens/new",
+      "cli_command": "hexis auth github setup-token",
+      "capability_aliases": {
+        "search": "search_issues",
+        "read": "read_issues",
+        "list": "read_issues",
+        "create": "create_issue",
+        "file": "create_issue",
+        "open": "create_issue",
+        "write": "create_issue",
+        "comment": "comment_issue",
+        "reply": "comment_issue",
+        "update": "update_issue",
+        "edit": "update_issue"
+      },
+      "setup_steps": [
+        "Open https://github.com/settings/personal-access-tokens/new and create a fine-grained personal access token scoped to Issues (Read and write) on the target repository or repositories.",
+        "Connect it on the Connections page in the web dashboard or run `hexis auth github setup-token` in a terminal.",
+        "Never paste your token into chat. Hexis verifies the token against GitHub and stores it privately in ~/.hexis/auth.",
+        "Return to your conversation to continue the pending GitHub action."
+      ],
+      "user_next_step": "Create a fine-grained GitHub token scoped to Issues (Read and write) at https://github.com/settings/personal-access-tokens/new, then save it on the Connections page or run `hexis auth github setup-token` in a terminal. Never paste the token into chat.",
+      "notes": [
+        "Public repositories can be read publicly, but creating, commenting on, or updating an issue requires authenticating as a specific GitHub account.",
+        "Hexis stores the token privately in ~/.hexis/auth and never silently consumes ambient gh auth or GITHUB_TOKEN environment variables."
+      ]
+    }'::jsonb,
+    'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token',
+    '{"provider": "github", "skill": "github-issues", "seeded_by": "db/77_functions_integrations.sql"}'::jsonb
 )
 ON CONFLICT (id) DO UPDATE SET
     display_name = EXCLUDED.display_name,
@@ -802,6 +855,23 @@ BEGIN
         last_error = NULL,
         updated_at = CURRENT_TIMESTAMP
     RETURNING * INTO row_connection;
+
+    -- Single-slot shared credentials (e.g. github_issues -> token.github_pat):
+    -- connecting a different login replaces the stored token, so displace any
+    -- previously connected account still referencing that same credential_ref.
+    IF row_attempt.connector_id = 'github_issues'
+       AND row_connection.credential_ref IS NOT NULL THEN
+        UPDATE integration_connections
+        SET status = 'revoked',
+            credential_ref = NULL,
+            last_error = 'Replaced by another GitHub account',
+            revoked_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE connector_id = row_attempt.connector_id
+          AND account_key <> normalized_account
+          AND credential_ref = row_connection.credential_ref
+          AND status = 'connected';
+    END IF;
 
     UPDATE connection_attempts
     SET account_key = normalized_account,

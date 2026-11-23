@@ -61,9 +61,9 @@ def _mcp_setup_next_step(missing_env: list[str]) -> str:
         return (
             "GitHub needs a connected account before this can search, create, "
             "or comment on issues -- a public repo being readable doesn't mean "
-            "acting on it as you is. Run `hexis auth github setup-token` in a "
-            "terminal (never paste the token into chat), then call use_skill "
-            "again."
+            "acting on it as you is. Connect GitHub Issues via start_github_setup "
+            "/ Connections → GitHub Issues, or run `hexis auth github setup-token` "
+            "in a terminal (never paste the token into chat), then retry."
         )
     return (
         f"Set {', '.join(missing_env)} in the service environment and "
@@ -201,6 +201,15 @@ class UseSkillHandler(ToolHandler):
         resolved_env: dict[str, str] = {}
         missing_env: list[str] = []
         for var in binding.env_requires:
+            if var == "GITHUB_PERSONAL_ACCESS_TOKEN":
+                # #102: never silently consume ambient GITHUB_PERSONAL_ACCESS_TOKEN;
+                # use only Hexis's managed store and inject into this subprocess only.
+                stored = _resolve_stored_mcp_credential(var)
+                if stored:
+                    resolved_env[var] = stored
+                else:
+                    missing_env.append(var)
+                continue
             if os.environ.get(var):
                 continue
             stored = _resolve_stored_mcp_credential(var)
@@ -209,11 +218,44 @@ class UseSkillHandler(ToolHandler):
                 continue
             missing_env.append(var)
         if missing_env:
-            return {
+            # If this server was previously running with a credential that has
+            # since been revoked/removed, tear down the stale subprocess now.
+            await MCPRuntime.instance().disconnect_server(binding.server)
+            setup_payload: dict[str, Any] = {
                 "status": "needs_setup",
-                "missing": [f"missing env var: {v}" for v in missing_env],
+                "missing": [
+                    "missing credential: github_issues"
+                    if v == "GITHUB_PERSONAL_ACCESS_TOKEN"
+                    else f"missing env var: {v}"
+                    for v in missing_env
+                ],
                 "next_step": _mcp_setup_next_step(missing_env),
             }
+            if "GITHUB_PERSONAL_ACCESS_TOKEN" in missing_env:
+                from core.auth.github_pat import GITHUB_CONNECTOR_ID, GITHUB_PAT_CREATE_URL
+
+                setup_payload["connector_id"] = GITHUB_CONNECTOR_ID
+                setup_payload["ui"] = {
+                    "kind": "connector_setup",
+                    "version": 1,
+                    "id": "connector_setup:github_issues:needs_setup",
+                    "connector_id": GITHUB_CONNECTOR_ID,
+                    "display_name": "GitHub Issues",
+                    "title": "Connect GitHub Issues",
+                    "status": "needs_setup",
+                    "summary": (
+                        "Public repositories are readable without signing in, but creating, "
+                        "commenting on, or updating issues requires your GitHub account."
+                    ),
+                    "authorization_url": GITHUB_PAT_CREATE_URL,
+                    "setup_steps": [
+                        "Create a fine-grained GitHub personal access token scoped to Issues (Read & Write) on the target repo(s).",
+                        "Connect GitHub Issues in Connections → GitHub Issues, or run `hexis auth github setup-token` in a terminal.",
+                        "Never paste your GitHub token into chat.",
+                    ],
+                    "next_step": setup_payload["next_step"],
+                }
+            return setup_payload
 
         if binding.command:
             server_config = MCPServerConfig(
@@ -223,12 +265,14 @@ class UseSkillHandler(ToolHandler):
                 env=resolved_env,
             )
         else:
+            import dataclasses
+
             config = await context.registry.get_config()
-            server_config = next(
+            configured = next(
                 (c for c in (config.mcp_servers or []) if c.name == binding.server and c.enabled),
                 None,
             )
-            if server_config is None:
+            if configured is None:
                 return {
                     "status": "unavailable",
                     "next_step": (
@@ -236,6 +280,10 @@ class UseSkillHandler(ToolHandler):
                         "(mcp_servers), or add a command to the skill manifest."
                     ),
                 }
+            server_config = dataclasses.replace(
+                configured,
+                env={**configured.env, **resolved_env},
+            )
 
         runtime = MCPRuntime.instance()
         result = await runtime.ensure_connected(server_config)

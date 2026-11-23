@@ -256,4 +256,32 @@ async def test_use_skill_github_needs_setup_points_to_setup_token_command(
     assert result.output["status"] == "needs_setup"
     assert "hexis auth github setup-token" in result.output["next_step"]
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in result.output["next_step"]
+    assert result.output["connector_id"] == "github_issues"
+    assert result.output["ui"]["kind"] == "connector_setup"
+    assert result.output["ui"]["connector_id"] == "github_issues"
+    assert not any(n.startswith("mcp_") for n in registry.list_names())
+
+
+async def test_use_skill_github_ignores_ambient_env_var(
+    tmp_path, stub_server_config, fresh_singleton, monkeypatch
+):
+    """#102: ambient GITHUB_PERSONAL_ACCESS_TOKEN in the process environment
+    must NOT be silently consumed when Hexis has no stored GitHub PAT."""
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_ambient_leak")
+    monkeypatch.setattr(
+        "core.auth.github_pat.resolve_github_token", lambda: (None, "")
+    )
+    script = Path(stub_server_config.args[0])
+    skills_root = _skill_dir_with_manifest(
+        tmp_path, script, env_requires="GITHUB_PERSONAL_ACCESS_TOKEN"
+    )
+    registry = _registry_for_skills(skills_root)
+    context = ToolExecutionContext(
+        tool_context=ToolContext.CHAT, call_id="t5", registry=registry
+    )
+
+    result = await UseSkillHandler().execute({"name": "stub-echo"}, context)
+    assert result.output["status"] == "needs_setup"
+    assert result.output["connector_id"] == "github_issues"
+    assert result.output["ui"]["kind"] == "connector_setup"
     assert not any(n.startswith("mcp_") for n in registry.list_names())

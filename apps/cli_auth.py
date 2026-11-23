@@ -776,19 +776,30 @@ async def _anthropic_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
     return 0
 
 
+async def _best_effort_github_db_pool(dsn: str) -> Any | None:
+    if not dsn or "unused" in dsn:
+        return None
+    try:
+        import asyncpg
+
+        return await asyncpg.create_pool(dsn, min_size=1, max_size=1, timeout=2.0)
+    except Exception:
+        return None
+
+
 async def _github_setup_token(dsn: str, wait_seconds: int, token: str | None) -> int:
     """#102: the github-issues skill dead-ended into "set
     GITHUB_PERSONAL_ACCESS_TOKEN in the service environment". This is the
-    interim, productized replacement the issue's own Non-Goals sanction: a
-    terminal-only prompt (never chat), verified against GitHub's own API
-    before being stored, so a bad paste fails loudly here instead of at
-    skill-activation time."""
+    productized terminal path (never chat), verified against GitHub's own API
+    before being stored privately in ~/.hexis/auth and synced to Postgres."""
     import getpass
 
     from apps.cli_theme import console
     from core.auth.github_pat import (
+        GITHUB_PAT_CREATE_URL,
         GithubPatCredentials,
         save_credentials,
+        sync_github_connection_db,
         validate_pat_format,
         verify_pat,
     )
@@ -796,7 +807,7 @@ async def _github_setup_token(dsn: str, wait_seconds: int, token: str | None) ->
     if not token:
         console.print(
             "[dim]Create a fine-grained token scoped to Issues (read/write) on the "
-            "target repo(s) at https://github.com/settings/personal-access-tokens/new[/dim]"
+            f"target repo(s) at {GITHUB_PAT_CREATE_URL}[/dim]"
         )
         try:
             token = getpass.getpass("Paste your GitHub personal access token: ").strip()
@@ -816,6 +827,26 @@ async def _github_setup_token(dsn: str, wait_seconds: int, token: str | None) ->
 
     save_credentials(GithubPatCredentials(token=token, login=login))
     console.print(f"[ok]GitHub token saved and verified as @{login}.[/ok]")
+
+    pool = await _best_effort_github_db_pool(dsn)
+    if pool is not None:
+        try:
+            synced = await sync_github_connection_db(
+                pool,
+                login=login,
+                source_channel="cli",
+            )
+            pending = synced.get("pending_action")
+            if isinstance(pending, dict) and pending:
+                repo = pending.get("repo") or "target repo"
+                act = pending.get("action") or "GitHub action"
+                console.print(
+                    f"[accent]Pending {act} for {repo} is ready to resume in your conversation.[/accent]"
+                )
+        except Exception:
+            pass
+        finally:
+            await pool.close()
     return 0
 
 
@@ -847,7 +878,7 @@ async def _github_status(dsn: str, wait_seconds: int, *, as_json: bool) -> int:
 
 async def _github_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
     from apps.cli_theme import console
-    from core.auth.github_pat import delete_credentials
+    from core.auth.github_pat import delete_credentials, revoke_github_connection_db
 
     if not yes:
         try:
@@ -860,6 +891,14 @@ async def _github_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
             return 1
 
     delete_credentials()
+    pool = await _best_effort_github_db_pool(dsn)
+    if pool is not None:
+        try:
+            await revoke_github_connection_db(pool, reason="logged out via cli")
+        except Exception:
+            pass
+        finally:
+            await pool.close()
     console.print("[ok]Deleted GitHub credentials.[/ok]")
     return 0
 

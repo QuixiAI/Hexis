@@ -67,6 +67,134 @@ def test_integration_action_arguments_reject_gmail_manual_setup() -> None:
     assert "connect_gmail" in str(excinfo.value.detail)
 
 
+def test_integration_action_arguments_reject_github_manual_setup() -> None:
+    with pytest.raises(HTTPException) as excinfo:
+        _integration_action_arguments(
+            "start_setup",
+            {"connector_id": "github-issues"},
+            "web-connections",
+        )
+
+    assert excinfo.value.status_code == 422
+    assert "start_github_setup" in str(excinfo.value.detail)
+
+
+def test_integration_action_arguments_add_web_source_for_github_setup() -> None:
+    args = _integration_action_arguments(
+        "start_github_setup",
+        {"pending_action": {"repo": "QuixiAI/Hexis", "action": "create_issue"}},
+        "web-chat-1",
+    )
+    assert args["source_channel"] == "web"
+    assert args["source_session_id"] == "web-chat-1"
+
+
+@pytest.mark.asyncio
+async def test_connect_github_pat_and_revoke_actions_never_leak_secret(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_complete(_pool, *, token, capabilities, attempt_id, source_channel, source_session_id):
+        captured["token"] = token
+        captured["capabilities"] = capabilities
+        captured["attempt_id"] = attempt_id
+        captured["source_channel"] = source_channel
+        captured["source_session_id"] = source_session_id
+        return {
+            "connected": True,
+            "connector_id": "github_issues",
+            "account_key": "octocat",
+            "display_name": "@octocat",
+            "login": "octocat",
+            "credential_ref": "token.github_pat",
+            "capabilities": capabilities or ["search_issues", "read_issues", "create_issue"],
+            "connection_id": "conn-123",
+            "pending_action": {"repo": "QuixiAI/Hexis", "action": "create_issue"},
+        }
+
+    async def fake_revoke(_pool, *, account_key, reason):
+        captured["revoked_account"] = account_key
+        captured["revoked_reason"] = reason
+        return {"revoked": True, "connector_id": "github_issues", "account_key": account_key}
+
+    monkeypatch.setattr(hexis_api, "_pool", object())
+    monkeypatch.setattr("core.auth.github_pat.complete_github_connection_db", fake_complete)
+    monkeypatch.setattr("core.auth.github_pat.revoke_github_connection_db", fake_revoke)
+
+    secret_token = "github_pat_super_secret_do_not_echo_12345"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.post(
+            "/api/integrations/action",
+            json={
+                "action": "connect_github_pat",
+                "arguments": {
+                    "token": secret_token,
+                    "capabilities": ["search_issues", "create_issue"],
+                },
+                "source_session_id": "web-connections",
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is True
+        assert body["output"]["login"] == "octocat"
+        assert body["output"]["ui"]["kind"] == "connector_setup"
+        assert body["output"]["ui"]["status"] == "connected"
+        assert body["output"]["pending_action"]["repo"] == "QuixiAI/Hexis"
+        assert secret_token not in response.text
+        assert captured["token"] == secret_token
+        assert captured["source_channel"] == "web"
+
+        revoke_resp = await client.post(
+            "/api/integrations/action",
+            json={
+                "action": "revoke_github",
+                "arguments": {"account_key": "octocat", "reason": "done"},
+            },
+        )
+        assert revoke_resp.status_code == 200
+        assert revoke_resp.json()["success"] is True
+        assert captured["revoked_account"] == "octocat"
+
+
+@pytest.mark.asyncio
+async def test_connect_github_pat_reports_validation_and_verification_errors(monkeypatch) -> None:
+    async def fail_format(_pool, **_kwargs):
+        raise ValueError("Token must start with 'github_pat_'")
+
+    async def fail_verify(_pool, **_kwargs):
+        raise RuntimeError("GitHub rejected the token (401 Unauthorized)")
+
+    monkeypatch.setattr(hexis_api, "_pool", object())
+    monkeypatch.setattr("core.auth.github_pat.complete_github_connection_db", fail_format)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        resp_empty = await client.post(
+            "/api/integrations/action",
+            json={"action": "connect_github_pat", "arguments": {"token": "   "}},
+        )
+        assert resp_empty.status_code == 422
+
+        resp_fmt = await client.post(
+            "/api/integrations/action",
+            json={"action": "connect_github_pat", "arguments": {"token": "not-a-pat"}},
+        )
+        assert resp_fmt.status_code == 422
+
+        monkeypatch.setattr("core.auth.github_pat.complete_github_connection_db", fail_verify)
+        resp_auth = await client.post(
+            "/api/integrations/action",
+            json={"action": "connect_github_pat", "arguments": {"token": "github_pat_bad"}},
+        )
+        assert resp_auth.status_code == 400
+        assert resp_auth.json()["error_type"] == "auth_failed"
+
+
 @pytest.mark.asyncio
 async def test_save_gmail_client_secret_action_returns_ui_without_secret(monkeypatch) -> None:
     class FakeRegistry:
