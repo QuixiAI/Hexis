@@ -856,6 +856,23 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP
     RETURNING * INTO row_connection;
 
+    -- Single-slot shared credentials (e.g. github_issues -> token.github_pat):
+    -- connecting a different login replaces the stored token, so displace any
+    -- previously connected account still referencing that same credential_ref.
+    IF row_attempt.connector_id = 'github_issues'
+       AND row_connection.credential_ref IS NOT NULL THEN
+        UPDATE integration_connections
+        SET status = 'revoked',
+            credential_ref = NULL,
+            last_error = 'Replaced by another GitHub account',
+            revoked_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE connector_id = row_attempt.connector_id
+          AND account_key <> normalized_account
+          AND credential_ref = row_connection.credential_ref
+          AND status = 'connected';
+    END IF;
+
     UPDATE connection_attempts
     SET account_key = normalized_account,
         status = 'complete',

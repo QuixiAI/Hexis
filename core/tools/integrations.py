@@ -118,8 +118,21 @@ _GITHUB_WHY_NEEDED = (
 )
 
 
+_GITHUB_SECRET_VALUE_RE = re.compile(
+    r"(?:github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|Bearer\s+[A-Za-z0-9._\-]{10,})"
+)
+
+
+def _redact_github_secret_text(text: str) -> str:
+    return _GITHUB_SECRET_VALUE_RE.sub("[REDACTED_TOKEN]", text)
+
+
 def _sanitize_github_pending_action(value: Any) -> dict[str, Any] | None:
-    """Whitelist non-secret task intent fields for resumable GitHub setup."""
+    """Whitelist non-secret task intent fields for resumable GitHub setup.
+
+    Also redacts accidental credential strings inside allowed text/label fields
+    and accepts only literal booleans for ``authorized``.
+    """
     if not isinstance(value, dict):
         return None
     sanitized: dict[str, Any] = {}
@@ -129,7 +142,11 @@ def _sanitize_github_pending_action(value: Any) -> dict[str, Any] | None:
         raw = value[key]
         if key == "labels":
             if isinstance(raw, list):
-                cleaned = [str(item).strip() for item in raw if str(item or "").strip()]
+                cleaned = [
+                    _redact_github_secret_text(str(item).strip())
+                    for item in raw
+                    if str(item or "").strip()
+                ]
                 if cleaned:
                     sanitized[key] = cleaned
         elif key == "issue_number":
@@ -138,9 +155,9 @@ def _sanitize_github_pending_action(value: Any) -> dict[str, Any] | None:
             except (TypeError, ValueError):
                 continue
         elif key == "authorized":
-            sanitized[key] = bool(raw)
+            sanitized[key] = raw if isinstance(raw, bool) else False
         else:
-            text = str(raw).strip()
+            text = _redact_github_secret_text(str(raw).strip())
             if text:
                 sanitized[key] = text
     return sanitized or None
@@ -2640,19 +2657,35 @@ class GithubSetupStatusHandler(ToolHandler):
         verified_login = creds.login if creds else None
 
         pending_action: dict[str, Any] | None = None
+        session_key = (context.session_id or "").strip()
         async with context.registry.pool.acquire() as conn:
             raw = await conn.fetchval("SELECT integration_status($1)", GITHUB_CONNECTOR_ID)
-            attempt_row = await conn.fetchrow(
-                """
-                SELECT id::text AS id, status, flow_state
-                FROM connection_attempts
-                WHERE connector_id = $1
-                  AND status IN ('pending_user', 'awaiting_input', 'error', 'complete')
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                GITHUB_CONNECTOR_ID,
-            )
+            if session_key:
+                attempt_row = await conn.fetchrow(
+                    """
+                    SELECT id::text AS id, status, flow_state
+                    FROM connection_attempts
+                    WHERE connector_id = $1
+                      AND source_session_id = $2
+                      AND status IN ('pending_user', 'awaiting_input', 'error', 'complete')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    GITHUB_CONNECTOR_ID,
+                    session_key,
+                )
+            else:
+                attempt_row = await conn.fetchrow(
+                    """
+                    SELECT id::text AS id, status, flow_state
+                    FROM connection_attempts
+                    WHERE connector_id = $1
+                      AND status IN ('pending_user', 'awaiting_input', 'error', 'complete')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    GITHUB_CONNECTOR_ID,
+                )
             if attempt_row is not None:
                 flow_state = _json(attempt_row["flow_state"])
                 if isinstance(flow_state, dict):

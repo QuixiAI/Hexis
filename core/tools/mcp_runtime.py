@@ -53,9 +53,9 @@ class MCPRuntime:
         async with self._lock_for(config.name):
             client = self._clients.get(config.name)
             if client is not None:
-                if client.is_connected:
+                if client.is_connected and client.config.env == config.env:
                     return {"connected": True, "tools": client.get_tools()}
-                # Dead process: drop and reconnect once.
+                # Dead process or changed credentials: drop and reconnect once.
                 try:
                     await client.disconnect()
                 except Exception:
@@ -123,6 +123,16 @@ class MCPRuntime:
                 ))
             registered.append(prefixed)
         return registered
+
+    async def disconnect_server(self, server: str) -> None:
+        """Stop and remove a single connected MCP server (e.g. on credential revocation)."""
+        async with self._lock_for(server):
+            client = self._clients.pop(server, None)
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    logger.debug("MCP client disconnect failed for %s", server, exc_info=True)
 
     async def shutdown(self) -> None:
         for name, client in list(self._clients.items()):

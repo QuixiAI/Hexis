@@ -3951,8 +3951,8 @@ function ConnectorSetupCard({
                   ...(capabilities.length > 0 ? { capabilities } : {}),
                   ...(ui.attempt_id ? { attempt_id: ui.attempt_id } : {}),
                 });
-                if (result.error) {
-                  setError(result.error);
+                if (result.error || result.detail || result.success === false) {
+                  setError(integrationActionError(result, 400));
                 } else {
                   setNotice("GitHub Issues connected. Tell me to continue when ready.");
                 }
@@ -3967,7 +3967,9 @@ function ConnectorSetupCard({
               onClick={async () => {
                 setError(null);
                 const result = await onRefresh(assistantId, ui);
-                if (result.error) setError(result.error);
+                if (result.error || result.detail || result.success === false) {
+                  setError(integrationActionError(result, 400));
+                }
               }}
               className="rounded-md border border-[var(--outline)] px-3 py-2 text-xs font-semibold text-[var(--foreground)] hover:border-[var(--teal)] disabled:opacity-40"
             >

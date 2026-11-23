@@ -156,7 +156,8 @@ async def test_catalog_is_tri_state_and_never_silently_drops():
     # MCP tools listed from the manifest, pre-activation.
     assert "mcp_github_create_issue" in gh["bound_tools"]
     if gh["status"] == "needs_setup":
-        assert "GITHUB_PERSONAL_ACCESS_TOKEN" in gh["next_step"]
+        assert "hexis auth github setup-token" in gh["next_step"]
+        assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in gh["next_step"]
 
     # Implicit skill for the configured-but-unbound server.
     assert "mcp-stubserver" in by_name

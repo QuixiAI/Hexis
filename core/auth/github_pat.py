@@ -169,6 +169,7 @@ async def sync_github_connection_db(
     if pool is not None:
         async with pool.acquire() as conn:
             resolved_attempt_id = attempt_id
+            row = None
             if resolved_attempt_id:
                 row = await conn.fetchrow(
                     """
@@ -180,17 +181,38 @@ async def sync_github_connection_db(
                     GITHUB_CONNECTOR_ID,
                 )
             else:
-                row = await conn.fetchrow(
-                    """
-                    SELECT id::text AS id, flow_state, requested_capabilities
-                    FROM connection_attempts
-                    WHERE connector_id = $1
-                      AND status IN ('pending_user', 'awaiting_input', 'error')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    GITHUB_CONNECTOR_ID,
-                )
+                session_key = (source_session_id or "").strip()
+                if session_key and session_key != "web-connections":
+                    row = await conn.fetchrow(
+                        """
+                        SELECT id::text AS id, flow_state, requested_capabilities
+                        FROM connection_attempts
+                        WHERE connector_id = $1
+                          AND source_session_id = $2
+                          AND status IN ('pending_user', 'awaiting_input', 'error')
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        GITHUB_CONNECTOR_ID,
+                        session_key,
+                    )
+                if row is None:
+                    # Cross-surface handoff (e.g. CLI or Connections page): reuse an
+                    # open attempt only when there is a single unambiguous candidate so
+                    # one conversation never steals another conversation's pending draft.
+                    open_rows = await conn.fetch(
+                        """
+                        SELECT id::text AS id, flow_state, requested_capabilities
+                        FROM connection_attempts
+                        WHERE connector_id = $1
+                          AND status IN ('pending_user', 'awaiting_input', 'error')
+                        ORDER BY created_at DESC
+                        LIMIT 2
+                        """,
+                        GITHUB_CONNECTOR_ID,
+                    )
+                    if len(open_rows) == 1:
+                        row = open_rows[0]
 
             if row is not None:
                 resolved_attempt_id = row["id"]
@@ -309,8 +331,23 @@ async def revoke_github_connection_db(
     account_key: str | None = None,
     reason: str | None = None,
 ) -> dict[str, Any]:
-    """Delete the stored GitHub PAT and revoke the DB connection record."""
-    delete_credentials()
+    """Delete the stored GitHub PAT (when unscoped or matching the saved login),
+    stop any live in-process GitHub MCP subprocess, and revoke the DB record."""
+    normalized_target = (account_key or "").strip().lower()
+    creds = load_credentials()
+    should_delete_local = (
+        not normalized_target
+        or (creds is not None and (creds.login or "").strip().lower() == normalized_target)
+    )
+    if should_delete_local:
+        delete_credentials()
+        try:
+            from core.tools.mcp_runtime import MCPRuntime
+
+            await MCPRuntime.instance().disconnect_server("github")
+        except Exception:
+            pass
+
     revoked_payload: dict[str, Any] = {}
     if pool is not None:
         async with pool.acquire() as conn:
@@ -323,6 +360,7 @@ async def revoke_github_connection_db(
             revoked_payload = _coerce_json(raw) or {}
     return {
         "revoked": True,
+        "local_credentials_deleted": should_delete_local,
         "connector_id": GITHUB_CONNECTOR_ID,
         "account_key": account_key,
         **revoked_payload,

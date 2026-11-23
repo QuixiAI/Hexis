@@ -161,3 +161,136 @@ async def test_github_issues_connector_resumable_flow_never_stores_secret_in_db(
                 "DELETE FROM integration_connections WHERE connector_id = $1 AND account_key = 'octocat'",
                 GITHUB_CONNECTOR_ID,
             )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_github_connector_sanitization_session_isolation_and_account_replacement(
+    db_pool, monkeypatch, tmp_path
+) -> None:
+    migration_sql = Path("db/migrations/0267_github_issues_connector.sql").read_text(
+        encoding="utf-8"
+    )
+    async with db_pool.acquire() as conn:
+        await conn.execute(migration_sql)
+
+    monkeypatch.setenv("HEXIS_AUTH_DIR", str(tmp_path))
+    alice_token = "github_pat_alice_secret_1111111111"
+    bob_token = "github_pat_bob_secret_2222222222"
+
+    async def fake_verify_pat(token: str) -> tuple[str | None, str | None]:
+        if token == alice_token:
+            return "alice", None
+        if token == bob_token:
+            return "bob", None
+        return None, "invalid token"
+
+    monkeypatch.setattr("core.auth.github_pat.verify_pat", fake_verify_pat)
+
+    registry = create_default_registry(db_pool)
+    ctx_a = ToolExecutionContext(
+        tool_context=ToolContext.CHAT,
+        call_id="gh-iso-a",
+        session_id="gh-session-a",
+        registry=registry,
+    )
+    ctx_b = ToolExecutionContext(
+        tool_context=ToolContext.CHAT,
+        call_id="gh-iso-b",
+        session_id="gh-session-b",
+        registry=registry,
+    )
+
+    try:
+        # Session A starts with string "false" for authorized and an accidental token in body/labels.
+        res_a = await registry.execute(
+            "start_github_setup",
+            {
+                "pending_action": {
+                    "action": "create_issue",
+                    "repo": "QuixiAI/Alpha",
+                    "body": f"Oops pasted {alice_token} here",
+                    "labels": ["bug", f"ghp_secretlabel123456"],
+                    "authorized": "false",
+                }
+            },
+            ctx_a,
+        )
+        assert res_a.success
+        assert res_a.output["pending_action"]["authorized"] is False
+        assert alice_token not in res_a.output["pending_action"]["body"]
+        assert "[REDACTED_TOKEN]" in res_a.output["pending_action"]["body"]
+        assert "ghp_secretlabel123456" not in json.dumps(res_a.output["pending_action"])
+
+        # Session B starts a separate draft.
+        res_b = await registry.execute(
+            "start_github_setup",
+            {
+                "pending_action": {
+                    "action": "comment_issue",
+                    "repo": "QuixiAI/Beta",
+                    "authorized": True,
+                }
+            },
+            ctx_b,
+        )
+        assert res_b.success
+        assert res_b.output["pending_action"]["authorized"] is True
+
+        # Session A's status returns A's draft (not B's!).
+        status_a = await registry.execute("github_setup_status", {}, ctx_a)
+        assert status_a.success
+        assert status_a.output["pending_action"]["repo"] == "QuixiAI/Alpha"
+
+        # Connecting from Session A without attempt_id selects A's draft, not B's.
+        conn_alice = await complete_github_connection_db(
+            db_pool,
+            token=alice_token,
+            source_channel="chat",
+            source_session_id="gh-session-a",
+        )
+        assert conn_alice["login"] == "alice"
+        assert conn_alice["pending_action"]["repo"] == "QuixiAI/Alpha"
+
+        # Connecting Bob replaces the shared PAT slot and displaces Alice's DB row atomically.
+        conn_bob = await complete_github_connection_db(
+            db_pool,
+            token=bob_token,
+            source_channel="web",
+            source_session_id="web-connections",
+        )
+        assert conn_bob["login"] == "bob"
+
+        async with db_pool.acquire() as conn:
+            alice_row = await conn.fetchrow(
+                "SELECT status, credential_ref FROM integration_connections WHERE connector_id = $1 AND account_key = 'alice'",
+                GITHUB_CONNECTOR_ID,
+            )
+            bob_row = await conn.fetchrow(
+                "SELECT status, credential_ref FROM integration_connections WHERE connector_id = $1 AND account_key = 'bob'",
+                GITHUB_CONNECTOR_ID,
+            )
+        assert alice_row["status"] == "revoked"
+        assert alice_row["credential_ref"] is None
+        assert bob_row["status"] == "connected"
+        assert bob_row["credential_ref"] == "token.github_pat"
+
+        # Stale disconnect for Alice must NOT delete Bob's local PAT.
+        rev_alice = await revoke_github_connection_db(db_pool, account_key="alice")
+        assert rev_alice["local_credentials_deleted"] is False
+        stored = load_credentials()
+        assert stored is not None and stored.login == "bob" and stored.token == bob_token
+
+        # Disconnecting Bob deletes Bob's local PAT.
+        rev_bob = await revoke_github_connection_db(db_pool, account_key="bob")
+        assert rev_bob["local_credentials_deleted"] is True
+        assert load_credentials() is None
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM connection_attempts WHERE connector_id = $1 AND source_session_id IN ('gh-session-a', 'gh-session-b', 'web-connections')",
+                GITHUB_CONNECTOR_ID,
+            )
+            await conn.execute(
+                "DELETE FROM integration_connections WHERE connector_id = $1 AND account_key IN ('alice', 'bob')",
+                GITHUB_CONNECTOR_ID,
+            )

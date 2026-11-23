@@ -1227,11 +1227,11 @@ function GitHubIssuesControls({
 
   const handleConnect = async () => {
     const cleaned = token.trim();
-    if (!cleaned || actionBusy) return;
+    if (!cleaned || selectedCapabilities.length === 0 || actionBusy) return;
     setToken("");
     await onAction("github_issues:connect", "connect_github_pat", {
       token: cleaned,
-      capabilities: selectedCapabilities.length > 0 ? selectedCapabilities : defaultCapabilities,
+      capabilities: selectedCapabilities,
       ...(pendingAttempt ? { attempt_id: pendingAttempt.attempt_id } : {}),
     });
     setShowReplaceForm(false);
@@ -1382,7 +1382,7 @@ function GitHubIssuesControls({
           <div className="flex flex-wrap items-center gap-2">
             <Button
               type="button"
-              disabled={Boolean(actionBusy) || token.trim().length === 0}
+              disabled={Boolean(actionBusy) || token.trim().length === 0 || selectedCapabilities.length === 0}
               onClick={() => void handleConnect()}
               className="px-3 py-2 text-xs"
             >

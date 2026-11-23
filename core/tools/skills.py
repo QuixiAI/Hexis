@@ -218,6 +218,9 @@ class UseSkillHandler(ToolHandler):
                 continue
             missing_env.append(var)
         if missing_env:
+            # If this server was previously running with a credential that has
+            # since been revoked/removed, tear down the stale subprocess now.
+            await MCPRuntime.instance().disconnect_server(binding.server)
             setup_payload: dict[str, Any] = {
                 "status": "needs_setup",
                 "missing": [
@@ -262,12 +265,14 @@ class UseSkillHandler(ToolHandler):
                 env=resolved_env,
             )
         else:
+            import dataclasses
+
             config = await context.registry.get_config()
-            server_config = next(
+            configured = next(
                 (c for c in (config.mcp_servers or []) if c.name == binding.server and c.enabled),
                 None,
             )
-            if server_config is None:
+            if configured is None:
                 return {
                     "status": "unavailable",
                     "next_step": (
@@ -275,6 +280,10 @@ class UseSkillHandler(ToolHandler):
                         "(mcp_servers), or add a command to the skill manifest."
                     ),
                 }
+            server_config = dataclasses.replace(
+                configured,
+                env={**configured.env, **resolved_env},
+            )
 
         runtime = MCPRuntime.instance()
         result = await runtime.ensure_connected(server_config)
