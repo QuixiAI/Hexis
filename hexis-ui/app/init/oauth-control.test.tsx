@@ -10,6 +10,12 @@ function jsonResponse(payload: unknown, status = 200): Response {
   });
 }
 
+async function findEnabledButton(name: string): Promise<HTMLButtonElement> {
+  const button = (await screen.findByRole("button", { name })) as HTMLButtonElement;
+  await waitFor(() => expect(button).toBeEnabled());
+  return button;
+}
+
 describe("OAuthControl", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -39,7 +45,7 @@ describe("OAuthControl", () => {
     vi.stubGlobal("open", opened);
 
     render(<OAuthControl provider="openai-codex" active={false} onUse={onUse} onLeave={() => undefined} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Log in with ChatGPT" }));
+    fireEvent.click(await findEnabledButton("Log in with ChatGPT"));
     expect(await screen.findByText("ABCD-1234")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Copy code and open OpenAI" }));
     expect(opened).toHaveBeenCalledWith("https://auth.openai.com/codex/device", "_blank", "noopener,noreferrer");
@@ -49,19 +55,24 @@ describe("OAuthControl", () => {
 
   it("completes a browser sign-in from a pasted redirect URL", async () => {
     const onUse = vi.fn();
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse({ provider: "google-gemini-cli", configured: false }))
-      .mockResolvedValueOnce(jsonResponse({
-        session_id: "s2", provider: "google-gemini-cli", flow: "authorization_code", status: "awaiting_code",
-        expires_in_seconds: 600, authorization_url: "https://example.test/authorize", callback_active: false,
-      }))
-      .mockResolvedValueOnce(jsonResponse({
-        session_id: "s2", provider: "google-gemini-cli", flow: "authorization_code", status: "complete",
-        expires_in_seconds: 590, credential: { provider: "google-gemini-cli", configured: true, email: "person@example.test" },
-      }));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/auth/status")) return jsonResponse({ provider: "google-gemini-cli", configured: false });
+      if (url.endsWith("/auth/start"))
+        return jsonResponse({
+          session_id: "s2", provider: "google-gemini-cli", flow: "authorization_code", status: "awaiting_code",
+          expires_in_seconds: 600, authorization_url: "https://example.test/authorize", callback_active: false,
+        });
+      if (url.endsWith("/auth/complete"))
+        return jsonResponse({
+          session_id: "s2", provider: "google-gemini-cli", flow: "authorization_code", status: "complete",
+          expires_in_seconds: 590, credential: { provider: "google-gemini-cli", configured: true, email: "person@example.test" },
+        });
+      throw new Error(`unexpected ${url}`);
+    });
 
     render(<OAuthControl provider="google-gemini-cli" active={false} onUse={onUse} onLeave={() => undefined} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Log in with Google (Gemini CLI)" }));
+    fireEvent.click(await findEnabledButton("Log in with Google (Gemini CLI)"));
     const link = await screen.findByRole("link", { name: "Continue to Google" });
     expect(link).toHaveAttribute("href", "https://example.test/authorize");
     fireEvent.change(screen.getByLabelText("Authorization code or redirect URL"), { target: { value: "code#state" } });
@@ -76,7 +87,7 @@ describe("OAuthControl", () => {
       jsonResponse({ provider: "xai-oauth", configured: true, expires_in_seconds: 3600 }),
     );
     const { rerender } = render(<OAuthControl provider="xai-oauth" active={false} onUse={onUse} onLeave={onLeave} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Use your xAI login" }));
+    fireEvent.click(await findEnabledButton("Use your xAI login"));
     expect(onUse).toHaveBeenCalledOnce();
     rerender(<OAuthControl provider="xai-oauth" active onUse={onUse} onLeave={onLeave} />);
     expect(await screen.findByText("Logged in with your xAI account")).toBeVisible();
@@ -85,12 +96,16 @@ describe("OAuthControl", () => {
   });
 
   it("surfaces an actionable provider error in place", async () => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse({ provider: "chutes", configured: false }))
-      .mockResolvedValueOnce(jsonResponse({ detail: "Enter the OAuth client ID from your Chutes developer settings." }, 400));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/auth/status")) return jsonResponse({ provider: "chutes", configured: false });
+      if (url.endsWith("/auth/start"))
+        return jsonResponse({ detail: "Enter the OAuth client ID from your Chutes developer settings." }, 400);
+      throw new Error(`unexpected ${url}`);
+    });
 
     render(<OAuthControl provider="chutes" active={false} onUse={() => undefined} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Log in with Chutes" }));
+    fireEvent.click(await findEnabledButton("Log in with Chutes"));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Enter the OAuth client ID from your Chutes developer settings.",
     );
@@ -115,7 +130,7 @@ describe("SetupTokenControl", () => {
       throw new Error(`unexpected ${url}`);
     });
     render(<SetupTokenControl active={false} onUse={onUse} onLeave={() => undefined} />);
-    fireEvent.click(await screen.findByRole("button", { name: "Use a Claude subscription" }));
+    fireEvent.click(await findEnabledButton("Use a Claude subscription"));
     fireEvent.change(screen.getByLabelText("Claude Code setup token"), {
       target: { value: "sk-ant-oat01-" + "x".repeat(80) },
     });
