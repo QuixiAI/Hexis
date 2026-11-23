@@ -173,6 +173,7 @@ describe("ChatPage attachments", () => {
 
     await waitFor(() => {
       expect(screen.getByText(/pasted-image-.*\.png/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
