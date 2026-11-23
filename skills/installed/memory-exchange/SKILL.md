@@ -6,7 +6,7 @@ requires:
   tools: [export_memories, import_dry_run, import_memories, import_review, protected_replacement_list, protected_replacement_inspect, protected_replacement_review, protected_replacement_audit_list, protected_reversion_list, protected_replacement_revert]
 contexts: [heartbeat, chat]
 aliases: [export, import, transfer, migrate, hmx, move]
-bound_tools: [export_memories, import_dry_run, import_memories, import_review, import_accept, import_reject, import_modify, import_quote, promote_to_staged, demote_to_analysis, protected_replacement_list, protected_replacement_inspect, protected_replacement_review, protected_replacement_audit_list, protected_reversion_list, protected_replacement_revert]
+bound_tools: [export_memories, import_dry_run, import_memories, import_review, import_accept, import_reject, import_modify, import_quote, promote_to_staged, demote_to_analysis, hmx_interview_status, record_hmx_interview_answer, protected_replacement_list, protected_replacement_inspect, protected_replacement_review, protected_replacement_audit_list, protected_reversion_list, protected_replacement_revert]
 ---
 
 # Hexis Memory Exchange

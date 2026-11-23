@@ -1807,6 +1807,19 @@ def build_parser() -> argparse.ArgumentParser:
     review_demote.set_defaults(func="hmx_review")
     hmx_review.set_defaults(func="hmx_review")
 
+    hmx_interview = sub.add_parser(
+        "interview",
+        parents=[_db],
+        help="Resume or inspect pending HMX onboarding interviews",
+    )
+    hmx_interview.add_argument(
+        "--export-id",
+        default=None,
+        help="Specific HMX export_id to inspect or resume",
+    )
+    hmx_interview.add_argument("--json", action="store_true", help="Print JSON")
+    hmx_interview.set_defaults(func="hmx_interview")
+
     # -- Goals command (defaults to 'list') --
     goals = sub.add_parser("goals", parents=[_db], help="Manage agent goals")
     goals_sub = goals.add_subparsers(dest="goals_command")
@@ -7608,13 +7621,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
             )
         )
 
-    if func in {"hmx_export", "hmx_import", "hmx_review"}:
-        from apps.cli_exchange import run_export, run_import, run_review
+    if func in {"hmx_export", "hmx_import", "hmx_review", "hmx_interview"}:
+        from apps.cli_exchange import run_export, run_import, run_interview, run_review
 
         handler = {
             "hmx_export": run_export,
             "hmx_import": run_import,
             "hmx_review": run_review,
+            "hmx_interview": run_interview,
         }[func]
         return asyncio.run(handler(_get_dsn(args), args))
 

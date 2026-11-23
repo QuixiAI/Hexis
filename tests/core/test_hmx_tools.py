@@ -35,6 +35,8 @@ _TOOL_NAMES = {
     "import_quote",
     "promote_to_staged",
     "demote_to_analysis",
+    "hmx_interview_status",
+    "record_hmx_interview_answer",
     "protected_replacement_list",
     "protected_replacement_inspect",
     "protected_replacement_review",
@@ -111,6 +113,8 @@ async def test_tool_specs_are_complete_and_conservative():
     for name in _TOOL_NAMES - {
         "import_dry_run",
         "import_review",
+        "hmx_interview_status",
+        "record_hmx_interview_answer",
         "protected_replacement_inspect",
         "protected_replacement_list",
         "protected_replacement_audit_list",
@@ -121,6 +125,9 @@ async def test_tool_specs_are_complete_and_conservative():
         assert handlers[name].spec.requires_approval
         assert not handlers[name].spec.is_read_only
         assert not handlers[name].spec.supports_parallel
+    assert handlers["hmx_interview_status"].spec.is_read_only
+    assert not handlers["record_hmx_interview_answer"].spec.is_read_only
+    assert not handlers["record_hmx_interview_answer"].spec.requires_approval
     assert not handlers["protected_replacement_review"].spec.requires_approval
     assert not handlers["protected_replacement_revert"].spec.requires_approval
     assert not handlers["protected_replacement_review"].spec.is_read_only
@@ -152,7 +159,11 @@ async def test_tool_specs_are_complete_and_conservative():
             "override_evidence_ref",
         } & set(properties)
     assert all(
-        handler.spec.allowed_contexts == {ToolContext.CHAT, ToolContext.HEARTBEAT}
+        handler.spec.allowed_contexts == (
+            {ToolContext.CHAT}
+            if handler.spec.name == "record_hmx_interview_answer"
+            else {ToolContext.CHAT, ToolContext.HEARTBEAT}
+        )
         for handler in handlers.values()
     )
     for name in ("import_reject", "import_modify", "import_quote"):

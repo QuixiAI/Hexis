@@ -233,3 +233,124 @@ async def test_already_answered_questions_are_not_re_asked():
 
     select_mock.assert_not_called()  # 'name' (choice) already answered
     assert outcome.answered == 1  # only 'extra' asked
+
+
+async def test_helpers_resolve_choice_labels_summarize_bindings_and_format_chat_prompt():
+    from core.hmx_interview import (
+        format_pending_interviews_prompt,
+        resolve_choice_value,
+        summarize_binding_effect,
+    )
+
+    q = {
+        "id": "cadence",
+        "type": "choice",
+        "prompt": "How often should I check in?",
+        "options": [
+            {"label": "Daily morning", "value": "daily"},
+            {"label": "Weekly Friday", "value": "weekly"},
+        ],
+        "binds": {
+            "action": "set_config",
+            "params_template": {"key": "preferences.cadence", "value": "{{answer}}"},
+        },
+        "required": True,
+    }
+    assert resolve_choice_value(q, "Daily morning") == "daily"
+    assert resolve_choice_value(q, "weekly") == "weekly"
+    assert "preferences.cadence" in summarize_binding_effect(q)
+
+    prompt = format_pending_interviews_prompt(
+        [{"export_id": "exp_abc", "remaining_questions": [q]}]
+    )
+    assert "Pending HMX Onboarding Interview" in prompt
+    assert "ask_user" in prompt
+    assert "record_hmx_interview_answer" in prompt
+    assert "exp_abc" in prompt
+    assert "preferences.cadence" in prompt
+
+
+async def test_hmx_interview_web_api_and_cli_resume(monkeypatch):
+    import httpx
+
+    import apps.hexis_api as hexis_api
+    from apps.hexis_cli import build_parser
+    from core.hmx_interview import run_pending_cli_interviews
+
+    # CLI parser accepts `hexis interview --export-id ... --json`.
+    parser = build_parser()
+    parsed = parser.parse_args(["interview", "--export-id", "exp_123", "--json"])
+    assert parsed.func == "hmx_interview"
+    assert parsed.export_id == "exp_123"
+    assert parsed.json is True
+
+    # Non-interactive resume returns pending interviews with actionable note.
+    pending_row = {
+        "export_id": "exp_123",
+        "status": "pending",
+        "questions": _document()["onboarding_interview"]["questions"],
+        "answers": [],
+        "remaining_questions": _document()["onboarding_interview"]["questions"],
+    }
+    conn = AsyncMock()
+    conn.fetchval.return_value = json.dumps([pending_row])
+    interviews, outcome = await run_pending_cli_interviews(conn, interactive=False)
+    assert len(interviews) == 1
+    assert outcome.ran is False
+    assert "hexis interview" in (outcome.note or "")
+
+    # Web API GET /api/hmx/interviews and POST /api/hmx/interviews/answer.
+    class FakeConn:
+        async def fetchval(self, query, *args):
+            if "get_pending_hmx_interviews" in query:
+                return json.dumps([pending_row])
+            if "get_hmx_interview_state" in query:
+                return json.dumps(pending_row)
+            if "record_hmx_interview_answer" in query:
+                assert args[0] == "exp_123"
+                assert args[1] == "name"
+                assert json.loads(args[2]) == "friend"
+                return json.dumps(
+                    {
+                        "success": True,
+                        "question_id": "name",
+                        "status": "answered",
+                        "binding_result": {"success": True},
+                        "interview_status": "pending",
+                    }
+                )
+            raise AssertionError(query)
+
+    class FakeAcquire:
+        async def __aenter__(self):
+            return FakeConn()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class FakePool:
+        def acquire(self):
+            return FakeAcquire()
+
+    monkeypatch.setattr(hexis_api, "_pool", FakePool())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=hexis_api.app),
+        base_url="http://testserver",
+    ) as client:
+        r_list = await client.get("/api/hmx/interviews")
+        assert r_list.status_code == 200
+        assert r_list.json()["count"] == 1
+        assert r_list.json()["interviews"][0]["remaining_questions"][0]["effect_summary"]
+
+        # Label "Friend" maps to value "friend".
+        r_ans = await client.post(
+            "/api/hmx/interviews/answer",
+            json={
+                "export_id": "exp_123",
+                "question_id": "name",
+                "status": "answered",
+                "answer": "Friend",
+            },
+        )
+        assert r_ans.status_code == 200
+        assert r_ans.json()["success"] is True

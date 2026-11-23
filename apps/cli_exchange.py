@@ -20,7 +20,11 @@ from core.hmx_files import (
     serialize_hmx_document,
     write_private_hmx_file,
 )
-from core.hmx_interview import InterviewOutcome, maybe_run_cli_interview
+from core.hmx_interview import (
+    InterviewOutcome,
+    maybe_run_cli_interview,
+    run_pending_cli_interviews,
+)
 
 from core.memory_exchange import (
     HmxAnalysisResult,
@@ -788,4 +792,33 @@ async def run_review(dsn: str, args: Any) -> int:
             for key in ("staging_id", "analysis_id", "local_ref"):
                 if result.get(key):
                     console.print(f"  [key]{key}:[/key] {result[key]}")
+    return 0
+
+
+async def run_interview(dsn: str, args: Any) -> int:
+    """Inspect or resume pending HMX onboarding interviews (#97)."""
+    conn = await _connect(dsn, args.wait_seconds)
+    try:
+        interactive = not bool(getattr(args, "json", False)) and sys.stdin.isatty()
+        interviews, outcome = await run_pending_cli_interviews(
+            conn,
+            export_id=getattr(args, "export_id", None),
+            interactive=interactive,
+        )
+    finally:
+        await conn.close()
+
+    if getattr(args, "json", False):
+        sys.stdout.write(
+            json.dumps(
+                {"interviews": interviews, "outcome": asdict(outcome)},
+                indent=2,
+                sort_keys=True,
+                default=str,
+            )
+            + "\n"
+        )
+        return 0
+
+    _print_interview_outcome(outcome, as_json=False)
     return 0

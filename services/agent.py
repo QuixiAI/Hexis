@@ -1171,6 +1171,30 @@ async def run_agent(
     )
 
     # 4. Build system prompt
+    effective_allowed_tools = set(skill_selection.allowed_tool_names)
+    chat_prompt_addenda: list[str] = []
+    if mode == "chat":
+        lang_addendum = _reply_language_addendum(user_message)
+        if lang_addendum:
+            chat_prompt_addenda.extend(lang_addendum)
+        if not is_group and pool is not None:
+            try:
+                from core.hmx_interview import (
+                    format_pending_interviews_prompt,
+                    list_pending_interviews,
+                )
+
+                async with pool.acquire() as conn:
+                    pending_interviews = await list_pending_interviews(conn)
+                interview_block = format_pending_interviews_prompt(pending_interviews)
+                if interview_block:
+                    chat_prompt_addenda.append(interview_block)
+                    effective_allowed_tools.update(
+                        {"hmx_interview_status", "record_hmx_interview_answer"}
+                    )
+            except Exception:
+                logger.debug("Pending HMX interview lookup unavailable", exc_info=True)
+
     system_prompt = await build_system_prompt(
         mode,
         registry,
@@ -1183,8 +1207,8 @@ async def run_agent(
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
         skill_setup_steps=skill_selection.setup_steps,
-        allowed_tool_names=set(skill_selection.allowed_tool_names),
-        prompt_addenda=_reply_language_addendum(user_message) if mode == "chat" else None,
+        allowed_tool_names=effective_allowed_tools,
+        prompt_addenda=chat_prompt_addenda or None,
     )
 
     # 5. Build enriched user message: in chat, the person's words come first
@@ -1247,7 +1271,7 @@ async def run_agent(
             is_group=is_group,
             is_operator=is_operator,
             on_approval=on_approval,
-            allowed_tool_names=set(skill_selection.allowed_tool_names),
+            allowed_tool_names=effective_allowed_tools,
             active_skill_names=[sk.name for sk in skill_selection.skills],
             surface=surface,
             tool_surface_input_hash=hash_input_text(skill_query),
