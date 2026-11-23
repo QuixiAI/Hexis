@@ -180,17 +180,37 @@ async def sync_github_connection_db(
                     GITHUB_CONNECTOR_ID,
                 )
             else:
-                row = await conn.fetchrow(
-                    """
-                    SELECT id::text AS id, flow_state, requested_capabilities
-                    FROM connection_attempts
-                    WHERE connector_id = $1
-                      AND status IN ('pending_user', 'awaiting_input', 'error')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    GITHUB_CONNECTOR_ID,
-                )
+                # Prefer the attempt from this session: without the filter the
+                # latest attempt for the connector wins, so a second
+                # conversation can resume (or complete) another session's
+                # pending setup. Fall back to the latest attempt only when
+                # no session was recorded.
+                if source_session_id:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT id::text AS id, flow_state, requested_capabilities
+                        FROM connection_attempts
+                        WHERE connector_id = $1
+                          AND source_session_id = $2
+                          AND status IN ('pending_user', 'awaiting_input', 'error')
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        GITHUB_CONNECTOR_ID,
+                        source_session_id,
+                    )
+                else:
+                    row = await conn.fetchrow(
+                        """
+                        SELECT id::text AS id, flow_state, requested_capabilities
+                        FROM connection_attempts
+                        WHERE connector_id = $1
+                          AND status IN ('pending_user', 'awaiting_input', 'error')
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        GITHUB_CONNECTOR_ID,
+                    )
 
             if row is not None:
                 resolved_attempt_id = row["id"]
@@ -309,8 +329,25 @@ async def revoke_github_connection_db(
     account_key: str | None = None,
     reason: str | None = None,
 ) -> dict[str, Any]:
-    """Delete the stored GitHub PAT and revoke the DB connection record."""
-    delete_credentials()
+    """Delete the stored GitHub PAT and revoke the DB connection record.
+
+    The stored PAT is deleted only when the disconnect owns it: a
+    whole-connector logout (account_key is None, e.g. the CLI logout) or a
+    disconnect whose account_key matches the login the stored PAT was
+    verified against. Disconnecting some other account must not silently
+    delete a PAT that belongs to a different login; the DB revoke still
+    applies to the named account.
+    """
+    if account_key is None:
+        delete_credentials()
+    else:
+        creds = load_credentials()
+        if (
+            creds is not None
+            and creds.login
+            and creds.login.lower() == account_key.strip().lower()
+        ):
+            delete_credentials()
     revoked_payload: dict[str, Any] = {}
     if pool is not None:
         async with pool.acquire() as conn:

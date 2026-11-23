@@ -7,6 +7,7 @@ from __future__ import annotations
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,6 +16,7 @@ from core.tools.base import ToolContext, ToolExecutionContext
 from core.tools.config import MCPServerConfig, ToolsConfig
 from core.tools.mcp_runtime import MCPRuntime
 from core.tools.skills import UseSkillHandler
+from skills.base import MCPBinding
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -230,6 +232,66 @@ async def test_use_skill_resolves_stored_github_credential_instead_of_dead_endin
     assert "mcp_stub_echo" in result.output["bound_tools"]
 
     await MCPRuntime.instance().shutdown()
+
+
+async def test_commandless_mcp_branch_receives_resolved_env(monkeypatch):
+    """#164 quick win: the commandless branch must merge resolved_env into
+    the configured server's env, exactly as the command branch does —
+    otherwise a stored GitHub PAT never reaches a commandless server's
+    subprocess and activation fails (or silently runs unauthenticated)."""
+    monkeypatch.delenv("GITHUB_PERSONAL_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "core.auth.github_pat.resolve_github_token",
+        lambda: ("github_pat_fake123", "octocat"),
+    )
+    seen: list[MCPServerConfig] = []
+
+    class _CapturingRuntime:
+        async def ensure_connected(self, config: MCPServerConfig) -> dict:
+            seen.append(config)
+            return {"connected": True, "tools": [{"name": "echo"}]}
+
+        def register_into(self, registry, server, bound_tools):
+            return ["mcp_stub_echo"]
+
+    monkeypatch.setattr(
+        MCPRuntime, "instance", classmethod(lambda cls: _CapturingRuntime())
+    )
+    registry = MagicMock()
+    registry.get_config = AsyncMock(
+        return_value=ToolsConfig(
+            mcp_servers=[
+                MCPServerConfig(
+                    name="stub",
+                    command=sys.executable,
+                    args=[],
+                    env={"EXISTING": "keep"},
+                )
+            ]
+        )
+    )
+    context = ToolExecutionContext(
+        tool_context=ToolContext.CHAT, call_id="t-commandless", registry=registry
+    )
+    skill = SimpleNamespace(
+        name="stub-echo",
+        mcp_binding=MCPBinding(
+            server="stub",
+            command=None,
+            env_requires=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        ),
+        bound_tools=["mcp_stub_echo"],
+        requires_tools=[],
+    )
+
+    result = await UseSkillHandler()._activate_mcp(skill, context)
+
+    assert result["status"] == "activated"
+    assert len(seen) == 1
+    assert seen[0].env == {
+        "EXISTING": "keep",
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "github_pat_fake123",
+    }
 
 
 async def test_use_skill_github_needs_setup_points_to_setup_token_command(

@@ -855,6 +855,7 @@ CREATE TABLE IF NOT EXISTS connector_action_audit (
     arguments JSONB NOT NULL DEFAULT '{}'::jsonb,
     context JSONB NOT NULL DEFAULT '{}'::jsonb,
     external_receipt JSONB,
+    sensitivity TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

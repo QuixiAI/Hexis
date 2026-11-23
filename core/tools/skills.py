@@ -12,6 +12,7 @@ import json
 import re
 import tempfile
 import uuid
+from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -275,6 +276,16 @@ class UseSkillHandler(ToolHandler):
                         "(mcp_servers), or add a command to the skill manifest."
                     ),
                 }
+            # Merge the credentials resolved above (e.g. the stored GitHub
+            # PAT) into the configured server's env, exactly as the
+            # command branch does: without this the stored token never
+            # reaches a commandless server's subprocess. Resolved values
+            # win over configured ones for the vars this binding requires.
+            if resolved_env:
+                server_config = dataclass_replace(
+                    server_config,
+                    env={**server_config.env, **resolved_env},
+                )
 
         runtime = MCPRuntime.instance()
         result = await runtime.ensure_connected(server_config)

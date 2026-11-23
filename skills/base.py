@@ -295,8 +295,9 @@ class SkillSpec:
                         "GitHub needs a connected account before this can search, create, "
                         "or comment on issues — reading a public repo is public, but acting "
                         "on it as you is not. Connect GitHub Issues in Connections → GitHub Issues "
-                        "(or run `hexis auth github setup-token` in a terminal), never paste a "
-                        "token into chat."
+                        "(or run `hexis auth github setup-token` in a terminal) to supply the "
+                        "GITHUB_PERSONAL_ACCESS_TOKEN credential from Hexis's own stored "
+                        "connection, never paste a token into chat."
                     ),
                 )
             return (

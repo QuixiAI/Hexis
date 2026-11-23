@@ -838,9 +838,9 @@ function GmailControls({
 
   const capabilities =
     accessTier === "manage"
-      ? ["read", "search", "send", "reply", "label", "spam_triage", "delete"]
+      ? ["read", "search", "draft", "send", "reply", "label", "spam_triage", "delete"]
       : accessTier === "write"
-        ? ["read", "search", "send", "reply"]
+        ? ["read", "search", "draft", "send", "reply"]
         : ["read", "search"];
   const pendingAttempt =
     summary.activeAttempts[0] ||
@@ -1231,7 +1231,12 @@ function GitHubIssuesControls({
     setToken("");
     await onAction("github_issues:connect", "connect_github_pat", {
       token: cleaned,
-      capabilities: selectedCapabilities.length > 0 ? selectedCapabilities : defaultCapabilities,
+      // Send the selection as-is: an explicitly cleared selection must not
+      // be silently replaced with the defaults here. (The server still
+      // treats an empty list as "use defaults" — see the note below — so
+      // Connect is disabled while nothing is selected instead of letting
+      // that silent restore happen.)
+      capabilities: selectedCapabilities,
       ...(pendingAttempt ? { attempt_id: pendingAttempt.attempt_id } : {}),
     });
     setShowReplaceForm(false);
@@ -1382,12 +1387,23 @@ function GitHubIssuesControls({
           <div className="flex flex-wrap items-center gap-2">
             <Button
               type="button"
-              disabled={Boolean(actionBusy) || token.trim().length === 0}
+              disabled={
+                Boolean(actionBusy) ||
+                token.trim().length === 0 ||
+                selectedCapabilities.length === 0
+              }
               onClick={() => void handleConnect()}
               className="px-3 py-2 text-xs"
             >
               {connectBusy ? "Verifying..." : "Connect GitHub Issues"}
             </Button>
+            {selectedCapabilities.length === 0 ? (
+              <p className="text-[11px] text-[var(--ink-soft)]">
+                Select at least one capability to connect. Clearing every
+                capability does not connect with none — the server would
+                silently reconnect with the defaults instead.
+              </p>
+            ) : null}
             {isConnected ? (
               <Button
                 type="button"

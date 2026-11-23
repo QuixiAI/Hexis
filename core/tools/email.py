@@ -143,7 +143,8 @@ class _GmailCredentials:
     _credentials_resolver: Callable[[], dict[str, Any] | None] | None
 
     async def readiness(self, context: ToolExecutionContext | None = None) -> str | None:
-        if self._credentials_resolver and self._credentials_resolver():
+        credentials, _auth_error = await _resolve_gmail_credentials(self._credentials_resolver)
+        if credentials:
             return None
         return "Gmail is not connected. Connect it on the Connections page."
 

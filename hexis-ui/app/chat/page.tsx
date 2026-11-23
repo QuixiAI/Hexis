@@ -3569,6 +3569,11 @@ function ConnectorSetupCard({
     !needsMemoryChoice &&
     !needsAutonomyChoice;
   const canCompleteOAuth = ["gmail", "spotify"].includes(ui.connector_id) && !connected && Boolean(ui.authorization_url || ui.attempt_id);
+  // Only gmail/spotify poll for completion (see the effect below). Other
+  // flows — e.g. the GitHub PAT flow, whose authorization_url is just the
+  // token-create page — never complete on their own, so the panel must not
+  // promise that it checks automatically.
+  const setupCompletesAutomatically = ["gmail", "spotify"].includes(ui.connector_id);
   const requiresClientSecret = canStartOAuth && !ui.client_secret_saved;
   const credentialModes = ui.credential_step?.modes || [];
   const hostedAvailable =
@@ -3951,8 +3956,8 @@ function ConnectorSetupCard({
                   ...(capabilities.length > 0 ? { capabilities } : {}),
                   ...(ui.attempt_id ? { attempt_id: ui.attempt_id } : {}),
                 });
-                if (result.error) {
-                  setError(result.error);
+                if (result.error || result.detail || result.success === false) {
+                  setError(integrationActionError(result, 400));
                 } else {
                   setNotice("GitHub Issues connected. Tell me to continue when ready.");
                 }
@@ -4174,7 +4179,9 @@ function ConnectorSetupCard({
             {ui.authorization_url}
           </p>
           <p className="mt-2 text-xs leading-5 text-[var(--ink-soft)]">
-            After you approve access, {connectorName} returns to Hexis and this panel checks for completion automatically.
+            {setupCompletesAutomatically
+              ? `After you approve access, ${connectorName} returns to Hexis and this panel checks for completion automatically.`
+              : "This panel does not check for completion automatically — finish the step above, then use Refresh status to re-check."}
           </p>
         </div>
       ) : null}

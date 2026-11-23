@@ -105,6 +105,30 @@ _GITHUB_PENDING_ACTION_ALLOWED_KEYS = {
     "notes",
 }
 
+# GitHub token shapes that must never be persisted in a pending-action draft.
+# Mirrors the known-key shapes in core/agent_loop.py's exception redactor
+# (kept local: importing the agent loop into the tool layer would risk a
+# cycle, and this is the persistence-time counterpart for draft fields).
+_GITHUB_CREDENTIAL_RE = re.compile(
+    r"(?:gh[oprsu]_|github_pat_)[A-Za-z0-9_]{8,}"
+)
+
+
+def _redact_credential_like_text(text: str) -> str:
+    """Replace credential-looking substrings so a pasted token can never be
+    persisted verbatim in a draft field."""
+    return _GITHUB_CREDENTIAL_RE.sub("[redacted]", text)
+
+
+def _parse_bool(value: Any) -> bool:
+    """Parse a bool without bool("false") == True: real bools pass through,
+    "true"/"false" strings parse case-insensitively, anything else is False."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return False
+
 _GITHUB_SETUP_STEPS = [
     "Open https://github.com/settings/personal-access-tokens/new and create a fine-grained personal access token scoped to Issues (Read and write) on the target repository or repositories.",
     "Connect it on the Connections page in the web dashboard or run `hexis auth github setup-token` in a terminal.",
@@ -129,7 +153,11 @@ def _sanitize_github_pending_action(value: Any) -> dict[str, Any] | None:
         raw = value[key]
         if key == "labels":
             if isinstance(raw, list):
-                cleaned = [str(item).strip() for item in raw if str(item or "").strip()]
+                cleaned = [
+                    _redact_credential_like_text(str(item).strip())
+                    for item in raw
+                    if str(item or "").strip()
+                ]
                 if cleaned:
                     sanitized[key] = cleaned
         elif key == "issue_number":
@@ -138,9 +166,9 @@ def _sanitize_github_pending_action(value: Any) -> dict[str, Any] | None:
             except (TypeError, ValueError):
                 continue
         elif key == "authorized":
-            sanitized[key] = bool(raw)
+            sanitized[key] = _parse_bool(raw)
         else:
-            text = str(raw).strip()
+            text = _redact_credential_like_text(str(raw).strip())
             if text:
                 sanitized[key] = text
     return sanitized or None
@@ -2642,17 +2670,37 @@ class GithubSetupStatusHandler(ToolHandler):
         pending_action: dict[str, Any] | None = None
         async with context.registry.pool.acquire() as conn:
             raw = await conn.fetchval("SELECT integration_status($1)", GITHUB_CONNECTOR_ID)
-            attempt_row = await conn.fetchrow(
-                """
-                SELECT id::text AS id, status, flow_state
-                FROM connection_attempts
-                WHERE connector_id = $1
-                  AND status IN ('pending_user', 'awaiting_input', 'error', 'complete')
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                GITHUB_CONNECTOR_ID,
-            )
+            # Prefer this session's attempt: without the filter the latest
+            # attempt for the connector wins, so one conversation can see
+            # (and resume) another session's pending action. Fall back to
+            # the latest attempt only when no session id is available.
+            session_id = context.session_id
+            if session_id:
+                attempt_row = await conn.fetchrow(
+                    """
+                    SELECT id::text AS id, status, flow_state
+                    FROM connection_attempts
+                    WHERE connector_id = $1
+                      AND source_session_id = $2
+                      AND status IN ('pending_user', 'awaiting_input', 'error', 'complete')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    GITHUB_CONNECTOR_ID,
+                    session_id,
+                )
+            else:
+                attempt_row = await conn.fetchrow(
+                    """
+                    SELECT id::text AS id, status, flow_state
+                    FROM connection_attempts
+                    WHERE connector_id = $1
+                      AND status IN ('pending_user', 'awaiting_input', 'error', 'complete')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    GITHUB_CONNECTOR_ID,
+                )
             if attempt_row is not None:
                 flow_state = _json(attempt_row["flow_state"])
                 if isinstance(flow_state, dict):
