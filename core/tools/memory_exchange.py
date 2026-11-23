@@ -727,6 +727,11 @@ class HmxInterviewStatusHandler(ToolHandler):
     async def execute(
         self, arguments: dict[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
+        if context.is_group or (context.tool_context == ToolContext.CHAT and not context.is_operator):
+            return ToolResult.error_result(
+                "HMX onboarding interviews are private to the primary operator in direct chat.",
+                ToolErrorType.PERMISSION_DENIED,
+            )
         pool = _pool(context)
         if not pool:
             return _missing_pool()
@@ -748,7 +753,14 @@ class HmxInterviewStatusHandler(ToolHandler):
                 answered_ids = {
                     a.get("question_id")
                     for a in (iv.get("answers") or [])
-                    if isinstance(a, dict) and a.get("status") in ("answered", "skipped")
+                    if isinstance(a, dict)
+                    and (
+                        a.get("status") == "skipped"
+                        or (
+                            a.get("status") == "answered"
+                            and (a.get("binding_result") or {}).get("success", True) is not False
+                        )
+                    )
                 }
                 remaining = []
                 for q in iv.get("questions") or []:
@@ -811,6 +823,11 @@ class RecordHmxInterviewAnswerHandler(ToolHandler):
     async def execute(
         self, arguments: dict[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
+        if context.is_group or (context.tool_context == ToolContext.CHAT and not context.is_operator):
+            return ToolResult.error_result(
+                "HMX onboarding interviews can only be answered by the primary operator in direct chat.",
+                ToolErrorType.PERMISSION_DENIED,
+            )
         pool = _pool(context)
         if not pool:
             return _missing_pool()

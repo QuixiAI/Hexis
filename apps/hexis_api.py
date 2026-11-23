@@ -1466,7 +1466,14 @@ async def hmx_interviews_endpoint(export_id: str | None = None):
         answered_ids = {
             a.get("question_id")
             for a in (iv.get("answers") or [])
-            if isinstance(a, dict) and a.get("status") in ("answered", "skipped")
+            if isinstance(a, dict)
+            and (
+                a.get("status") == "skipped"
+                or (
+                    a.get("status") == "answered"
+                    and (a.get("binding_result") or {}).get("success", True) is not False
+                )
+            )
         }
         remaining = [
             {**q, "effect_summary": summarize_binding_effect(q)}

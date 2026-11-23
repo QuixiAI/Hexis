@@ -260,6 +260,29 @@ async def test_helpers_resolve_choice_labels_summarize_bindings_and_format_chat_
     assert resolve_choice_value(q, "weekly") == "weekly"
     assert "preferences.cadence" in summarize_binding_effect(q)
 
+    # Booleans and integers stay distinct during exact value matching.
+    mixed_q = {
+        "id": "mixed",
+        "type": "choice",
+        "prompt": "Choose",
+        "options": [{"label": "Enabled", "value": True}, {"label": "One", "value": 1}],
+        "binds": {"action": "set_config", "params_template": {"key": "preferences.x", "value": "{{answer}}"}},
+    }
+    assert resolve_choice_value(mixed_q, 1) == 1 and type(resolve_choice_value(mixed_q, 1)) is int
+    assert resolve_choice_value(mixed_q, True) is True
+
+    # Explicit ingest kind takes precedence over url field in preview.
+    ingest_text_q = {
+        "id": "ing",
+        "type": "freeform",
+        "prompt": "Notes",
+        "binds": {
+            "action": "ingest",
+            "params_template": {"kind": "text", "url": "https://example.com", "content": "{{answer}}"},
+        },
+    }
+    assert "text ingestion" in summarize_binding_effect(ingest_text_q)
+
     prompt = format_pending_interviews_prompt(
         [{"export_id": "exp_abc", "remaining_questions": [q]}]
     )

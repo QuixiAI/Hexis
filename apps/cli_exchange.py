@@ -820,5 +820,32 @@ async def run_interview(dsn: str, args: Any) -> int:
         )
         return 0
 
+    if not interactive and interviews:
+        from apps.cli_theme import console
+
+        for iv in interviews:
+            answered_ids = {
+                a.get("question_id")
+                for a in (iv.get("answers") or [])
+                if isinstance(a, dict)
+                and (
+                    a.get("status") == "skipped"
+                    or (
+                        a.get("status") == "answered"
+                        and (a.get("binding_result") or {}).get("success", True) is not False
+                    )
+                )
+            }
+            remaining = [
+                q.get("id")
+                for q in (iv.get("questions") or [])
+                if isinstance(q, dict) and q.get("id") not in answered_ids
+            ]
+            console.print(
+                f"  [key]{iv.get('export_id')}[/key]  status={iv.get('status')}  "
+                f"remaining={len(remaining)}"
+                + (f" ({', '.join(str(qid) for qid in remaining)})" if remaining else "")
+            )
+
     _print_interview_outcome(outcome, as_json=False)
     return 0

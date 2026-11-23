@@ -2631,7 +2631,8 @@ async def import_hmx(
 
         onboarding_interview = data.get("onboarding_interview")
         if (
-            isinstance(onboarding_interview, dict)
+            not reviewed
+            and isinstance(onboarding_interview, dict)
             and isinstance(onboarding_interview.get("questions"), list)
             and onboarding_interview.get("questions")
         ):

@@ -67,10 +67,17 @@ def summarize_binding_effect(question: dict[str, Any]) -> str:
     if action == "remember":
         return "saves a memory with hmx_interview provenance"
     if action == "ingest":
-        kind = str(params.get("kind") or "").strip()
-        if params.get("url") or kind == "url":
+        kind = str(params.get("kind") or "").strip().lower()
+        if not kind:
+            if params.get("url"):
+                kind = "url"
+            elif params.get("artifact_id") or (isinstance(params.get("payload"), dict) and params["payload"].get("artifact_id")):
+                kind = "artifact"
+            else:
+                kind = "text"
+        if kind == "url":
             return f"queues a URL ingestion job ({params.get('url') or 'user-supplied URL'})"
-        if params.get("artifact_id") or kind == "artifact":
+        if kind == "artifact":
             return "queues an artifact ingestion job"
         return "queues a text ingestion job"
     if action == "init_identity":
@@ -96,13 +103,20 @@ def summarize_binding_effect(question: dict[str, Any]) -> str:
     return f"runs binding action '{action}'"
 
 
+def _json_equal(a: Any, b: Any) -> bool:
+    """JSON-type-aware equality (keeps bool distinct from int in Python)."""
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return bool(a == b)
+
+
 def resolve_choice_value(question: dict[str, Any], raw_answer: Any) -> Any:
     """For choice questions, map a matching option label back to its declared value.
 
     When the agent uses ``ask_user`` with option labels as choices, the user's
     selected text is the label (e.g. ``"Daily morning digest"``) while the HMX
     binding template expects the option's ``value`` (e.g. ``"daily_morning"``).
-    Exact value matches pass through unchanged.
+    Exact value matches pass through unchanged (keeping booleans distinct from ints).
     """
     if not isinstance(question, dict) or question.get("type") != "choice":
         return raw_answer
@@ -110,7 +124,7 @@ def resolve_choice_value(question: dict[str, Any], raw_answer: Any) -> Any:
     if not isinstance(options, list) or not options:
         return raw_answer
     for opt in options:
-        if isinstance(opt, dict) and opt.get("value") == raw_answer:
+        if isinstance(opt, dict) and _json_equal(opt.get("value"), raw_answer):
             return opt.get("value")
     if isinstance(raw_answer, str):
         needle = raw_answer.strip().lower()
@@ -118,8 +132,9 @@ def resolve_choice_value(question: dict[str, Any], raw_answer: Any) -> Any:
             if not isinstance(opt, dict):
                 continue
             label = str(opt.get("label") or "").strip().lower()
-            val_str = str(opt.get("value") or "").strip().lower()
-            if needle == label or needle == val_str:
+            val = opt.get("value")
+            val_str = str(val).strip().lower() if isinstance(val, str) else ""
+            if needle == label or (val_str and needle == val_str):
                 return opt.get("value")
     return raw_answer
 
@@ -271,8 +286,20 @@ async def maybe_run_cli_interview(
     if state["status"] == "completed":
         return InterviewOutcome(ran=False, note="This import's onboarding interview was already completed.")
 
-    answered_ids = {a["question_id"] for a in state["answers"] if a["status"] in ("answered", "skipped")}
-    return await _run_interview_questions_cli(conn, export_id, interview["questions"], answered_ids)
+    persisted_questions = state.get("questions") if isinstance(state.get("questions"), list) else interview["questions"]
+    settled_ids = {
+        a["question_id"]
+        for a in (state.get("answers") or [])
+        if isinstance(a, dict)
+        and (
+            a.get("status") == "skipped"
+            or (
+                a.get("status") == "answered"
+                and (a.get("binding_result") or {}).get("success", True) is not False
+            )
+        )
+    }
+    return await _run_interview_questions_cli(conn, export_id, persisted_questions, settled_ids)
 
 
 async def run_pending_cli_interviews(
@@ -297,25 +324,38 @@ async def run_pending_cli_interviews(
     if not interviews:
         return [], InterviewOutcome(ran=False, note="No pending onboarding interviews.")
 
+    pending_only = [iv for iv in interviews if iv.get("status") != "completed"]
     if not interactive:
+        if not pending_only:
+            return interviews, InterviewOutcome(
+                ran=False,
+                completed=True,
+                note=f"Onboarding interview {interviews[0].get('export_id')} is already completed.",
+            )
         return interviews, InterviewOutcome(
             ran=False,
-            note=f"{len(interviews)} pending onboarding interview(s). Run `hexis interview` in a TTY or start a chat to answer.",
+            completed=False,
+            note=f"{len(pending_only)} pending onboarding interview(s). Run `hexis interview` in a TTY or start a chat to answer.",
         )
 
     total_answered = total_skipped = total_failed = 0
     ran_any = False
     all_completed = True
-    for iv in interviews:
-        if iv.get("status") == "completed":
-            continue
+    for iv in pending_only:
         questions = iv.get("questions") or []
-        answered_ids = {
+        settled_ids = {
             a["question_id"]
             for a in (iv.get("answers") or [])
-            if isinstance(a, dict) and a.get("status") in ("answered", "skipped")
+            if isinstance(a, dict)
+            and (
+                a.get("status") == "skipped"
+                or (
+                    a.get("status") == "answered"
+                    and (a.get("binding_result") or {}).get("success", True) is not False
+                )
+            )
         }
-        outcome = await _run_interview_questions_cli(conn, str(iv["export_id"]), questions, answered_ids)
+        outcome = await _run_interview_questions_cli(conn, str(iv["export_id"]), questions, settled_ids)
         ran_any = ran_any or outcome.ran
         all_completed = all_completed and outcome.completed
         total_answered += outcome.answered
@@ -323,7 +363,11 @@ async def run_pending_cli_interviews(
         total_failed += outcome.failed_bindings
 
     if not ran_any:
-        return interviews, InterviewOutcome(ran=False, note="All matching onboarding interviews are already completed.")
+        return interviews, InterviewOutcome(
+            ran=False,
+            completed=True,
+            note="All matching onboarding interviews are already completed.",
+        )
     return interviews, InterviewOutcome(
         ran=True,
         completed=all_completed,

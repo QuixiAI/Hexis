@@ -73,7 +73,13 @@ RETURNS JSONB AS $$
                         SELECT 1
                         FROM jsonb_array_elements(s.answers) a
                         WHERE a->>'question_id' = q->>'id'
-                          AND a->>'status' IN ('answered', 'skipped')
+                          AND (
+                              a->>'status' = 'skipped'
+                              OR (
+                                  a->>'status' = 'answered'
+                                  AND COALESCE((a->'binding_result'->>'success')::boolean, TRUE)
+                              )
+                          )
                     )
                 ), '[]'::jsonb),
                 'created_at', s.created_at,
@@ -143,6 +149,62 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- an HMX file is a portable, shareable artifact, so only safe user/persona/
 -- preference/plugin/skill/channel/integration keys may be set, and secret-named
 -- keys must hold an environment variable NAME (never a secret value).
+-- Recursively inspect structured config values so raw tokens cannot hide
+-- inside nested JSON objects or arrays.
+CREATE OR REPLACE FUNCTION _hmx_interview_check_nested_secrets(
+    p_key TEXT,
+    p_value JSONB
+) RETURNS TEXT AS $$
+DECLARE
+    val_text TEXT;
+    elem JSONB;
+    obj_key TEXT;
+    obj_val JSONB;
+    nested_err TEXT;
+BEGIN
+    IF p_value IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF jsonb_typeof(p_value) = 'string' THEN
+        val_text := p_value #>> '{}';
+        IF val_text ~ '(github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_\-]{12,}|xox[baprs]-[A-Za-z0-9\-]{10,}|xapp-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z\-_]{20,}|Bearer[[:space:]]+[A-Za-z0-9._\-]{10,})' THEN
+            RETURN format('refusing to store a credential-like value in config key %L', p_key);
+        END IF;
+        RETURN NULL;
+    ELSIF jsonb_typeof(p_value) = 'array' THEN
+        FOR elem IN SELECT value FROM jsonb_array_elements(p_value)
+        LOOP
+            nested_err := _hmx_interview_check_nested_secrets(p_key, elem);
+            IF nested_err IS NOT NULL THEN
+                RETURN nested_err;
+            END IF;
+        END LOOP;
+        RETURN NULL;
+    ELSIF jsonb_typeof(p_value) = 'object' THEN
+        FOR obj_key, obj_val IN SELECT key, value FROM jsonb_each(p_value)
+        LOOP
+            IF obj_key ~* '(token|secret|password|api_key|private_key|credential)' THEN
+                IF jsonb_typeof(obj_val) <> 'string'
+                   OR btrim(obj_val #>> '{}') !~ '^[A-Z_][A-Z0-9_]*$' THEN
+                    RETURN format(
+                        'secret field %L inside config key %L must be an environment variable name, never a secret value',
+                        obj_key,
+                        p_key
+                    );
+                END IF;
+            ELSE
+                nested_err := _hmx_interview_check_nested_secrets(p_key || '.' || obj_key, obj_val);
+                IF nested_err IS NOT NULL THEN
+                    RETURN nested_err;
+                END IF;
+            END IF;
+        END LOOP;
+        RETURN NULL;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 CREATE OR REPLACE FUNCTION _hmx_interview_validate_config_binding(
     p_key TEXT,
     p_value JSONB
@@ -150,6 +212,7 @@ CREATE OR REPLACE FUNCTION _hmx_interview_validate_config_binding(
 DECLARE
     key_clean TEXT := btrim(COALESCE(p_key, ''));
     val_text TEXT;
+    nested_err TEXT;
 BEGIN
     IF key_clean = '' THEN
         RETURN 'set_config binding requires a non-empty key';
@@ -189,10 +252,10 @@ BEGIN
                 key_clean
             );
         END IF;
-    ELSIF jsonb_typeof(p_value) = 'string' THEN
-        val_text := p_value #>> '{}';
-        IF val_text ~ '(github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9_]{10,}|sk-[A-Za-z0-9_\-]{12,}|xox[baprs]-[A-Za-z0-9\-]{10,}|xapp-[A-Za-z0-9\-]{10,}|AIza[0-9A-Za-z\-_]{20,}|Bearer[[:space:]]+[A-Za-z0-9._\-]{10,})' THEN
-            RETURN format('refusing to store a credential-like value in config key %L', key_clean);
+    ELSE
+        nested_err := _hmx_interview_check_nested_secrets(key_clean, p_value);
+        IF nested_err IS NOT NULL THEN
+            RETURN nested_err;
         END IF;
     END IF;
 
@@ -405,7 +468,7 @@ BEGIN
         IF id_purpose IS NOT NULL THEN agent_patch := agent_patch || jsonb_build_object('purpose', id_purpose); END IF;
         IF id_creator IS NOT NULL THEN agent_patch := agent_patch || jsonb_build_object('creator_name', id_creator); END IF;
 
-        SELECT init_stage INTO current_init_stage FROM heartbeat_state WHERE id = 1;
+        SELECT init_stage INTO current_init_stage FROM heartbeat_state WHERE id = 1 FOR UPDATE;
         IF (current_init_stage IS NULL OR current_init_stage <> 'complete') AND id_name IS NOT NULL THEN
             PERFORM init_identity(id_name, id_pronouns, id_voice, id_description, id_purpose, id_creator);
             PERFORM set_config('agent.name', to_jsonb(id_name));
@@ -749,6 +812,8 @@ DECLARE
     question JSONB;
     binding_action TEXT;
     binding_result JSONB;
+    prior_entry JSONB;
+    stored_answer JSONB;
     entry JSONB;
     updated_answers JSONB;
     has_required BOOLEAN;
@@ -782,12 +847,39 @@ BEGIN
         );
     END IF;
 
+    -- Idempotent retry guard: if this question already succeeded with the exact
+    -- same answer, return the recorded result without re-executing the binding.
+    SELECT a INTO prior_entry
+    FROM jsonb_array_elements(state.answers) a
+    WHERE a->>'question_id' = p_question_id
+    LIMIT 1;
+    IF p_status = 'answered'
+       AND prior_entry IS NOT NULL
+       AND prior_entry->>'status' = 'answered'
+       AND COALESCE((prior_entry->'binding_result'->>'success')::boolean, FALSE)
+       AND (prior_entry->'answer') IS NOT DISTINCT FROM p_answer THEN
+        RETURN jsonb_build_object(
+            'success', true,
+            'question_id', p_question_id,
+            'status', 'answered',
+            'binding_result', prior_entry->'binding_result',
+            'interview_status', state.status,
+            'idempotent_replay', true
+        );
+    END IF;
+
     binding_action := question->'binds'->>'action';
+    stored_answer := p_answer;
     IF p_status = 'answered' THEN
         binding_result := apply_hmx_interview_binding(
             binding_action, question->'binds'->'params_template',
             p_answer, p_export_id, p_question_id
         );
+        -- Never retain rejected secret/policy-violating values in hmx_interview_state.answers.
+        IF binding_action = 'set_config'
+           AND COALESCE(binding_result->>'error_type', '') = 'policy_violation' THEN
+            stored_answer := to_jsonb('[REDACTED]'::text);
+        END IF;
         IF COALESCE((binding_result->>'success')::boolean, FALSE) THEN
             -- Journal every applied answer via #93 change journal.
             IF to_regprocedure('record_change(text,text,jsonb)') IS NOT NULL THEN
@@ -835,12 +927,12 @@ BEGIN
     entry := jsonb_build_object(
         'question_id', p_question_id,
         'status', p_status,
-        'answer', p_answer,
+        'answer', stored_answer,
         'binding_result', binding_result,
         'answered_at', CURRENT_TIMESTAMP
     );
-    -- Idempotent-ish: replace any prior entry for this question rather than
-    -- accumulating duplicates if a caller retries.
+    -- Replace any prior entry for this question rather than accumulating
+    -- duplicates when a caller retries or corrects a failed binding.
     UPDATE hmx_interview_state
     SET answers = (
             SELECT COALESCE(jsonb_agg(a), '[]'::jsonb)
@@ -862,26 +954,42 @@ BEGIN
             WHERE COALESCE((q->>'required')::boolean, FALSE)
               AND NOT EXISTS (
                   SELECT 1 FROM jsonb_array_elements(updated_answers) a
-                  WHERE a->>'question_id' = q->>'id' AND a->>'status' = 'answered'
+                  WHERE a->>'question_id' = q->>'id'
+                    AND (
+                        (
+                            a->>'status' = 'answered'
+                            AND COALESCE((a->'binding_result'->>'success')::boolean, TRUE)
+                        )
+                        OR (
+                            COALESCE((q->>'skippable')::boolean, FALSE)
+                            AND a->>'status' = 'skipped'
+                        )
+                    )
               )
         ) INTO interview_done;
     ELSE
         -- When no questions are explicitly marked required, stay pending until
-        -- every question has been answered or skipped.
+        -- every question has either succeeded or been skipped.
         SELECT NOT EXISTS (
             SELECT 1 FROM jsonb_array_elements(state.questions) q
             WHERE NOT EXISTS (
                 SELECT 1 FROM jsonb_array_elements(updated_answers) a
                 WHERE a->>'question_id' = q->>'id'
-                  AND a->>'status' IN ('answered', 'skipped')
+                  AND (
+                      a->>'status' = 'skipped'
+                      OR (
+                          a->>'status' = 'answered'
+                          AND COALESCE((a->'binding_result'->>'success')::boolean, TRUE)
+                      )
+                  )
             )
         ) INTO interview_done;
     END IF;
 
-    IF interview_done THEN
-        UPDATE hmx_interview_state SET status = 'completed', updated_at = CURRENT_TIMESTAMP
-        WHERE export_id = p_export_id;
-    END IF;
+    UPDATE hmx_interview_state
+    SET status = CASE WHEN interview_done THEN 'completed' ELSE 'pending' END,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE export_id = p_export_id;
 
     RETURN jsonb_build_object(
         'success', true,

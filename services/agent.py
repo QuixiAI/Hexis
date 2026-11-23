@@ -1177,7 +1177,7 @@ async def run_agent(
         lang_addendum = _reply_language_addendum(user_message)
         if lang_addendum:
             chat_prompt_addenda.extend(lang_addendum)
-        if not is_group and pool is not None:
+        if not is_group and is_operator and pool is not None:
             try:
                 from core.hmx_interview import (
                     format_pending_interviews_prompt,

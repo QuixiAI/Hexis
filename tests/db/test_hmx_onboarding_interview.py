@@ -16,17 +16,6 @@ from tests.utils import get_test_identifier
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
 
-@pytest.fixture(scope="module", autouse=True)
-async def _apply_migration_0268(db_pool):
-    from pathlib import Path
-
-    sql = Path("db/migrations/0268_hmx_onboarding_interview_bindings.sql").read_text(
-        encoding="utf-8"
-    )
-    async with db_pool.acquire() as conn:
-        await conn.execute(sql)
-
-
 def _j(value):
     return json.loads(value) if isinstance(value, str) else value
 
@@ -276,21 +265,11 @@ async def test_answering_with_no_interview_started_is_a_clear_error(db_pool):
             await tr.rollback()
 
 
-async def _ensure_migration_0268(conn) -> None:
-    from pathlib import Path
-
-    sql = Path("db/migrations/0268_hmx_onboarding_interview_bindings.sql").read_text(
-        encoding="utf-8"
-    )
-    await conn.execute(sql)
-
-
 async def test_all_seven_bindings_journal_inbox_and_security_rails(db_pool):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
-            await _ensure_migration_0268(conn)
             marker = get_test_identifier("hmxall7")
             export_id = f"exp_{marker[:16]:0<16}"
             spec = {
@@ -542,30 +521,82 @@ async def test_all_seven_bindings_journal_inbox_and_security_rails(db_pool):
             ))
             assert res_disallowed["binding_result"]["success"] is False
             assert res_disallowed["binding_result"]["error_type"] == "policy_violation"
-            # Last question settled -> all-optional interview now completes!
-            assert res_disallowed["interview_status"] == "completed"
+            # Failed bindings stay pending/retryable rather than silently completing!
+            assert res_disallowed["interview_status"] == "pending"
 
-            # Verify change_journal (#93) and web_inbox recorded consequential bindings.
-            journal_count = await conn.fetchval(
-                "SELECT count(*) FROM change_journal WHERE kind = 'hmx_interview' AND detail->>'export_id' = $1",
+            # Rejected Slack secret must NOT be retained verbatim in hmx_interview_state.answers.
+            state_dump = await conn.fetchval(
+                "SELECT answers::text FROM hmx_interview_state WHERE export_id = $1",
                 export_id,
             )
-            assert journal_count >= 7
+            assert "xoxb-real-secret-token-123456" not in state_dump
+            assert "[REDACTED]" in state_dump
 
-            inbox_count = await conn.fetchval(
-                "SELECT count(*) FROM web_inbox WHERE kind = 'hmx_interview' AND payload->>'export_id' = $1",
-                export_id,
+            # Nested secret inside a structured object on an allowed config key is also rejected.
+            nested_err = await conn.fetchval(
+                "SELECT _hmx_interview_validate_config_binding($1, $2::jsonb)",
+                f"preferences.{marker}_nested",
+                json.dumps({"nested": {"api_key": "sk-live-secret-1234567890"}}),
             )
-            assert inbox_count >= 7
+            assert nested_err is not None
+
+            # Idempotent retry of q_cfg_ok does not overwrite a newer operator edit.
+            await conn.execute(
+                "SELECT set_config($1, 'false'::jsonb)",
+                f"preferences.{marker}_digest",
+            )
+            replay = _j(await conn.fetchval(
+                "SELECT record_hmx_interview_answer($1, 'q_cfg_ok', 'answered', $2::jsonb)",
+                export_id, json.dumps(True),
+            ))
+            assert replay.get("idempotent_replay") is True
+            assert await conn.fetchval(
+                "SELECT get_config_bool($1)", f"preferences.{marker}_digest"
+            ) is False
+
+            # Skipping the 3 failed questions settles the all-optional interview cleanly.
+            for qid in ("q_ingest_path_blocked", "q_cfg_secret_blocked", "q_cfg_disallowed_key"):
+                skip_r = _j(await conn.fetchval(
+                    "SELECT record_hmx_interview_answer($1, $2, 'skipped')",
+                    export_id, qid,
+                ))
+                assert skip_r["success"] is True
+            assert skip_r["interview_status"] == "completed"
+
+            # Verify EXACT question IDs in change_journal (#93) and web_inbox.
+            expected_qids = {
+                "q_identity",
+                "q_goal",
+                "q_guardrail_tool",
+                "q_guardrail_belief",
+                "q_ingest_text",
+                "q_schedule",
+                "q_cfg_ok",
+                "q_cfg_env_ok",
+            }
+            journal_qids = {
+                row["qid"]
+                for row in await conn.fetch(
+                    "SELECT detail->>'question_id' AS qid FROM change_journal WHERE kind = 'hmx_interview' AND detail->>'export_id' = $1",
+                    export_id,
+                )
+            }
+            assert journal_qids == expected_qids
+
+            inbox_qids = {
+                row["qid"]
+                for row in await conn.fetch(
+                    "SELECT payload->>'question_id' AS qid FROM web_inbox WHERE kind = 'hmx_interview' AND payload->>'export_id' = $1",
+                    export_id,
+                )
+            }
+            assert inbox_qids == expected_qids
         finally:
             await tr.rollback()
 
 
 async def test_required_question_cannot_be_skipped_and_chat_tools_work(db_pool):
     from core.tools import ToolContext, ToolExecutionContext, create_default_registry
-
-    async with db_pool.acquire() as conn:
-        await _ensure_migration_0268(conn)
 
     marker = get_test_identifier("hmxtool")
     export_id = f"exp_{marker[:16]:0<16}"
@@ -596,14 +627,41 @@ async def test_required_question_cannot_be_skipped_and_chat_tools_work(db_pool):
         )
 
     registry = create_default_registry(db_pool)
-    ctx = ToolExecutionContext(
+    ctx_operator = ToolExecutionContext(
         tool_context=ToolContext.CHAT,
         call_id="hmx-tool-1",
         session_id="chat-session-hmx",
+        is_operator=True,
+        is_group=False,
+        registry=registry,
+    )
+    ctx_group = ToolExecutionContext(
+        tool_context=ToolContext.CHAT,
+        call_id="hmx-tool-group",
+        session_id="chat-session-group",
+        is_operator=True,
+        is_group=True,
+        registry=registry,
+    )
+    ctx_non_operator = ToolExecutionContext(
+        tool_context=ToolContext.CHAT,
+        call_id="hmx-tool-nonop",
+        session_id="chat-session-dm",
+        is_operator=False,
+        is_group=False,
         registry=registry,
     )
     try:
-        status_res = await registry.execute("hmx_interview_status", {"export_id": export_id}, ctx)
+        # Group and non-operator turns are denied access to onboarding interviews.
+        assert not (await registry.execute("hmx_interview_status", {"export_id": export_id}, ctx_group)).success
+        assert not (await registry.execute("hmx_interview_status", {"export_id": export_id}, ctx_non_operator)).success
+        assert not (await registry.execute(
+            "record_hmx_interview_answer",
+            {"export_id": export_id, "question_id": "tone", "status": "answered", "answer": "direct"},
+            ctx_non_operator,
+        )).success
+
+        status_res = await registry.execute("hmx_interview_status", {"export_id": export_id}, ctx_operator)
         assert status_res.success
         assert status_res.output["count"] == 1
         assert status_res.output["interviews"][0]["remaining_questions"][0]["effect_summary"]
@@ -612,7 +670,7 @@ async def test_required_question_cannot_be_skipped_and_chat_tools_work(db_pool):
         skip_res = await registry.execute(
             "record_hmx_interview_answer",
             {"export_id": export_id, "question_id": "tone", "status": "skipped"},
-            ctx,
+            ctx_operator,
         )
         assert not skip_res.success
         assert "required" in (skip_res.error or "").lower()
@@ -621,7 +679,7 @@ async def test_required_question_cannot_be_skipped_and_chat_tools_work(db_pool):
         ans_res = await registry.execute(
             "record_hmx_interview_answer",
             {"export_id": export_id, "question_id": "tone", "status": "answered", "answer": "Crisp & direct"},
-            ctx,
+            ctx_operator,
         )
         assert ans_res.success, ans_res.error
         assert ans_res.output["binding_result"]["value"] == "direct"
